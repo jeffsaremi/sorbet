@@ -78,7 +78,7 @@ build --define=versioned=false
 build:versioned --workspace_status_command=tools/buildstamp/get_workspace_status --stamp --define=versioned=true
 
 build:dbg-darwin --config=dbg --platforms=@//tools/config:darwin_x86_64
-build:dbg-linux --config=dbg --platforms=@//tools/config:linux_x86_64
+build:dbg-linux --config=dbg 
 
 ##
 ## Configurations used for releases
@@ -97,7 +97,7 @@ build:release-debug-common --config=skipslowenforce
 
 # harden: mark relocation sections read-only
 build:release-linux --linkopt=-Wl,-z,relro,-z,now
-build:release-linux --config=lto-linux --config=release-common --platforms=@//tools/config:linux_x86_64
+build:release-linux --config=lto-linux --config=release-common
 
 build:release-linux           --copt=-mcpu=generic
 build:release-sanitized-linux --copt=-mcpu=generic
