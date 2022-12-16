@@ -170,12 +170,12 @@ def register_sorbet_dependencies():
 
     http_archive(
         name = "com_grail_bazel_toolchain",
-        urls = _github_public_urls("dockwa/bazel-toolchain/archive/{}.tar.gz".format(
-			"51accced079b38083bf43c4ef33a300c83cddff4"
+        urls = _github_public_urls("jeffsaremi/bazel-toolchain/archive/{}.tar.gz".format(
+			"c82da70af1a6c0f59dc7e1187531196097b3bd55"
 		)),
-        sha256 = "0e6a80d3e8cd9788dbfe5f100e82d28092113f79b48e75ddfb677e8d26f9fb92",
+        sha256 = "75ee4d34894b440d09c429e34897af4c411d55d0de3435bc4d211869da5d18f6",
 		strip_prefix = "bazel-toolchain-{}".format(
-			"51accced079b38083bf43c4ef33a300c83cddff4",
+			"c82da70af1a6c0f59dc7e1187531196097b3bd55",
 		),
     )
 
