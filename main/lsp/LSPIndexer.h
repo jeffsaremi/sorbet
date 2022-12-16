@@ -1,9 +1,13 @@
 #ifndef RUBY_TYPER_LSP_LSPINDEXER_H
 #define RUBY_TYPER_LSP_LSPINDEXER_H
 
+#include "LSPPathType.h"
 #include "core/core.h"
 #include "main/lsp/LSPFileUpdates.h"
 #include "main/lsp/LSPMessage.h"
+#include "main/lsp/LSPPreprocessor.h"
+#include "main/lsp/notifications/indexer_initialization.h"
+#include "main/lsp/notifications/initialized.h"
 
 namespace sorbet {
 class WorkerPool;
@@ -14,6 +18,7 @@ namespace sorbet::realmain::lsp {
 
 class SorbetWorkspaceEditParams;
 class LSPConfiguration;
+
 /**
  * The indexer keeps a GlobalState object up-to-date with the latest edits, maintains a set of FileHashes for
  * every file in the workspace, and uses said hashes to decide if edits can be incrementally typechecked on the
@@ -46,13 +51,14 @@ class LSPIndexer final {
      * Determines if the given edit can take the fast path relative to the most recently committed edit.
      * It compares the file hashes in the files in `edit` to those in `evictedFiles` and `initialGS` (in that order).
      */
-    bool canTakeFastPath(const LSPFileUpdates &edit,
-                         const UnorderedMap<core::FileRef, std::shared_ptr<core::File>> &evictedFiles) const;
+    PathType getTypecheckingPath(const LSPFileUpdates &edit,
+                                 const UnorderedMap<core::FileRef, std::shared_ptr<core::File>> &evictedFiles) const;
     /**
      * INVARIANT: `changedFiles` must have hashes computed.
      */
-    bool canTakeFastPathInternal(const std::vector<std::shared_ptr<core::File>> &changedFiles,
-                                 const UnorderedMap<core::FileRef, std::shared_ptr<core::File>> &evictedFiles) const;
+    PathType
+    getTypecheckingPathInternal(const std::vector<std::shared_ptr<core::File>> &changedFiles,
+                                const UnorderedMap<core::FileRef, std::shared_ptr<core::File>> &evictedFiles) const;
 
 public:
     LSPIndexer(std::shared_ptr<const LSPConfiguration> config, std::unique_ptr<core::GlobalState> initialGS,
@@ -62,16 +68,17 @@ public:
     /**
      * Determines if the given files can take the fast path relative to the latest committed edit.
      */
-    bool canTakeFastPath(const std::vector<std::shared_ptr<core::File>> &changedFiles) const;
+    PathType getTypecheckingPath(const std::vector<std::shared_ptr<core::File>> &changedFiles) const;
 
     /**
      * Computes state hashes for the given set of files. Is a no-op if the provided files all have hashes.
      */
     void computeFileHashes(const std::vector<std::shared_ptr<core::File>> &files) const;
 
-    /** Initializes the indexer by indexing and hashing all files in the workspace. Mutates the LSPFileUpdates so it can
-     * be passed to the typechecker to initialize it. */
-    void initialize(LSPFileUpdates &updates, WorkerPool &workers);
+    /**
+     * Initializes the indexer with the state produced on the typechecking thread.
+     */
+    void initialize(IndexerInitializationTask &task, std::unique_ptr<core::GlobalState> initialGS);
 
     /**
      * Commits the given edit to `initialGS`, and returns a canonical LSPFileUpdates object containing indexed trees
@@ -89,6 +96,13 @@ public:
      * Given a file ref _that exists_, return the underlying file.
      */
     const core::File &getFile(core::FileRef fref) const;
+
+    /**
+     * Given a reference to the InitializedTask, transfer ownership of the global state out for initialization in the
+     * typechecker thread. The task argument is unused, and is present only to make it difficult to get the global state
+     * out in a context that's not the InitializedTask's index function.
+     */
+    void transferInitializeState(InitializedTask &task);
 };
 
 } // namespace sorbet::realmain::lsp

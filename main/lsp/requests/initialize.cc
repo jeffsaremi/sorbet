@@ -5,7 +5,7 @@ using namespace std;
 
 namespace sorbet::realmain::lsp {
 
-const std::vector<std::string> InitializeTask::TRIGGER_CHARACTERS = {".", ":"};
+const std::vector<std::string> InitializeTask::TRIGGER_CHARACTERS = {".", ":", "@", "#"};
 
 InitializeTask::InitializeTask(LSPConfiguration &config, MessageId id, std::unique_ptr<InitializeParams> params)
     : LSPRequestTask(config, id, LSPMethod::Initialize), mutableConfig(config), params(move(params)) {}
@@ -31,11 +31,12 @@ unique_ptr<ResponseMessage> InitializeTask::runRequest(LSPTypecheckerDelegate &t
     serverCap->hoverProvider = true;
     serverCap->referencesProvider = true;
     serverCap->implementationProvider = true;
-    serverCap->documentFormattingProvider = rubyfmt_enabled && opts.lspDocumentFormatRubyfmtEnabled;
+    serverCap->documentFormattingProvider = opts.lspDocumentFormatRubyfmtEnabled;
     serverCap->sorbetShowSymbolProvider = true;
 
     auto codeActionProvider = make_unique<CodeActionOptions>();
-    codeActionProvider->codeActionKinds = {CodeActionKind::Quickfix, CodeActionKind::SourceFixAllSorbet};
+    codeActionProvider->codeActionKinds = {CodeActionKind::Quickfix, CodeActionKind::SourceFixAllSorbet,
+                                           CodeActionKind::RefactorExtract};
     serverCap->codeActionProvider = move(codeActionProvider);
 
     if (opts.lspSignatureHelpEnabled) {

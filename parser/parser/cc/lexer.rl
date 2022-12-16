@@ -5,7 +5,7 @@ Parts of the source are derived from ruby_parser:
 Copyright (c) Ryan Davis, seattle.rb
 
 This lexer is a rewrite of the original in Ragel/C:
-Copyright (c) Charlie Somerville, GitHub
+Copyright (c) Hailey Somerville, GitHub
 
 MIT License
 
@@ -120,11 +120,12 @@ using namespace std::string_literals;
 
 %% prepush { check_stack_capacity(); }
 
-lexer::lexer(diagnostics_t &diag, ruby_version version, std::string_view source_buffer, sorbet::StableStringStorage<> &scratch)
+lexer::lexer(diagnostics_t &diag, ruby_version version, std::string_view source_buffer, sorbet::StableStringStorage<> &scratch, bool traceLexer)
   : diagnostics(diag)
   , version(version)
   , source_buffer(source_buffer)
   , scratch(scratch)
+  , lineBreaks(sorbet::findLineBreaks(source_buffer))
   , cs(lex_en_line_begin)
   , _p(source_buffer.data())
   , _pe(source_buffer.data() + source_buffer.size())
@@ -143,7 +144,7 @@ lexer::lexer(diagnostics_t &diag, ruby_version version, std::string_view source_
   , num_xfrm(num_xfrm_type::NONE)
   , escape_s(nullptr)
   , herebody_s(nullptr)
-  , in_kwarg(false)
+  , traceLexer(traceLexer)
 {
   assert(!source_buffer.empty());
   assert(source_buffer.back() == '\0');
@@ -155,6 +156,103 @@ lexer::lexer(diagnostics_t &diag, ruby_version version, std::string_view source_
   static_env.push(environment());
 
   cs_before_block_comment = lex_en_line_begin;
+}
+
+// At the moment, having a method like this instead of using Ragel to properly
+// track indentation at the time we emit a token could be a recipe for really
+// bad performance (having a function like this makes lexing accidentally
+// quadratic in the worst case).
+//
+// While we're saved by the fact that ~most files don't have syntax errors and
+// this method should only be called when there are syntax errors, it's still
+// prudent to not make things excessively slow. This method attempts to exit
+// after doing the least amount of work possible.
+//
+// We may want to revisit this (e.g. to simplify or move into the state machine)
+int lexer::compare_indent_level(token_t left, token_t right) {
+    // token::lineStart is non-sensical for tNL tokens
+    assert(left->type() != token_type::tNL && right->type() != token_type::tNL);
+
+    const auto leftStart = left->start();
+    const auto leftLineStart = left->lineStart();
+    const auto rightStart = right->start();
+    const auto rightLineStart = right->lineStart();
+
+    // optimization: tokens start on same line
+    if (leftStart == rightStart) {
+        return 0;
+    }
+
+    auto *data = this->source_buffer.data();
+    auto *leftPtr = data + leftLineStart;
+    const auto * const leftStartPtr = data + leftStart;
+    auto *rightPtr = data + rightLineStart;
+    const auto * const rightStartPtr = data + rightStart;
+
+    int i = -1;
+    while (leftPtr <= leftStartPtr && rightPtr <= rightStartPtr) {
+        i++;
+        if (i > 100) {
+            // Attempt to defeat pathologically long whitespace prefixes.
+            // This will basically mean falling back to the indendation-agnostic behavior.
+            // We could alternatively attempt to return some sort of error state here.
+            return 0;
+        }
+
+        auto leftChar = *leftPtr;
+        auto rightChar = *rightPtr;
+        auto leftIsSpace = leftChar == ' ' || leftChar == '\t';
+        auto rightIsSpace = rightChar == ' ' || rightChar == '\t';
+
+        if (leftIsSpace && !rightIsSpace) {
+            return 1; // left > right
+        } else if (!leftIsSpace && !rightIsSpace) {
+            return 0; // left == right
+        } else if (!leftIsSpace && rightIsSpace) {
+            return -1;  // left < right
+        }
+
+        if (leftChar != rightChar) {
+            // mismatched indent. give up and say equal
+            // TODO(jez) Might want to handle this case better
+            return 0;
+        }
+
+        leftPtr++;
+        rightPtr++;
+    }
+
+    // This is weird. One or both of the tokens' first characters was a whitespace character.
+    // Assert so that we can add a test case if we ever find this in the wild.
+    assert(false);
+    return 0;
+}
+
+size_t lexer::line_start(token_type type, size_t beginPos) {
+    if (type == token_type::tNL) {
+        // Doesn't make sense to ask for line start of newline character
+        return SIZE_MAX;
+    }
+
+    // If this assertion ever fires, we'll have to change File::lineBreaks to operate on size_t
+    assert(beginPos < INT_MAX);
+    int beginPosInt = static_cast<int>(beginPos);
+
+    // Gets the first element which compares greater than or equal to `beginPos`.
+    // Since we already handled newline characters, it should be just the first elem greater.
+    auto it = absl::c_lower_bound(this->lineBreaks, beginPosInt);
+    if (it != this->lineBreaks.begin()) {
+        // First element of lineBreaks is always -1 (as if there was an
+        // imaginary `\n`) one character before the start of a file. But we're
+        // actually looking for the start of the line (i.e., the offset right
+        // after the newline).
+        //
+        // If we're not at begin, that means we found something the first newline after beginPos,
+        // and we want last newline before beginPos.
+        --it;
+    }
+    // return offset immediately after offset of newline char
+    return (*it) + 1;
 }
 
 void lexer::check_stack_capacity() {
@@ -178,7 +276,9 @@ int lexer::arg_or_cmdarg(int cmd_state) {
 void lexer::emit_comment(const char* s, const char* e) {
   /* unused for now */
   (void)s;
-  (void)e;
+  if (*e == '\n') { // might also be \0
+    newline_s = e;
+  }
 }
 
 std::string lexer::tok() const {
@@ -457,7 +557,12 @@ static bool eof_codepoint(char c) {
 token_t lexer::advance_() {
   if (!token_queue.empty()) {
     token_t token = token_queue.front();
-    token_queue.pop_front();
+    if (token->type() == token_type::eof) {
+      // spin on EOF forever, even if advance is called repeatedly
+      ENFORCE(token_queue.size() == 1);
+    } else {
+      token_queue.pop_front();
+    }
     return token;
   }
 
@@ -497,10 +602,11 @@ token_t lexer::advance_() {
 
   if (cs == lex_error) {
     size_t start = (size_t)(p - source_buffer.data());
-    return mempool.alloc(token_type::error, start, start + 1, std::string_view(p - 1, 1));
+    return mempool.alloc(token_type::error, start, start + 1, std::string_view(p - 1, 1), line_start(token_type::error, start));
   }
 
-  return mempool.alloc(token_type::eof, source_buffer.size(), source_buffer.size(), std::string_view("", 0));
+  token_queue.push_back(mempool.alloc(token_type::eof, source_buffer.size(), source_buffer.size(), std::string_view("", 0), line_start(token_type::eof, source_buffer.size())));
+  return mempool.alloc(token_type::tBEFORE_EOF, source_buffer.size(), source_buffer.size(), std::string_view("", 0), line_start(token_type::tBEFORE_EOF, source_buffer.size()));
 }
 
 void lexer::emit(token_type type) {
@@ -515,7 +621,8 @@ void lexer::emit(token_type type, std::string_view str, const char* start, const
   size_t offset_start = (size_t)(start - source_buffer.data());
   size_t offset_end = (size_t)(end - source_buffer.data());
 
-  token_queue.push_back(mempool.alloc(type, offset_start, offset_end, str));
+  size_t line = line_start(type, offset_start);
+  token_queue.push_back(mempool.alloc(type, offset_start, offset_end, str, line));
 }
 
 void lexer::emit(token_type type, const std::string &str) {
@@ -526,9 +633,10 @@ void lexer::emit(token_type type, const std::string &str, const char* start, con
   size_t offset_start = (size_t)(start - source_buffer.data());
   size_t offset_end = (size_t)(end - source_buffer.data());
 
+  size_t line = line_start(type, offset_start);
   // Copy the string into stable storage.
   auto scratch_view = scratch.enterString(str);
-  token_queue.push_back(mempool.alloc(type, offset_start, offset_end, scratch_view));
+  token_queue.push_back(mempool.alloc(type, offset_start, offset_end, scratch_view, line));
 }
 
 void lexer::emit_do(bool do_block) {
@@ -816,8 +924,11 @@ void lexer::set_state_expr_value() {
 
   # Ruby accepts (and fails on) variables with leading digit
   # in literal context, but not in unquoted symbol body.
-  class_var_v    = '@@' c_alnum+;
-  instance_var_v = '@' c_alnum+;
+  class_var_v    = '@@' c_alnum*;
+  instance_var_v = '@' c_alnum*;
+
+  class_var_v_nonempty    = '@@' c_alnum+;
+  instance_var_v_nonempty = '@' c_alnum+;
 
   label          = bareword [?!]? ':';
 
@@ -1231,7 +1342,7 @@ void lexer::set_state_expr_value() {
   # Interpolations with immediate variable names simply call into
   # the corresponding machine.
 
-  interp_var = '#' ( global_var | class_var_v | instance_var_v );
+  interp_var = '#' ( global_var | class_var_v_nonempty | instance_var_v_nonempty );
 
   action extend_interp_var {
     auto& current_literal = literal_();
@@ -1567,7 +1678,9 @@ void lexer::set_state_expr_value() {
 
       class_var_v
       => {
-        if (ts[2] >= '0' && ts[2] <= '9') {
+        if (te - ts == 2) {
+          diagnostic_(dlevel::ERROR, dclass::Unexpected, tok());
+        } else if (ts[2] >= '0' && ts[2] <= '9') {
           diagnostic_(dlevel::ERROR, dclass::CvarName, tok(ts, te));
         }
 
@@ -1577,7 +1690,9 @@ void lexer::set_state_expr_value() {
 
       instance_var_v
       => {
-        if (ts[1] >= '0' && ts[1] <= '9') {
+        if (te - ts == 1) {
+          diagnostic_(dlevel::ERROR, dclass::Unexpected, tok());
+        } else if (ts[1] >= '0' && ts[1] <= '9') {
           diagnostic_(dlevel::ERROR, dclass::IvarName, tok(ts, te));
         }
 
@@ -1654,6 +1769,18 @@ void lexer::set_state_expr_value() {
       label ( any - ':' )
       => { emit(token_type::tLABEL, tok_view(ts, te - 2), ts, te - 1);
            fhold; fnext expr_labelarg; fbreak; };
+
+      '...'
+      => {
+        if (version >= ruby_version::RUBY_31 && context.inArgDef) {
+          auto ident = tok_view(ts, te - 2);
+          emit(token_type::tBDOT3, ident);
+          fnext expr_end; fbreak;
+        } else {
+          p -= 3;
+          fgoto expr_end;
+        }
+      };
 
       w_space_comment;
 
@@ -2198,7 +2325,7 @@ void lexer::set_state_expr_value() {
           | '@@' %{ tm = p - 2; }
           ) [0-9]*
       => {
-        if (version == ruby_version::RUBY_27) {
+        if (version >= ruby_version::RUBY_27) {
           if (ts[0] == ':' && ts[1] == '@' && ts[2] == '@') {
             diagnostic_(dlevel::ERROR, dclass::CvarName, tok(ts + 1, te));
           } else {
@@ -2370,17 +2497,38 @@ void lexer::set_state_expr_value() {
         fnext expr_beg; fbreak;
       };
 
-      '...'
+      # Here we scan and conditionally emit "\n":
+      # + if it's there
+      #   + and emitted we do nothing
+      #   + and not emitted we return `p` to "\n" to process it on the next scan
+      # + if it's not there we do nothing
+      '...' c_nl?
       => {
+        bool followed_by_nl = te - 1 == newline_s;
+        bool nl_emitted = false;
+        auto dots_te = followed_by_nl ? te - 1 : te;
+
         auto ident = tok_view(ts, te - 2);
-        if (version >= ruby_version::RUBY_27) {
-          emit(token_type::tBDOT3, ident, ts, te);
-        } else {
+        if (version >= ruby_version::RUBY_30) {
           if (!lambda_stack.empty() && lambda_stack.top() == paren_nest) {
-            emit(token_type::tDOT3, ident, ts, te);
+            emit(token_type::tDOT3, ident, ts, dots_te);
           } else {
-            emit(token_type::tBDOT3, ident, ts, te);
+            emit(token_type::tBDOT3, ident, ts, dots_te);
+
+            if (version >= ruby_version::RUBY_31 && followed_by_nl && context.inArgDef) {
+              emit(token_type::tNL, "", newline_s, newline_s + 1);
+              nl_emitted = true;
+            }
           }
+        } else if (version >= ruby_version::RUBY_27) {
+          emit(token_type::tBDOT3, ident, ts, dots_te);
+        } else {
+          emit(token_type::tDOT3, ident, ts, dots_te);
+        }
+
+         if (followed_by_nl && !nl_emitted) {
+          // return "\n" to process it on the next scan
+          fhold;
         }
 
         fnext expr_beg; fbreak;
@@ -2446,7 +2594,7 @@ void lexer::set_state_expr_value() {
 
     w_newline
     => {
-      if (in_kwarg) {
+      if (context.inKwarg) {
         fhold; fgoto expr_end;
       } else {
         fgoto line_begin;
@@ -2876,9 +3024,27 @@ void lexer::set_state_expr_value() {
 token_t lexer::advance() {
   auto tok = advance_();
 
-  last_token_s = tok->start();
-  last_token_e = tok->end();
+  if (this->traceLexer) {
+    std::cerr << *tok << std::endl;
+  }
+
   return tok;
+}
+
+void lexer::unadvance(token_t token) {
+  token_queue.push_front(token);
+}
+
+void lexer::rewind_and_reset_to_expr_beg(size_t newPos) {
+  assert(newPos <= source_buffer.size());
+
+  // rewind
+  this->_p = this->source_buffer.data() + newPos;
+  token_queue.clear();
+
+  // reset
+  set_state_expr_beg();
+  this->context.inKwarg = false;
 }
 
 void lexer::rewind_and_reset_to_expr_end(size_t newPos) {
@@ -2886,10 +3052,11 @@ void lexer::rewind_and_reset_to_expr_end(size_t newPos) {
 
   // rewind
   this->_p = this->source_buffer.data() + newPos;
+  token_queue.clear();
 
   // reset
   set_state_expr_end();
-  this->in_kwarg = false;
+  this->context.inKwarg = false;
 }
 
 void lexer::extend_static() {
@@ -2925,6 +3092,14 @@ void lexer::declare_forward_args() {
 
 bool lexer::is_declared_forward_args() {
   return is_declared(FORWARD_ARGS);
+}
+
+void lexer::declare_anonymous_args() {
+  declare(ANONYMOUS_BLOCKARG);
+}
+
+bool lexer::is_declared_anonymous_args() {
+  return is_declared(ANONYMOUS_BLOCKARG);
 }
 
 optional_size lexer::dedentLevel() {

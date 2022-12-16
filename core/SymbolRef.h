@@ -3,10 +3,11 @@
 
 #include "common/common.h"
 #include "core/DebugOnlyCheck.h"
+#include "core/FileRef.h"
 #include "core/ShowOptions.h"
 
 namespace sorbet::core {
-class Symbol;
+class ClassOrModule;
 class GlobalState;
 class NameRef;
 class Loc;
@@ -23,26 +24,26 @@ struct SymbolDataDebugCheck {
  *  Entering new symbols can invalidate `Symbol &`s and thus they are generally unsafe.
  *  This class ensures that all accesses are safe in debug builds and effectively is a `Symbol &` in optimized builds.
  */
-class SymbolData : private DebugOnlyCheck<SymbolDataDebugCheck> {
-    Symbol &symbol;
+class ClassOrModuleData : private DebugOnlyCheck<SymbolDataDebugCheck> {
+    ClassOrModule &symbol;
 
 public:
-    SymbolData(Symbol &ref, GlobalState &gs);
+    ClassOrModuleData(ClassOrModule &ref, GlobalState &gs);
 
-    Symbol *operator->();
-    const Symbol *operator->() const;
+    ClassOrModule *operator->();
+    const ClassOrModule *operator->() const;
 };
-CheckSize(SymbolData, 8, 8);
+CheckSize(ClassOrModuleData, 8, 8);
 
-class ConstSymbolData : private DebugOnlyCheck<SymbolDataDebugCheck> {
-    const Symbol &symbol;
+class ConstClassOrModuleData : private DebugOnlyCheck<SymbolDataDebugCheck> {
+    const ClassOrModule &symbol;
 
 public:
-    ConstSymbolData(const Symbol &ref, const GlobalState &gs);
+    ConstClassOrModuleData(const ClassOrModule &ref, const GlobalState &gs);
 
-    const Symbol *operator->() const;
+    const ClassOrModule *operator->() const;
 };
-CheckSize(ConstSymbolData, 8, 8);
+CheckSize(ConstClassOrModuleData, 8, 8);
 
 class Method;
 class MethodData : private DebugOnlyCheck<SymbolDataDebugCheck> {
@@ -88,6 +89,28 @@ public:
 };
 CheckSize(ConstFieldData, 8, 8);
 
+class TypeParameter;
+class TypeParameterData : private DebugOnlyCheck<SymbolDataDebugCheck> {
+    TypeParameter &typeParam;
+
+public:
+    TypeParameterData(TypeParameter &ref, GlobalState &gs);
+
+    TypeParameter *operator->();
+    const TypeParameter *operator->() const;
+};
+CheckSize(TypeParameterData, 8, 8);
+
+class ConstTypeParameterData : private DebugOnlyCheck<SymbolDataDebugCheck> {
+    const TypeParameter &typeParam;
+
+public:
+    ConstTypeParameterData(const TypeParameter &ref, const GlobalState &gs);
+
+    const TypeParameter *operator->() const;
+};
+CheckSize(ConstTypeParameterData, 8, 8);
+
 class ClassOrModuleRef final {
     uint32_t _id;
 
@@ -116,10 +139,10 @@ public:
         return ref;
     }
 
-    SymbolData data(GlobalState &gs) const;
-    SymbolData dataAllowingNone(GlobalState &gs) const;
-    ConstSymbolData data(const GlobalState &gs) const;
-    ConstSymbolData dataAllowingNone(const GlobalState &gs) const;
+    ClassOrModuleData data(GlobalState &gs) const;
+    ClassOrModuleData dataAllowingNone(GlobalState &gs) const;
+    ConstClassOrModuleData data(const GlobalState &gs) const;
+    ConstClassOrModuleData dataAllowingNone(const GlobalState &gs) const;
 
     bool operator==(const ClassOrModuleRef &rhs) const;
     bool operator!=(const ClassOrModuleRef &rhs) const;
@@ -137,6 +160,34 @@ public:
         return show(gs, {});
     };
     std::string show(const GlobalState &gs, ShowOptions options) const;
+
+    // Given a symbol like <PackageSpecRegistry>::Project::Foo, returns true.
+    // Given any other symbol, returns false.
+    // Also returns false if called on core::Symbols::noClassOrModule().
+    bool isPackageSpecSymbol(const GlobalState &gs) const;
+
+    // Certain classes that need to be generic in the standard library already have a definition for
+    // the `[]` method, which would otherwise be the way to apply type arguments to a generic class.
+    // For example, `Set[1, 2, 3]` creates a `Set` of `Integer`s.
+    //
+    // To allow people to continue this syntax, we create certain forwarder classes under the `T::`
+    // namespace so that the `[]` method does not conflict with any existing method.
+    //
+    // This method tells whether the current ClassOrModuleRef is one of those forwarder classes.
+    bool isBuiltinGenericForwarder() const;
+    // Unwraps things like `T::Hash` to `Hash`, otherwise returns itself.
+    ClassOrModuleRef maybeUnwrapBuiltinGenericForwarder() const;
+    // Gets the `T::` forwarder class for the builtin generic (like `::Array` -> `::T::Array`)
+    // Returns Symbols::noClassOrModule if there is no forwarder.
+    ClassOrModuleRef forwarderForBuiltinGeneric() const;
+
+    // Before stabilizing Sorbet's type syntax (indeed, before Sorbet even supported generic type
+    // syntax), it was allowed to use `Array` in place of `T::Array[T.untyped]`. Out of a desire to
+    // avoid a large code migration, we preserve that behavior for the select stdlib classes it
+    // applied to at the time.
+    //
+    // The set of stdlib classes receiving this special behavior should not grow over time.
+    bool isLegacyStdlibGeneric() const;
 };
 CheckSize(ClassOrModuleRef, 4, 4);
 
@@ -263,9 +314,9 @@ public:
         return ref;
     }
 
-    SymbolData data(GlobalState &gs) const;
-    ConstSymbolData data(const GlobalState &gs) const;
-    SymbolData dataAllowingNone(GlobalState &gs) const;
+    TypeParameterData data(GlobalState &gs) const;
+    ConstTypeParameterData data(const GlobalState &gs) const;
+    TypeParameterData dataAllowingNone(GlobalState &gs) const;
     std::string_view showKind(const GlobalState &gs) const;
     std::string showFullName(const GlobalState &gs) const;
     std::string toStringFullName(const GlobalState &gs) const;
@@ -308,9 +359,9 @@ public:
         return ref;
     }
 
-    SymbolData data(GlobalState &gs) const;
-    ConstSymbolData data(const GlobalState &gs) const;
-    SymbolData dataAllowingNone(GlobalState &gs) const;
+    TypeParameterData data(GlobalState &gs) const;
+    ConstTypeParameterData data(const GlobalState &gs) const;
+    TypeParameterData dataAllowingNone(GlobalState &gs) const;
     std::string_view showKind(const GlobalState &gs) const;
     std::string showFullName(const GlobalState &gs) const;
     std::string toStringFullName(const GlobalState &gs) const;
@@ -327,7 +378,7 @@ CheckSize(TypeArgumentRef, 4, 4);
 
 class SymbolRef final {
     friend class GlobalState;
-    friend class Symbol;
+    friend class ClassOrModule;
     // For toStringWithOptions.
     friend class ClassOrModuleRef;
     friend class MethodRef;
@@ -485,7 +536,9 @@ public:
     core::SymbolRef owner(const GlobalState &gs) const;
     core::Loc loc(const GlobalState &gs) const;
     bool isPrintable(const GlobalState &gs) const;
-    const InlinedVector<Loc, 2> &locs(const GlobalState &gs) const;
+    using LOC_store = InlinedVector<Loc, 2>;
+    const LOC_store &locs(const GlobalState &gs) const;
+    void removeLocsForFile(GlobalState &gs, core::FileRef file) const;
     const TypePtr &resultType(const GlobalState &gs) const;
     void setResultType(GlobalState &gs, const TypePtr &typePtr) const;
     SymbolRef dealias(const GlobalState &gs) const;
@@ -494,7 +547,6 @@ public:
     // Prints the fully qualified name of the symbol in a format that is suitable for showing to the user (e.g.
     // "Owner::SymbolName")
     std::string showFullName(const GlobalState &gs) const;
-    std::string showFullNameWithoutPackagePrefix(const GlobalState &gs) const;
     std::string toStringFullName(const GlobalState &gs) const;
 
     std::string showRaw(const GlobalState &gs) const {
@@ -591,177 +643,173 @@ public:
         return ClassOrModuleRef::fromRaw(16);
     }
 
-    static ClassOrModuleRef Opus() {
+    static ClassOrModuleRef T() {
         return ClassOrModuleRef::fromRaw(17);
     }
 
-    static ClassOrModuleRef T() {
+    static ClassOrModuleRef Class() {
         return ClassOrModuleRef::fromRaw(18);
     }
 
-    static ClassOrModuleRef Class() {
+    static ClassOrModuleRef BasicObject() {
         return ClassOrModuleRef::fromRaw(19);
     }
 
-    static ClassOrModuleRef BasicObject() {
+    static ClassOrModuleRef Kernel() {
         return ClassOrModuleRef::fromRaw(20);
     }
 
-    static ClassOrModuleRef Kernel() {
+    static ClassOrModuleRef Range() {
         return ClassOrModuleRef::fromRaw(21);
     }
 
-    static ClassOrModuleRef Range() {
+    static ClassOrModuleRef Regexp() {
         return ClassOrModuleRef::fromRaw(22);
     }
 
-    static ClassOrModuleRef Regexp() {
+    static ClassOrModuleRef Magic() {
         return ClassOrModuleRef::fromRaw(23);
     }
 
-    static ClassOrModuleRef Magic() {
+    static ClassOrModuleRef MagicSingleton() {
         return ClassOrModuleRef::fromRaw(24);
     }
 
-    static ClassOrModuleRef MagicSingleton() {
+    static ClassOrModuleRef Module() {
         return ClassOrModuleRef::fromRaw(25);
     }
 
-    static ClassOrModuleRef Module() {
+    static ClassOrModuleRef StandardError() {
         return ClassOrModuleRef::fromRaw(26);
     }
 
-    static ClassOrModuleRef StandardError() {
+    static ClassOrModuleRef Complex() {
         return ClassOrModuleRef::fromRaw(27);
     }
 
-    static ClassOrModuleRef Complex() {
+    static ClassOrModuleRef Rational() {
         return ClassOrModuleRef::fromRaw(28);
     }
 
-    static ClassOrModuleRef Rational() {
+    static ClassOrModuleRef T_Array() {
         return ClassOrModuleRef::fromRaw(29);
     }
 
-    static ClassOrModuleRef T_Array() {
+    static ClassOrModuleRef T_Hash() {
         return ClassOrModuleRef::fromRaw(30);
     }
 
-    static ClassOrModuleRef T_Hash() {
+    static ClassOrModuleRef T_Proc() {
         return ClassOrModuleRef::fromRaw(31);
     }
 
-    static ClassOrModuleRef T_Proc() {
+    static ClassOrModuleRef Proc() {
         return ClassOrModuleRef::fromRaw(32);
     }
 
-    static ClassOrModuleRef Proc() {
+    static ClassOrModuleRef Enumerable() {
         return ClassOrModuleRef::fromRaw(33);
     }
 
-    static ClassOrModuleRef Enumerable() {
+    static ClassOrModuleRef Set() {
         return ClassOrModuleRef::fromRaw(34);
     }
 
-    static ClassOrModuleRef Set() {
+    static ClassOrModuleRef Struct() {
         return ClassOrModuleRef::fromRaw(35);
     }
 
-    static ClassOrModuleRef Struct() {
+    static ClassOrModuleRef File() {
         return ClassOrModuleRef::fromRaw(36);
     }
 
-    static ClassOrModuleRef File() {
+    static ClassOrModuleRef Sorbet() {
         return ClassOrModuleRef::fromRaw(37);
     }
 
-    static ClassOrModuleRef Sorbet() {
+    static ClassOrModuleRef Sorbet_Private() {
         return ClassOrModuleRef::fromRaw(38);
     }
 
-    static ClassOrModuleRef Sorbet_Private() {
+    static ClassOrModuleRef Sorbet_Private_Static() {
         return ClassOrModuleRef::fromRaw(39);
     }
 
-    static ClassOrModuleRef Sorbet_Private_Static() {
-        return ClassOrModuleRef::fromRaw(40);
-    }
-
     static ClassOrModuleRef Sorbet_Private_StaticSingleton() {
-        return ClassOrModuleRef::fromRaw(41);
+        return ClassOrModuleRef::fromRaw(40);
     }
 
     // Used as the superclass for symbols created to populate unresolvable ruby
     // constants
     static ClassOrModuleRef StubModule() {
-        return ClassOrModuleRef::fromRaw(42);
+        return ClassOrModuleRef::fromRaw(41);
     }
 
     // Used to mark the presence of a mixin that we were unable to
     // statically resolve to a module
     static ClassOrModuleRef StubMixin() {
-        return ClassOrModuleRef::fromRaw(43);
+        return ClassOrModuleRef::fromRaw(42);
     }
 
     // Used to mark the presence of a mixin that will be replaced with a real
     // ClassOrModuleRef or StubMixin once resolution completes.
     static ClassOrModuleRef PlaceholderMixin() {
-        return ClassOrModuleRef::fromRaw(44);
+        return ClassOrModuleRef::fromRaw(43);
     }
 
     // Used to mark the presence of a superclass that we were unable to
     // statically resolve to a class
     static ClassOrModuleRef StubSuperClass() {
-        return ClassOrModuleRef::fromRaw(45);
+        return ClassOrModuleRef::fromRaw(44);
     }
 
     static ClassOrModuleRef T_Enumerable() {
-        return ClassOrModuleRef::fromRaw(46);
+        return ClassOrModuleRef::fromRaw(45);
     }
 
     static ClassOrModuleRef T_Range() {
-        return ClassOrModuleRef::fromRaw(47);
+        return ClassOrModuleRef::fromRaw(46);
     }
 
     static ClassOrModuleRef T_Set() {
-        return ClassOrModuleRef::fromRaw(48);
+        return ClassOrModuleRef::fromRaw(47);
     }
 
     static ClassOrModuleRef void_() {
-        return ClassOrModuleRef::fromRaw(49);
+        return ClassOrModuleRef::fromRaw(48);
     }
 
     // Synthetic symbol used by resolver to mark type alias assignments.
     static ClassOrModuleRef typeAliasTemp() {
-        return ClassOrModuleRef::fromRaw(50);
+        return ClassOrModuleRef::fromRaw(49);
     }
 
     static ClassOrModuleRef T_Configuration() {
-        return ClassOrModuleRef::fromRaw(51);
+        return ClassOrModuleRef::fromRaw(50);
     }
 
     static ClassOrModuleRef T_Generic() {
-        return ClassOrModuleRef::fromRaw(52);
+        return ClassOrModuleRef::fromRaw(51);
     }
 
     static ClassOrModuleRef Tuple() {
-        return ClassOrModuleRef::fromRaw(53);
+        return ClassOrModuleRef::fromRaw(52);
     }
 
     static ClassOrModuleRef Shape() {
-        return ClassOrModuleRef::fromRaw(54);
+        return ClassOrModuleRef::fromRaw(53);
     }
 
     static ClassOrModuleRef Subclasses() {
-        return ClassOrModuleRef::fromRaw(55);
+        return ClassOrModuleRef::fromRaw(54);
     }
 
     static ClassOrModuleRef Sorbet_Private_Static_ImplicitModuleSuperClass() {
-        return ClassOrModuleRef::fromRaw(56);
+        return ClassOrModuleRef::fromRaw(55);
     }
 
     static ClassOrModuleRef Sorbet_Private_Static_ReturnTypeInference() {
-        return ClassOrModuleRef::fromRaw(57);
+        return ClassOrModuleRef::fromRaw(56);
     }
 
     static MethodRef noMethod() {
@@ -799,7 +847,7 @@ public:
     }
 
     static ClassOrModuleRef T_Sig() {
-        return ClassOrModuleRef::fromRaw(58);
+        return ClassOrModuleRef::fromRaw(57);
     }
 
     static FieldRef Magic_undeclaredFieldStub() {
@@ -811,38 +859,42 @@ public:
     }
 
     static ClassOrModuleRef T_Helpers() {
-        return ClassOrModuleRef::fromRaw(59);
+        return ClassOrModuleRef::fromRaw(58);
     }
 
     static ClassOrModuleRef DeclBuilderForProcs() {
-        return ClassOrModuleRef::fromRaw(60);
+        return ClassOrModuleRef::fromRaw(59);
     }
 
     static ClassOrModuleRef DeclBuilderForProcsSingleton() {
-        return ClassOrModuleRef::fromRaw(61);
+        return ClassOrModuleRef::fromRaw(60);
     }
 
     static ClassOrModuleRef Net() {
-        return ClassOrModuleRef::fromRaw(62);
+        return ClassOrModuleRef::fromRaw(61);
     }
 
     static ClassOrModuleRef Net_IMAP() {
-        return ClassOrModuleRef::fromRaw(63);
+        return ClassOrModuleRef::fromRaw(62);
     }
 
     static ClassOrModuleRef Net_Protocol() {
-        return ClassOrModuleRef::fromRaw(64);
+        return ClassOrModuleRef::fromRaw(63);
     }
 
     static ClassOrModuleRef T_Sig_WithoutRuntime() {
-        return ClassOrModuleRef::fromRaw(65);
+        return ClassOrModuleRef::fromRaw(64);
     }
 
     static ClassOrModuleRef Enumerator() {
-        return ClassOrModuleRef::fromRaw(66);
+        return ClassOrModuleRef::fromRaw(65);
     }
 
     static ClassOrModuleRef T_Enumerator() {
+        return ClassOrModuleRef::fromRaw(66);
+    }
+
+    static ClassOrModuleRef T_Enumerator_Lazy() {
         return ClassOrModuleRef::fromRaw(67);
     }
 
@@ -886,8 +938,16 @@ public:
         return ClassOrModuleRef::fromRaw(76);
     }
 
-    static ClassOrModuleRef T_Sig_WithoutRuntimeSingleton() {
+    static ClassOrModuleRef T_Private_Methods() {
         return ClassOrModuleRef::fromRaw(77);
+    }
+
+    static ClassOrModuleRef T_Private_Methods_DeclBuilder() {
+        return ClassOrModuleRef::fromRaw(78);
+    }
+
+    static ClassOrModuleRef T_Sig_WithoutRuntimeSingleton() {
+        return ClassOrModuleRef::fromRaw(79);
     }
 
     static MethodRef sigWithoutRuntime() {
@@ -895,27 +955,23 @@ public:
     }
 
     static ClassOrModuleRef T_NonForcingConstants() {
-        return ClassOrModuleRef::fromRaw(78);
+        return ClassOrModuleRef::fromRaw(80);
     }
 
     static MethodRef SorbetPrivateStaticSingleton_sig() {
         return MethodRef::fromRaw(5);
     }
 
-    static ClassOrModuleRef PackageRegistry() {
-        return ClassOrModuleRef::fromRaw(79);
-    }
-
-    static ClassOrModuleRef PackageTests() {
-        return ClassOrModuleRef::fromRaw(80);
-    }
-
-    static ClassOrModuleRef PackageSpec() {
+    static ClassOrModuleRef PackageSpecRegistry() {
         return ClassOrModuleRef::fromRaw(81);
     }
 
-    static ClassOrModuleRef PackageSpecSingleton() {
+    static ClassOrModuleRef PackageSpec() {
         return ClassOrModuleRef::fromRaw(82);
+    }
+
+    static ClassOrModuleRef PackageSpecSingleton() {
+        return ClassOrModuleRef::fromRaw(83);
     }
 
     static MethodRef PackageSpec_import() {
@@ -930,44 +986,64 @@ public:
         return MethodRef::fromRaw(8);
     }
 
-    static MethodRef PackageSpec_export_for_test() {
+    static MethodRef PackageSpec_restrict_to_service() {
         return MethodRef::fromRaw(9);
     }
 
-    static MethodRef PackageSpec_restrict_to_service() {
-        return MethodRef::fromRaw(10);
-    }
-
     static ClassOrModuleRef Encoding() {
-        return ClassOrModuleRef::fromRaw(83);
-    }
-
-    static ClassOrModuleRef Thread() {
         return ClassOrModuleRef::fromRaw(84);
     }
 
-    static MethodRef Class_new() {
-        return MethodRef::fromRaw(11);
-    }
-
-    static MethodRef todoMethod() {
-        return MethodRef::fromRaw(12);
-    }
-
-    static ClassOrModuleRef Sorbet_Private_Static_ResolvedSig() {
+    static ClassOrModuleRef Thread() {
         return ClassOrModuleRef::fromRaw(85);
     }
 
-    static ClassOrModuleRef Sorbet_Private_Static_ResolvedSigSingleton() {
+    static MethodRef Class_new() {
+        return MethodRef::fromRaw(10);
+    }
+
+    static MethodRef todoMethod() {
+        return MethodRef::fromRaw(11);
+    }
+
+    static MethodRef rootStaticInit() {
+        return MethodRef::fromRaw(12);
+    }
+
+    static MethodRef PackageSpec_autoloader_compatibility() {
+        return MethodRef::fromRaw(13);
+    }
+
+    static ClassOrModuleRef Sorbet_Private_Static_ResolvedSig() {
         return ClassOrModuleRef::fromRaw(86);
     }
 
-    static ClassOrModuleRef T_Private_Compiler() {
+    static ClassOrModuleRef Sorbet_Private_Static_ResolvedSigSingleton() {
         return ClassOrModuleRef::fromRaw(87);
     }
 
-    static ClassOrModuleRef T_Private_CompilerSingleton() {
+    static ClassOrModuleRef T_Private_Compiler() {
         return ClassOrModuleRef::fromRaw(88);
+    }
+
+    static ClassOrModuleRef T_Private_CompilerSingleton() {
+        return ClassOrModuleRef::fromRaw(89);
+    }
+
+    static ClassOrModuleRef MagicBindToAttachedClass() {
+        return ClassOrModuleRef::fromRaw(90);
+    }
+
+    static ClassOrModuleRef MagicBindToSelfType() {
+        return ClassOrModuleRef::fromRaw(91);
+    }
+
+    static ClassOrModuleRef T_Types() {
+        return ClassOrModuleRef::fromRaw(92);
+    }
+
+    static ClassOrModuleRef T_Types_Base() {
+        return ClassOrModuleRef::fromRaw(93);
     }
 
     static constexpr int MAX_PROC_ARITY = 10;
@@ -992,11 +1068,11 @@ public:
         return ClassOrModuleRef::fromRaw(MAX_SYNTHETIC_CLASS_SYMBOLS - 1);
     }
 
-    static constexpr int MAX_SYNTHETIC_CLASS_SYMBOLS = 203;
-    static constexpr int MAX_SYNTHETIC_METHOD_SYMBOLS = 45;
+    static constexpr int MAX_SYNTHETIC_CLASS_SYMBOLS = 207;
+    static constexpr int MAX_SYNTHETIC_METHOD_SYMBOLS = 48;
     static constexpr int MAX_SYNTHETIC_FIELD_SYMBOLS = 4;
     static constexpr int MAX_SYNTHETIC_TYPEARGUMENT_SYMBOLS = 4;
-    static constexpr int MAX_SYNTHETIC_TYPEMEMBER_SYMBOLS = 100;
+    static constexpr int MAX_SYNTHETIC_TYPEMEMBER_SYMBOLS = 105;
 };
 
 template <typename H> H AbslHashValue(H h, const SymbolRef &m) {

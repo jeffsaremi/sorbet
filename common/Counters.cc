@@ -84,6 +84,13 @@ void CounterImpl::prodCounterAdd(const char *counter, unsigned long value) {
     this->counters[counter] += value;
 }
 
+void CounterImpl::prodCounterSet(const char *counter, unsigned long value) {
+    if (fuzz_mode) {
+        return;
+    }
+    this->counters[counter] = value;
+}
+
 void CounterImpl::timingAdd(CounterImpl::Timing timing) {
     if (fuzz_mode) {
         return;
@@ -144,7 +151,9 @@ void counterConsume(CounterState cs) {
 }
 
 void counterAdd(ConstExprStr counter, unsigned long value) {
-    counterState.counterAdd(counter.str, value);
+    if constexpr (enable_counters) {
+        counterState.counterAdd(counter.str, value);
+    }
 }
 
 void counterInc(ConstExprStr counter) {
@@ -153,6 +162,10 @@ void counterInc(ConstExprStr counter) {
 
 void prodCounterAdd(ConstExprStr counter, unsigned long value) {
     counterState.prodCounterAdd(counter.str, value);
+}
+
+void prodCounterSet(ConstExprStr counter, unsigned long value) {
+    counterState.prodCounterSet(counter.str, value);
 }
 
 void prodCounterInc(ConstExprStr counter) {
@@ -168,7 +181,9 @@ void prodCategoryCounterInc(ConstExprStr category, ConstExprStr counter) {
 }
 
 void categoryCounterAdd(ConstExprStr category, ConstExprStr counter, unsigned long value) {
-    counterState.categoryCounterAdd(category.str, counter.str, value);
+    if constexpr (enable_counters) {
+        counterState.categoryCounterAdd(category.str, counter.str, value);
+    }
 }
 
 int genThreadId() {
@@ -254,7 +269,9 @@ void histogramInc(ConstExprStr histogram, int key) {
 }
 
 void histogramAdd(ConstExprStr histogram, int key, unsigned long value) {
-    counterState.histogramAdd(histogram.str, key, value);
+    if constexpr (enable_counters) {
+        counterState.histogramAdd(histogram.str, key, value);
+    }
 }
 
 void prodHistogramInc(ConstExprStr histogram, int key) {

@@ -44,12 +44,48 @@ passes=(
   minimized-rbi
 )
 
-./bazel build //main:sorbet //test:print_document_symbols -c opt
+usage() {
+  cat <<EOF
+$0 [options] [<file>...]
 
+Arguments
+  <file>      One or more *.rb files whose exp files to update.
+              Defaults to everything in test/testdata/
+
+Options
+  --no-build  Don't build anything, just reuse what was already built
+  -h, --help  Print this message
+EOF
+}
+
+BUILD=1
 if [ $# -eq 0 ]; then
   paths=(test/testdata)
 else
+  while true; do
+    case $1 in
+      --no-build)
+        BUILD=
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      -*)
+        1>&2 echo "Unrecognized option '$1'"
+        1>&2 usage
+        exit 1
+        ;;
+      *)
+        break;
+    esac
+  done
   paths=("$@")
+fi
+
+if [ "$BUILD" != "" ]; then
+  ./bazel build //main:sorbet //test:print_document_symbols -c opt
 fi
 
 rb_src=()
@@ -75,35 +111,98 @@ for this_src in "${rb_src[@]}" DUMMY; do
   fi
 
   if [ -n "$basename" ]; then
+    needs_requires_ancestor=false
+    if grep -q '^# enable-experimental-requires-ancestor: true' "${srcs[@]}"; then
+      needs_requires_ancestor=true
+    fi
     for pass in "${passes[@]}"; do
       candidate="$basename.$pass.exp"
-      args=()
+      # Document symbols is weird, because it's (currently) the only exp-style
+      # test where you can have multiple files and multiple exp files (e.g. one
+      # per file, reflecting the document symbols for that particular file).
+      # Everything else either has a one-to-one mapping or has a many-to-one
+      # mapping (e.g. packager tests).
+      #
+      # If `candidate` doesn't exist, we might be in the case where we have files
+      # foo_test__1.rb, foo_test__2.rb, and so on, `basename`/`this_base` would
+      # therefore be `foo_test`, and `foo_test.document-symbols.exp` doesn't exist
+      # ...but `foo_test__1.rb.document-symbols.exp` does!
+      #
+      # So in the case that our first candidate doesn't exist, we need to check
+      # for the existence of other possible exp files specifically for
+      # document-symbols, and therefore we need an entirely separate list.
+      document_symbols_candidates=("$candidate")
+      if [ ! -e "$candidate" ]; then
+        if [ "$pass" != "document-symbols" ]; then
+          continue
+        fi
+
+        # Avoid re-checking the thing we already checked.
+        if [ "${#srcs[@]}" = 1 ]; then
+          continue
+        fi
+
+        document_symbols_candidates=()
+        for src in "${srcs[@]}"; do
+          if [[ "$src" =~ .*.exp ]]; then
+            continue
+          fi
+
+          src_candidate="$src.document-symbols.exp"
+          if [ -e "$src_candidate" ]; then
+            document_symbols_candidates=("${document_symbols_candidates[@]}" "$src_candidate")
+          fi
+        done
+
+        # If we still didn't find anything, we can move on.
+        if [ "${#document_symbols_candidates[@]}" = 0 ]; then
+          continue
+        fi
+      fi
+      if $needs_requires_ancestor; then
+        args=("--enable-experimental-requires-ancestor")
+      else
+        args=()
+      fi
       if [ "$pass" = "autogen" ]; then
-        args=("--stop-after=namer --skip-rewriter-passes")
+        args=("--stop-after=namer")
       elif [ "$pass" = "minimized-rbi" ]; then
         args=("--minimize-to-rbi=$basename.minimize.rbi")
       elif [ "$pass" = "package-tree" ]; then
         args=("--stripe-packages")
-        extra_prefixes=()
+
+        extra_underscore_prefixes=()
         while IFS='' read -r prefix; do
-          extra_prefixes+=("$prefix")
-        done < <(grep '# extra-package-files-directory-prefix: ' "${srcs[@]}" | sort | awk -F': ' '{print $2}')
-        if [ "${#extra_prefixes[@]}" -gt 0 ]; then
-          for prefix in "${extra_prefixes[@]}"; do
-            args+=("--extra-package-files-directory-prefix" "${prefix}")
+          extra_underscore_prefixes+=("$prefix")
+        done < <(grep '# extra-package-files-directory-prefix-underscore: ' "${srcs[@]}" | sort | awk -F': ' '{print $2}')
+        if [ "${#extra_underscore_prefixes[@]}" -gt 0 ]; then
+          for prefix in "${extra_underscore_prefixes[@]}"; do
+            args+=("--extra-package-files-directory-prefix-underscore" "${prefix}")
+          done
+        fi
+
+        extra_slash_prefixes=()
+        while IFS='' read -r prefix; do
+          extra_slash_prefixes+=("$prefix")
+        done < <(grep '# extra-package-files-directory-prefix-slash: ' "${srcs[@]}" | sort | awk -F': ' '{print $2}')
+        if [ "${#extra_slash_prefixes[@]}" -gt 0 ]; then
+          for prefix in "${extra_slash_prefixes[@]}"; do
+            args+=("--extra-package-files-directory-prefix-slash" "${prefix}")
           done
         fi
       fi
-      if ! [ -e "$candidate" ]; then
-        continue
-      fi
       case "$pass" in
         document-symbols)
-          echo bazel-bin/test/print_document_symbols \
-            "${srcs[@]}" \
-            \> "$candidate" \
-            2\>/dev/null \
-            >>"$COMMAND_FILE"
+          # See above for why this case is weird.
+          for exp in "${document_symbols_candidates[@]}"; do
+            wanted_file="${exp%.document-symbols.exp}"
+            # `srcs` contains all of the exp files, too, but including them should be harmless.
+            echo bazel-bin/test/print_document_symbols \
+              "$wanted_file" "${srcs[@]}" \
+              \> "$exp" \
+              2\>/dev/null \
+              >>"$COMMAND_FILE"
+          done
           ;;
         autocorrects)
           echo tools/scripts/print_autocorrects_exp.sh \
@@ -131,4 +230,12 @@ done
 
 if ! parallel --joblog - < "$COMMAND_FILE"; then
   echo 'WARN: parallel exiited non-zero'
+fi
+
+# Just update the entire directory, rather than figuring
+# out exactly what got updated or didn't.
+if [ "${EMIT_SYNCBACK:-}" != "" ]; then
+  echo '### BEGIN SYNCBACK ###'
+  echo 'test/testdata/'
+  echo '### END SYNCBACK ###'
 fi

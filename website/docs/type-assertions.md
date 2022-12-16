@@ -1,13 +1,14 @@
 ---
 id: type-assertions
 title: Type Assertions
+sidebar_label: T.let, T.cast, T.must, T.bind
 ---
 
 There are five ways to assert the types of expressions in Sorbet:
 
 - `T.let(expr, Type)`
 - `T.cast(expr, Type)`
-- `T.must(expr)`
+- `T.must(expr)` / `T.must_because(expr) {msg}`
 - `T.assert_type!(expr, Type)`
 - `T.bind(self, Type)`
 
@@ -99,9 +100,16 @@ will still be caught as a missing method statically.
 
 ## `T.must`
 
+<a id="tmust_because"></a>
+
 `T.must` is for asserting that a value of a [nilable type](nilable-types.md) is
 not `nil`. `T.must` is similar to `T.cast` in that it will not necessarily
 trigger an error when `srb tc` is run, but can trigger an error during runtime.
+
+`T.must_because` is like `T.must` but also takes a reason why the value is not
+expected to be `nil`, which appears in the exception that is raised if passed a
+`nil` argument.
+
 The following example illustrates two cases:
 
 1. a use of `T.must` with a value that Sorbet is able to determine statically is
@@ -134,6 +142,35 @@ end
 ```
 
 <a href="https://sorbet.run/#%23%20typed%3A%20true%0Aclass%20A%0A%20%20extend%20T%3A%3ASig%0A%0A%20%20sig%20%7Bvoid%7D%0A%20%20def%20foo%0A%20%20%20%20x%20%3D%20T.let(nil%2C%20T.nilable(String))%0A%20%20%20%20y%20%3D%20T.must(nil)%0A%20%20%20%20puts%20y%20%23%20error%3A%20This%20code%20is%20unreachable%0A%20%20end%0A%0A%20%20sig%20%7Bvoid%7D%0A%20%20def%20bar%0A%20%20%20%20vals%20%3D%20T.let(%5B%5D%2C%20T%3A%3AArray%5BInteger%5D)%0A%20%20%20%20x%20%3D%20vals.find%20%7B%7Ca%7C%20a%20%3E%200%7D%0A%20%20%20%20T.reveal_type(x)%20%23%20Revealed%20type%3A%20T.nilable(Integer)%0A%20%20%20%20y%20%3D%20T.must(x)%0A%20%20%20%20puts%20y%20%23%20no%20static%20error%0A%20%20end%0A%0Aend">
+  → View on sorbet.run
+</a>
+
+Here's the same example with `T.must_because`, showing the user of custom
+reasons. The reason is provided as a block that returns a `String`, so that the
+reason is only computed if the exception would be raised.
+
+```ruby
+class A
+  extend T::Sig
+
+  sig {void}
+  def foo
+    y = T.must_because(nil) {'reason'}
+    puts y # error: This code is unreachable
+  end
+
+  sig {void}
+  def bar
+    vals = T.let([], T::Array[Integer])
+    x = vals.find {|a| a > 0}
+    T.reveal_type(x) # Revealed type: T.nilable(Integer)
+    y = T.must_because(x) {'reason'}
+    puts y # no static error
+  end
+end
+```
+
+<a href="https://sorbet.run/#%23%20typed%3A%20true%0A%0Aclass%20A%0A%20%20extend%20T%3A%3ASig%0A%0A%20%20sig%20%7Bvoid%7D%0A%20%20def%20foo%0A%20%20%20%20y%20%3D%20T.must_because%28nil%29%20%7B'reason'%7D%0A%20%20%20%20puts%20y%20%23%20error%3A%20This%20code%20is%20unreachable%0A%20%20end%0A%0A%20%20sig%20%7Bvoid%7D%0A%20%20def%20bar%0A%20%20%20%20vals%20%3D%20T.let%28%5B%5D%2C%20T%3A%3AArray%5BInteger%5D%29%0A%20%20%20%20x%20%3D%20vals.find%20%7B%7Ca%7C%20a%20%3E%200%7D%0A%20%20%20%20T.reveal_type%28x%29%20%23%20Revealed%20type%3A%20T.nilable%28Integer%29%0A%20%20%20%20y%20%3D%20T.must_because%28x%29%20%7B'reason'%7D%0A%20%20%20%20puts%20y%20%23%20no%20static%20error%0A%20%20end%0Aend">
   → View on sorbet.run
 </a>
 
@@ -194,6 +231,41 @@ assertion result into a variable, and it can only be used on `self`.
 `T.bind` can be used anywhere `self` is used (i.e., methods, blocks, lambdas,
 etc.), though it is most usually useful within blocks. See
 [Blocks, Procs, and Lambda Types](procs.md) for more real-world usage examples.
+
+## Static vs Runtime Checking
+
+At runtime, all of these assertions verify the `expr` they are passed matches
+the `Type` they are passed.
+
+Statically, e.g., when type checking with `srb tc`, some of them are **assumed**
+to hold, but not statically checked.
+
+| Assertion                    | Static      | Runtime |
+| ---------------------------- | ----------- | ------- |
+| `T.let(expr, Type)`          | checked     | checked |
+| `T.cast(expr, Type)`         | **assumed** | checked |
+| `T.must(expr)`               | **assumed** | checked |
+| `T.assert_type!(expr, Type)` | checked     | checked |
+| `T.bind(self, Type)`         | **assumed** | checked |
+
+When an assertion is assumed to hold statically, Sorbet will only use it for the
+purpose of updating its internal understanding of the types, and will never
+attempt to alert the programmer that an assumption might not hold. In this
+sense, those assertions can be considered
+[Escape Hatches](troubleshooting.md#escape-hatches) for getting something to
+typecheck that might not otherwise.
+
+**Note** that even though all of these assertions are checked at runtime, some
+**individual types** might never be checked at runtime, regardless of the type
+assertion used. This includes the element types of generics (like the `Integer`
+in `T::Array[Integer]`), the argument and return types of
+[Proc Types](procs.md), [`T.self_type`](self-type.md),
+[`T.attached_class`](attached-class), and others.
+
+These assertions are also subject to the `T::Configuration` hooks that
+`sorbet-runtime` provides for controlling runtime type checking. See
+[Runtime Configuration](tconfiguration.md) for more. By default, all of these
+assertions will raise a `TypeError` if they are violated at runtime.
 
 ## Comparison of type assertions
 

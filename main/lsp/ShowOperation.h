@@ -21,9 +21,11 @@ public:
         Indexing = 1,
         SlowPathBlocking,
         SlowPathNonBlocking,
+        FastPath,
         References,
         SymbolSearch,
         Rename,
+        MoveMethod,
     };
     ShowOperation(const LSPConfiguration &config, Kind kind);
     ~ShowOperation();

@@ -1,6 +1,7 @@
 #include "main/lsp/LSPPreprocessor.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_replace.h"
+#include "common/kvstore/KeyValueStore.h"
 #include "main/lsp/LSPOutput.h"
 #include "main/lsp/json_types.h"
 #include "main/lsp/notifications/notifications.h"
@@ -11,7 +12,7 @@ using namespace std;
 namespace sorbet::realmain::lsp {
 
 namespace {
-string readFile(string_view path, const FileSystem &fs) {
+string readFile(const string &path, const FileSystem &fs) {
     try {
         return fs.readFile(path);
     } catch (FileNotFoundException e) {
@@ -24,35 +25,104 @@ string readFile(string_view path, const FileSystem &fs) {
     }
 }
 
-core::File::Type getFileType(string_view path, const options::Options &opts) {
-    if (opts.stripePackages && absl::EndsWith(path, "/__package.rb")) {
-        return core::File::Type::Package;
+class TerminateOnDestruction final {
+    TaskQueue &queue;
+
+public:
+    TerminateOnDestruction(TaskQueue &queue) : queue{queue} {}
+    ~TerminateOnDestruction() {
+        absl::MutexLock lck(queue.getMutex());
+        queue.terminate();
     }
-    return core::File::Type::Normal;
+};
+
+CounterState mergeCounters(CounterState counters) {
+    if (!counters.hasNullCounters()) {
+        counterConsume(move(counters));
+    }
+    return getAndClearThreadCounters();
 }
 
 } // namespace
 
-LSPPreprocessor::LSPPreprocessor(shared_ptr<LSPConfiguration> config, shared_ptr<absl::Mutex> taskQueueMutex,
-                                 shared_ptr<TaskQueueState> taskQueue, uint32_t initialVersion)
-    : config(move(config)), taskQueueMutex(std::move(taskQueueMutex)), taskQueue(move(taskQueue)),
-      owner(this_thread::get_id()), nextVersion(initialVersion + 1) {}
+bool TaskQueue::isTerminated() const {
+    return this->terminated;
+}
+
+void TaskQueue::terminate() {
+    this->terminated = true;
+}
+
+bool TaskQueue::isPaused() const {
+    return this->paused;
+}
+
+void TaskQueue::pause() {
+    this->paused = true;
+}
+
+void TaskQueue::resume() {
+    this->paused = false;
+}
+
+int TaskQueue::getErrorCode() const {
+    return this->errorCode;
+}
+
+void TaskQueue::setErrorCode(int code) {
+    this->errorCode = code;
+}
+
+CounterState &TaskQueue::getCounters() {
+    return this->counters;
+}
+
+const std::deque<std::unique_ptr<LSPTask>> &TaskQueue::tasks() const {
+    return this->pendingTasks;
+}
+
+std::deque<std::unique_ptr<LSPTask>> &TaskQueue::tasks() {
+    return this->pendingTasks;
+}
+
+absl::Mutex *TaskQueue::getMutex() {
+    return &this->stateMutex;
+}
+
+bool TaskQueue::ready() const {
+    return this->terminated || (!this->paused && !this->pendingTasks.empty());
+}
+
+LSPPreprocessor::LSPPreprocessor(shared_ptr<LSPConfiguration> config, shared_ptr<TaskQueue> taskQueue,
+                                 uint32_t initialVersion)
+    : config(move(config)), taskQueue(std::move(taskQueue)), owner(this_thread::get_id()),
+      nextVersion(initialVersion + 1) {}
 
 string_view LSPPreprocessor::getFileContents(string_view path) const {
-    auto it = openFiles.find(path);
-    if (it == openFiles.end()) {
+    auto maybeFileContents = maybeGetFileContents(path);
+    if (!maybeFileContents.has_value()) {
         ENFORCE(false, "Editor sent a change request without a matching open request.");
         return string_view();
     }
-    return it->second->source();
+    return maybeFileContents.value();
+}
+
+optional<string_view> LSPPreprocessor::maybeGetFileContents(string_view path) const {
+    auto it = openFiles.find(path);
+    optional<string_view> result;
+    if (it == openFiles.end()) {
+        return result;
+    }
+    result = it->second->source();
+    return result;
 }
 
 void LSPPreprocessor::mergeFileChanges() {
-    taskQueueMutex->AssertHeld();
+    taskQueue->getMutex()->AssertHeld();
     auto &logger = config->logger;
     // mergeFileChanges is the most expensive operation this thread performs while holding the mutex lock.
     Timer timeit(logger, "lsp.mergeFileChanges");
-    auto &pendingRequests = taskQueue->pendingTasks;
+    auto &pendingRequests = taskQueue->tasks();
     const int originalSize = pendingRequests.size();
     int requestsMergedCounter = 0;
 
@@ -136,6 +206,12 @@ unique_ptr<LSPTask> LSPPreprocessor::getTaskForMessage(LSPMessage &msg) {
                 auto newParams = canonicalizeEdits(nextVersion++, move(params));
                 return make_unique<SorbetWorkspaceEditTask>(*config, move(newParams));
             }
+            case LSPMethod::SorbetWatchmanStateEnter:
+                return make_unique<WatchmanStateEnterTask>(*config,
+                                                           move(get<unique_ptr<WatchmanStateEnter>>(rawParams)));
+            case LSPMethod::SorbetWatchmanStateLeave:
+                return make_unique<WatchmanStateLeaveTask>(*config,
+                                                           move(get<unique_ptr<WatchmanStateLeave>>(rawParams)));
             case LSPMethod::SorbetWorkspaceEdit:
                 return make_unique<SorbetWorkspaceEditTask>(
                     *config, move(get<unique_ptr<SorbetWorkspaceEditParams>>(rawParams)));
@@ -190,6 +266,8 @@ unique_ptr<LSPTask> LSPPreprocessor::getTaskForMessage(LSPMessage &msg) {
                 return make_unique<CompletionTask>(*config, id, move(get<unique_ptr<CompletionParams>>(rawParams)));
             case LSPMethod::TextDocumentCodeAction:
                 return make_unique<CodeActionTask>(*config, id, move(get<unique_ptr<CodeActionParams>>(rawParams)));
+            case LSPMethod::CodeActionResolve:
+                return make_unique<CodeActionResolveTask>(*config, id, move(get<unique_ptr<CodeAction>>(rawParams)));
             case LSPMethod::TextDocumentFormatting:
                 return make_unique<DocumentFormattingTask>(*config, id,
                                                            move(get<unique_ptr<DocumentFormattingParams>>(rawParams)));
@@ -233,8 +311,8 @@ unique_ptr<LSPTask> LSPPreprocessor::getTaskForMessage(LSPMessage &msg) {
 }
 
 bool LSPPreprocessor::cancelRequest(const CancelParams &params) {
-    absl::MutexLock lock(taskQueueMutex.get());
-    auto &pendingTasks = taskQueue->pendingTasks;
+    absl::MutexLock lock(taskQueue->getMutex());
+    auto &pendingTasks = taskQueue->tasks();
     for (auto it = pendingTasks.begin(); it != pendingTasks.end(); ++it) {
         auto &current = **it;
         if (current.cancel(params.id)) {
@@ -250,24 +328,24 @@ bool LSPPreprocessor::cancelRequest(const CancelParams &params) {
 }
 
 void LSPPreprocessor::pause() {
-    absl::MutexLock lock(taskQueueMutex.get());
-    ENFORCE(!taskQueue->paused);
+    absl::MutexLock lock(taskQueue->getMutex());
+    ENFORCE(!taskQueue->isPaused());
     config->logger->error("Pausing");
-    taskQueue->paused = true;
+    taskQueue->pause();
 }
 
 void LSPPreprocessor::resume() {
-    absl::MutexLock lock(taskQueueMutex.get());
-    ENFORCE(taskQueue->paused);
+    absl::MutexLock lock(taskQueue->getMutex());
+    ENFORCE(taskQueue->isPaused());
     config->logger->error("Resuming");
-    taskQueue->paused = false;
+    taskQueue->resume();
 }
 
 void LSPPreprocessor::exit(int exitCode) {
-    absl::MutexLock lock(taskQueueMutex.get());
-    if (!taskQueue->terminate) {
-        taskQueue->terminate = true;
-        taskQueue->errorCode = exitCode;
+    absl::MutexLock lock(taskQueue->getMutex());
+    if (!taskQueue->isTerminated()) {
+        taskQueue->terminate();
+        taskQueue->setErrorCode(exitCode);
     }
 }
 
@@ -294,9 +372,9 @@ void LSPPreprocessor::preprocessAndEnqueue(unique_ptr<LSPMessage> msg) {
     }
     if (task->finalPhase() != LSPTask::Phase::PREPROCESS) {
         // Enqueue task to be processed on processing thread.
-        absl::MutexLock lock(taskQueueMutex.get());
+        absl::MutexLock lock(taskQueue->getMutex());
         const bool isEdit = task->method == LSPMethod::SorbetWorkspaceEdit;
-        taskQueue->pendingTasks.push_back(move(task));
+        taskQueue->tasks().push_back(move(task));
         if (isEdit) {
             // Only edits can be merged; avoid looping over the queue on every request.
             mergeFileChanges();
@@ -304,6 +382,50 @@ void LSPPreprocessor::preprocessAndEnqueue(unique_ptr<LSPMessage> msg) {
     } else {
         prodCategoryCounterInc("lsp.messages.processed", task->methodString());
     }
+}
+
+unique_ptr<Joinable> LSPPreprocessor::runPreprocessor(MessageQueueState &messageQueue, absl::Mutex &messageQueueMutex) {
+    return runInAThread("lspPreprocess", [this, &messageQueue, &messageQueueMutex] {
+        // Propagate the termination flag across the two queues.
+        MessageQueueState::NotifyOnDestruction notify(messageQueue, messageQueueMutex);
+        TerminateOnDestruction notifyProcessing(*taskQueue);
+        owner = this_thread::get_id();
+        while (true) {
+            unique_ptr<LSPMessage> msg;
+            {
+                absl::MutexLock lck(&messageQueueMutex);
+                messageQueueMutex.Await(absl::Condition(
+                    +[](MessageQueueState *messageQueue) -> bool {
+                        return messageQueue->terminate || !messageQueue->pendingRequests.empty();
+                    },
+                    &messageQueue));
+                // Only terminate once incoming queue is drained.
+                if (messageQueue.terminate && messageQueue.pendingRequests.empty()) {
+                    config->logger->debug("Preprocessor terminating");
+                    return;
+                }
+                msg = move(messageQueue.pendingRequests.front());
+                messageQueue.pendingRequests.pop_front();
+                // Combine counters with this thread's counters.
+                if (!messageQueue.counters.hasNullCounters()) {
+                    counterConsume(move(messageQueue.counters));
+                }
+            }
+
+            preprocessAndEnqueue(move(msg));
+
+            {
+                absl::MutexLock lck(taskQueue->getMutex());
+                // Merge the counters from all of the worker threads with those stored in
+                // taskQueue.
+                taskQueue->getCounters() = mergeCounters(move(taskQueue->getCounters()));
+                if (taskQueue->isTerminated()) {
+                    // We must have processed an exit notification, or one of the downstream threads exited.
+                    return;
+                }
+            }
+        }
+    });
 }
 
 unique_ptr<SorbetWorkspaceEditParams>
@@ -317,9 +439,10 @@ LSPPreprocessor::canonicalizeEdits(uint32_t v, unique_ptr<DidChangeTextDocumentP
         string localPath = config->remoteName2Local(uri);
         if (!config->isFileIgnored(localPath)) {
             string fileContents = changeParams->getSource(getFileContents(localPath));
-            auto fileType = getFileType(localPath, config->opts);
+            auto fileType = core::File::Type::Normal;
             auto &slot = openFiles[localPath];
             auto file = make_shared<core::File>(move(localPath), move(fileContents), fileType, v);
+            file->setIsOpenInClient(true);
             edit->updates.push_back(file);
             slot = move(file);
         }
@@ -335,9 +458,10 @@ LSPPreprocessor::canonicalizeEdits(uint32_t v, unique_ptr<DidOpenTextDocumentPar
     if (config->isUriInWorkspace(uri)) {
         string localPath = config->remoteName2Local(uri);
         if (!config->isFileIgnored(localPath)) {
-            auto fileType = getFileType(localPath, config->opts);
+            auto fileType = core::File::Type::Normal;
             auto &slot = openFiles[localPath];
             auto file = make_shared<core::File>(move(localPath), move(openParams->textDocument->text), fileType, v);
+            file->setIsOpenInClient(true);
             edit->updates.push_back(file);
             slot = move(file);
         }
@@ -355,7 +479,7 @@ LSPPreprocessor::canonicalizeEdits(uint32_t v, unique_ptr<DidCloseTextDocumentPa
         if (!config->isFileIgnored(localPath)) {
             openFiles.erase(localPath);
             // Use contents of file on disk.
-            auto fileType = getFileType(localPath, config->opts);
+            auto fileType = core::File::Type::Normal;
             auto fileContents = readFile(localPath, *config->opts.fs);
             edit->updates.push_back(make_shared<core::File>(move(localPath), move(fileContents), fileType, v));
         }
@@ -372,7 +496,7 @@ LSPPreprocessor::canonicalizeEdits(uint32_t v, unique_ptr<WatchmanQueryResponse>
         string localPath = !config->rootPath.empty() ? absl::StrCat(config->rootPath, "/", file) : file;
         // Editor contents supercede file system updates.
         if (!config->isFileIgnored(localPath) && !openFiles.contains(localPath)) {
-            auto fileType = getFileType(localPath, config->opts);
+            auto fileType = core::File::Type::Normal;
             auto fileContents = readFile(localPath, *config->opts.fs);
             edit->updates.push_back(make_shared<core::File>(move(localPath), move(fileContents), fileType, v));
         }

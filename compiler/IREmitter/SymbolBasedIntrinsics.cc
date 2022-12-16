@@ -173,7 +173,7 @@ public:
         llvm::Value *res{nullptr};
         if (auto *blk = mcctx.blkAsFunction()) {
             if (!cMethodWithBlock.has_value()) {
-                core::Loc loc{mcctx.irctx.cfg.file, send->argLocs.back()};
+                core::Loc loc{mcctx.cs.file, send->argLocs.back()};
                 failCompilation(cs, loc, "Unable to handle a block with this intrinsic");
             }
             auto *forwarder = generateForwarder(mcctx);
@@ -398,9 +398,7 @@ void emitParamInitialization(CompilerState &cs, llvm::IRBuilderBase &builder, co
         for (auto info : nonKeywordArgInfo) {
             ++i;
             auto *id = Payload::idIntern(cs, builder, info->argumentName(cs));
-            auto *offset = IREmitterHelpers::buildU4(cs, i);
-            llvm::Value *indices[] = {offset};
-            builder.CreateStore(id, builder.CreateGEP(table, indices));
+            builder.CreateStore(id, builder.CreateConstGEP1_32(table, i));
         }
 
         auto *tableSize = IREmitterHelpers::buildS4(cs, nonKeywordArgInfo.size());
@@ -420,9 +418,7 @@ void emitParamInitialization(CompilerState &cs, llvm::IRBuilderBase &builder, co
         for (auto info : keywordArgInfo) {
             ++i;
             auto *id = Payload::idIntern(cs, builder, info->argumentName(cs));
-            auto *offset = IREmitterHelpers::buildU4(cs, i);
-            llvm::Value *indices[] = {offset};
-            builder.CreateStore(id, builder.CreateGEP(table, indices));
+            builder.CreateStore(id, builder.CreateConstGEP1_32(table, i));
         }
 
         auto *kw_num = IREmitterHelpers::buildS4(cs, kwNum);
@@ -476,15 +472,15 @@ public:
         }
 
         // Second arg: name of method to define
-        auto litName = core::cast_type_nonnull<core::LiteralType>(send->args[1].type);
-        ENFORCE(litName.literalKind == core::LiteralType::LiteralTypeKind::Symbol);
-        auto funcNameRef = litName.asName(cs);
+        auto litName = core::cast_type_nonnull<core::NamedLiteralType>(send->args[1].type);
+        ENFORCE(litName.literalKind == core::NamedLiteralType::LiteralTypeKind::Symbol);
+        auto funcNameRef = litName.asName();
         auto name = Payload::toCString(cs, funcNameRef.show(cs), builder);
 
         // Third arg: method kind (normal, attr_reader, or genericPropGetter)
-        auto litMethodKind = core::cast_type_nonnull<core::LiteralType>(send->args[2].type);
-        ENFORCE(litMethodKind.literalKind == core::LiteralType::LiteralTypeKind::Symbol);
-        auto methodKind = litMethodKind.asName(cs);
+        auto litMethodKind = core::cast_type_nonnull<core::NamedLiteralType>(send->args[2].type);
+        ENFORCE(litMethodKind.literalKind == core::NamedLiteralType::LiteralTypeKind::Symbol);
+        auto methodKind = litMethodKind.asName();
 
         auto lookupSym = isSelf ? ownerSym : ownerSym.data(cs)->attachedClass(cs);
         if (ownerSym == core::Symbols::Object() && !isSelf) {
@@ -692,27 +688,24 @@ public:
         auto options = 0;
         if (send->args.size() == 2) {
             auto &arg1 = send->args[1];
-            if (!core::isa_type<core::LiteralType>(arg1.type)) {
+            if (!core::isa_type<core::IntegerLiteralType>(arg1.type)) {
                 return IREmitterHelpers::emitMethodCallViaRubyVM(mcctx);
             }
-            auto literalOptions = core::cast_type_nonnull<core::LiteralType>(arg1.type);
-            if (literalOptions.literalKind != core::LiteralType::LiteralTypeKind::Integer) {
-                return IREmitterHelpers::emitMethodCallViaRubyVM(mcctx);
-            }
-            options = literalOptions.asInteger();
+            const auto &literalOptions = core::cast_type_nonnull<core::IntegerLiteralType>(arg1.type);
+            options = literalOptions.value;
         }
 
         auto &arg0 = send->args[0];
-        if (!core::isa_type<core::LiteralType>(arg0.type)) {
+        if (!core::isa_type<core::NamedLiteralType>(arg0.type)) {
             return IREmitterHelpers::emitMethodCallViaRubyVM(mcctx);
         }
 
-        auto literal = core::cast_type_nonnull<core::LiteralType>(arg0.type);
-        if (literal.literalKind != core::LiteralType::LiteralTypeKind::String) {
+        auto literal = core::cast_type_nonnull<core::NamedLiteralType>(arg0.type);
+        if (literal.literalKind != core::NamedLiteralType::LiteralTypeKind::String) {
             return IREmitterHelpers::emitMethodCallViaRubyVM(mcctx);
         }
         auto &builder = mcctx.builder;
-        auto str = literal.asName(cs).shortName(cs);
+        auto str = literal.asName().shortName(cs);
         return Payload::cPtrToRubyRegexp(cs, builder, str, options);
     };
 

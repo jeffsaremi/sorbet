@@ -244,7 +244,7 @@ class Array
 end
 ```
 
-## Why is `super` is untyped, even when the parent method has a `sig`?
+## Why is `super` untyped, even when the parent method has a `sig`?
 
 Sorbet can't know what the "parent method" is 100% of the time. For example,
 when calling `super` from a method defined in a module, the `super` method will
@@ -323,7 +323,6 @@ To upgrade a patch level (e.g., from 0.4.4314 to 0.4.4358):
 ```
 bundle update sorbet sorbet-runtime
 # also update plugins like sorbet-rails, if any
-bundle exec srb init
 
 # For plugins like sorbet-rails, see their docs, eg.
 https://github.com/chanzuckerberg/sorbet-rails#initial-setup
@@ -391,8 +390,12 @@ RUN wget -nv -O /etc/apk/keys/sgerrand.rsa.pub https://alpine-pkgs.sgerrand.com/
 
 ## Does Sorbet support ActiveRecord (and Rails?)
 
-[sorbet-rails] is a community-maintained project which can help generate RBI
-files for certain Rails constructs.
+Sorbet doesn't support Rails, but
+[Tapioca can generate RBI files for it](https://github.com/Shopify/tapioca#generating-rbi-files-for-rails-and-other-dsls).
+
+If you're not using Tapioca, you could use [sorbet-rails], a
+community-maintained project which can help generate RBI files for certain Rails
+constructs.
 
 Also see the [Community] page for more community-maintained projects!
 
@@ -469,3 +472,49 @@ response.
 
 Sorbet does not support duck typing either for static analysis or runtime
 checking.
+
+## How do I see errors from a single file, not the whole project?
+
+Fundamentally, Sorbet typechecks a single project at a time. Unlike other
+languages and compilers, it does not process files in a codebase one file at a
+time. This is largely due to the fact that Ruby does not have any sort of
+file-level import mechanism—in Ruby, code can usually be defined anywhere and
+used from anywhere else—and this places constraints on how Sorbet must be
+implemented.
+
+Because Sorbet typechecks a single project at a time, it does not allow
+filtering the list of errors to a single file. Sometimes though, the number of
+errors Sorbet reports can be overwhelming, especially when adopting Sorbet in a
+new codebase. In these cases, the best way to proceed is as follows:
+
+1.  Put every file in the codebase at `# typed: false` (see
+    [Strictness Levels](static.md#file-level-granularity-strictness-levels)).
+    Note that the default strictness level when there is no explicit `# typed:`
+    comment in a file is `# typed: false`. The `--typed=false` command line flag
+    can be used to forcibly override every file's strictness level to
+    `# typed: false`, regardless of what's written in the file.
+
+    Forcing every file to `# typed: false` will silence all but the most
+    critical Sorbet errors throughout the project.
+
+1.  Proceed to fix these errors. If there are still an overwhelming number of
+    errors, tackle the errors that are reported earlier first. Sorbet's design
+    means that errors discovered early in the early phases of typechecking can
+    cause redundant errors in later phases.
+
+1.  Once there are no errors in any files at `# typed: false`, proceed to
+    upgrade individual files to `# typed: true`. Only new errors will be
+    reported in these `# typed: true` files, and not in any other files.
+    Repeatedly upgrade as many individual files as is preferred. Note that many
+    Sorbet codebases start off with all files at `# typed: false` and gradually
+    (usually organically) shrink the number of `# typed: false` files over time.
+
+If for some reason it's still imperative to limit the Sorbet error output to
+only those errors coming from a single file and the steps above are not
+acceptable, we recommend post processing the errors reported by Sorbet with
+tools like `grep`.
+
+There are also third-party tools that offer the ability to sort and filter
+Sorbet's errors, like [spoom].
+
+[spoom]: https://github.com/Shopify/spoom#errors-sorting-and-filtering

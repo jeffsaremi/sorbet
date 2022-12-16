@@ -35,7 +35,7 @@ string getRootPath(const shared_ptr<LSPOutput> &output, const options::Options &
 }
 
 MarkupKind getPreferredMarkupKind(vector<MarkupKind> formats) {
-    if (find(formats.begin(), formats.end(), MarkupKind::Markdown) != formats.end()) {
+    if (absl::c_find(formats, MarkupKind::Markdown) != formats.end()) {
         return MarkupKind::Markdown;
     } else {
         return MarkupKind::Plaintext;
@@ -64,12 +64,12 @@ LSPClientConfiguration::LSPClientConfiguration(const InitializeParams &params) {
         }
     }
 
-    if (params.capabilities->textDocument) {
-        auto &textDocument = *params.capabilities->textDocument;
-        if (textDocument->completion) {
-            auto &completion = *textDocument->completion;
-            if (completion->completionItem) {
-                auto &completionItem = (*completion->completionItem);
+    if (params.capabilities->textDocument.has_value()) {
+        auto &textDocument = params.capabilities->textDocument.value();
+        if (textDocument->completion.has_value()) {
+            auto &completion = textDocument->completion.value();
+            if (completion->completionItem.has_value()) {
+                auto &completionItem = completion->completionItem.value();
                 clientCompletionItemSnippetSupport = completionItem->snippetSupport.value_or(false);
                 if (completionItem->documentationFormat != nullopt) {
                     clientCompletionItemMarkupKind =
@@ -77,11 +77,23 @@ LSPClientConfiguration::LSPClientConfiguration(const InitializeParams &params) {
                 }
             }
         }
-        if (textDocument->hover) {
-            auto &hover = *textDocument->hover;
-            if (hover->contentFormat) {
-                auto &contentFormat = *hover->contentFormat;
+        if (textDocument->hover.has_value()) {
+            auto &hover = textDocument->hover.value();
+            if (hover->contentFormat.has_value()) {
+                auto &contentFormat = hover->contentFormat.value();
                 clientHoverMarkupKind = getPreferredMarkupKind(contentFormat);
+            }
+        }
+        if (textDocument->codeAction.has_value()) {
+            auto &codeAction = textDocument->codeAction.value();
+            if (codeAction->dataSupport.has_value()) {
+                clientCodeActionDataSupport = codeAction->dataSupport.value_or(false);
+            }
+
+            if (codeAction->resolveSupport.has_value()) {
+                auto &properties = codeAction->resolveSupport.value()->properties;
+                clientCodeActionResolveEditSupport =
+                    absl::c_any_of(properties, [](auto prop) { return prop == "edit"; });
             }
         }
     }
@@ -99,25 +111,6 @@ void LSPConfiguration::setClientConfig(const shared_ptr<const LSPClientConfigura
         Exception::raise("Cannot call setClientConfig twice in one session!");
     }
     this->clientConfig = clientConfig;
-}
-
-// LSP Spec: line / col in Position are 0-based
-// Sorbet:   line / col in core::Loc are 1-based (like most editors)
-// LSP Spec: distinguishes Position (zero-width) and Range (start & end)
-// Sorbet:   zero-width core::Loc is a Position
-//
-// https://microsoft.github.io/language-server-protocol/specification#text-documents
-core::Loc LSPConfiguration::lspPos2Loc(const core::FileRef fref, const Position &pos,
-                                       const core::GlobalState &gs) const {
-    core::Loc::Detail reqPos;
-    reqPos.line = pos.line + 1;
-    reqPos.column = pos.character + 1;
-    if (auto maybeOffset = core::Loc::pos2Offset(fref.data(gs), reqPos)) {
-        auto offset = maybeOffset.value();
-        return core::Loc{fref, offset, offset};
-    } else {
-        return core::Loc::none(fref);
-    }
 }
 
 string LSPConfiguration::localName2Remote(string_view filePath) const {

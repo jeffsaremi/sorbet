@@ -6,6 +6,7 @@
 #include "absl/strings/str_split.h"
 #include "common/FileOps.h"
 #include "common/Timer.h"
+#include "common/concurrency/WorkerPool.h"
 #include "common/formatting.h"
 #include "common/sort.h"
 #include "core/Error.h"
@@ -78,6 +79,7 @@ const vector<PrintOptions> print_options({
     {"autogen-subclasses", &Printers::AutogenSubclasses},
     {"package-tree", &Printers::Packager, false},
     {"minimized-rbi", &Printers::MinimizeRBI},
+    {"payload-sources", &Printers::PayloadSources},
 });
 
 PrinterConfig::PrinterConfig() : state(make_shared<GuardedState>()){};
@@ -97,7 +99,7 @@ void PrinterConfig::flush() {
         return;
     }
     absl::MutexLock lck(&state->mutex);
-    FileOps::write(outputPath, to_string(state->buf));
+    FileOps::write(outputPath, string_view(state->buf.data(), state->buf.size()));
 };
 
 string PrinterConfig::flushToString() {
@@ -148,6 +150,7 @@ vector<reference_wrapper<PrinterConfig>> Printers::printers() {
         AutogenSubclasses,
         Packager,
         MinimizeRBI,
+        PayloadSources,
     });
 }
 
@@ -193,7 +196,7 @@ core::StrictLevel text2StrictLevel(string_view key, shared_ptr<spdlog::logger> l
     }
 }
 
-UnorderedMap<string, core::StrictLevel> extractStricnessOverrides(string fileName, shared_ptr<spdlog::logger> logger) {
+UnorderedMap<string, core::StrictLevel> extractStrictnessOverrides(string fileName, shared_ptr<spdlog::logger> logger) {
     UnorderedMap<string, core::StrictLevel> result;
     try {
         YAML::Node config = YAML::LoadFile(fileName);
@@ -235,6 +238,18 @@ UnorderedMap<string, core::StrictLevel> extractStricnessOverrides(string fileNam
         throw EarlyReturnWithCode(1);
     }
     return result;
+}
+
+void buildAutogenCacheOptions(cxxopts::Options &options) {
+    options.add_options("advanced")("autogen-constant-cache-file",
+                                    "Location of the cache file used to determine if it's safe to skip autogen. If "
+                                    "this is not provided, autogen will always run.",
+                                    cxxopts::value<string>()->default_value(""));
+    options.add_options("advanced")("autogen-changed-files",
+                                    "List of files which have changed since the last autogen run. If a cache file is "
+                                    "also provided, autogen may exit early if it determines that these files could "
+                                    "not have affected the output of autogen.",
+                                    cxxopts::value<vector<string>>());
 }
 
 cxxopts::Options
@@ -315,14 +330,25 @@ buildOptions(const vector<pipeline::semantic_extension::SemanticExtensionProvide
     options.add_options("advanced")("watchman-path",
                                     "Path to watchman executable. Defaults to using `watchman` on your PATH.",
                                     cxxopts::value<string>()->default_value(empty.watchmanPath));
+    options.add_options("advanced")("watchman-pause-state-name",
+                                    "Name of watchman state that halts processing for its duration",
+                                    cxxopts::value<string>()->default_value(empty.watchmanPauseStateName));
+
     options.add_options("advanced")("enable-experimental-lsp-document-symbol",
                                     "Enable experimental LSP feature: Document Symbol");
     options.add_options("advanced")("enable-experimental-lsp-document-formatting-rubyfmt",
                                     "Enable experimental LSP feature: Document Formatting with Rubyfmt");
+    options.add_options("advanced")(
+        "rubyfmt-path",
+        "Path to the rubyfmt executable used for document formatting. Defaults to using `rubyfmt` on your PATH.",
+        cxxopts::value<string>()->default_value(empty.rubyfmtPath));
     options.add_options("advanced")("enable-experimental-lsp-document-highlight",
                                     "Enable experimental LSP feature: Document Highlight");
     options.add_options("advanced")("enable-experimental-lsp-signature-help",
                                     "Enable experimental LSP feature: Signature Help");
+    options.add_options("advanced")("enable-experimental-lsp-fast-path",
+                                    "Enable experimental LSP feature: a faster fast path using symbol deletions",
+                                    cxxopts::value<bool>()->default_value("true"));
     options.add_options("advanced")("enable-experimental-requires-ancestor",
                                     "Enable experimental `requires_ancestor` annotation");
 
@@ -356,8 +382,14 @@ buildOptions(const vector<pipeline::semantic_extension::SemanticExtensionProvide
     options.add_options("advanced")("stripe-packages-hint-message",
                                     "Optional hint message to add to packaging related errors",
                                     cxxopts::value<string>()->default_value(""));
-    options.add_options("dev")("extra-package-files-directory-prefix",
-                               "Extra parent directories which contain package files. "
+    options.add_options("dev")("extra-package-files-directory-prefix-underscore",
+                               "Extra parent directories which contain package files. These paths use an underscore "
+                               "package-munging convention, i.e. 'Project_Foo'."
+                               "This option must be used in conjunction with --stripe-packages",
+                               cxxopts::value<vector<string>>(), "string");
+    options.add_options("dev")("extra-package-files-directory-prefix-slash",
+                               "Extra parent directories which contain package files. These paths use an underscore "
+                               "package-munging convention, i.e. 'project/foo'."
                                "This option must be used in conjunction with --stripe-packages",
                                cxxopts::value<vector<string>>(), "string");
     options.add_options("dev")(
@@ -388,22 +420,25 @@ buildOptions(const vector<pipeline::semantic_extension::SemanticExtensionProvide
                                     "Modules that should never be collapsed into their parent. This helps break cycles "
                                     "in certain cases. (e.g. Foo::Bar::Baz)",
                                     cxxopts::value<vector<string>>());
+    options.add_options("advanced")("autogen-autoloader-pbal-namespaces",
+                                    "Namespaces for which path-based autoloading is enabled.",
+                                    cxxopts::value<vector<string>>());
     options.add_options("advanced")("autogen-autoloader-strip-prefix",
                                     "Prefixes to strip from file output paths. "
                                     "If path does not start with prefix, nothing is stripped",
                                     cxxopts::value<vector<string>>());
-    options.add_options("advanced")("autogen-autoloader-packaged", "Generate the packaged autoloader files",
-                                    cxxopts::value<bool>());
+    buildAutogenCacheOptions(options);
 
     options.add_options("advanced")("error-url-base",
                                     "Error URL base string. If set, error URLs are generated by prefixing the "
                                     "error code with this string.",
                                     cxxopts::value<string>()->default_value(empty.errorUrlBase), "url-base");
-    options.add_options("advanced")("ruby3-keyword-args", "Enforce use of new (Ruby 3.0-style) keyword arguments",
-                                    cxxopts::value<bool>());
+    options.add_options("advanced")("experimental-ruby3-keyword-args",
+                                    "Enforce use of new (Ruby 3.0-style) keyword arguments", cxxopts::value<bool>());
 
     // Developer options
     options.add_options("dev")("p,print", to_string(all_prints), cxxopts::value<vector<string>>(), "type");
+    options.add_options("dev")("trace-lexer", "Emit the lexer's token stream in a debug format");
     options.add_options("dev")("trace-parser", "Enable bison's parser trace functionality");
     options.add_options("dev")("autogen-subclasses-parent",
                                "Parent classes for which generate a list of subclasses. "
@@ -412,6 +447,9 @@ buildOptions(const vector<pipeline::semantic_extension::SemanticExtensionProvide
     options.add_options("dev")("autogen-subclasses-ignore",
                                "Like --ignore, but it only affects `-p autogen-subclasses`.",
                                cxxopts::value<vector<string>>(), "string");
+    options.add_options("dev")("autogen-behavior-allowed-in-rbi-files-paths",
+                               "RBI files defined in these paths can be considered by autogen as behavior-defining.",
+                               cxxopts::value<vector<string>>(), "string");
     options.add_options("dev")("stop-after", to_string(all_stop_after),
                                cxxopts::value<string>()->default_value("inferencer"), "phase");
     options.add_options("dev")("no-stdlib", "Do not load included rbi files for stdlib");
@@ -419,11 +457,11 @@ buildOptions(const vector<pipeline::semantic_extension::SemanticExtensionProvide
                                "[experimental] Output a minimal RBI contining the diff between Sorbet's view of a "
                                "codebase and the definitions present in this file",
                                cxxopts::value<std::string>()->default_value(""), "<file.rbi>");
-    options.add_options("dev")("skip-rewriter-passes", "Do not run Rewriter passess");
     options.add_options("dev")("wait-for-dbg", "Wait for debugger on start");
     options.add_options("dev")("stress-incremental-resolver",
                                "Force incremental updates to discover resolver & namer bugs");
-    options.add_options("dev")("sleep-in-slow-path", "Add some sleeps to slow path to artificially slow it down");
+    options.add_options("dev")("sleep-in-slow-path", "Add some sleeps to slow path to artificially slow it down",
+                               cxxopts::value<int>()->implicit_value("3"));
     options.add_options("dev")("simulate-crash", "Crash on start");
     options.add_options("dev")("silence-dev-message", "Silence \"You are running a development build\" message");
     options.add_options("dev")("censor-for-snapshot-tests",
@@ -433,8 +471,17 @@ buildOptions(const vector<pipeline::semantic_extension::SemanticExtensionProvide
                                "Errors not mentioned will be silenced. "
                                "This option can be passed multiple times.",
                                cxxopts::value<vector<int>>(), "errorCode");
-    options.add_options("dev")("package-rbi-output", "Serialize package RBIs to folder.",
+    options.add_options("dev")("single-package", "Run in single-package mode",
                                cxxopts::value<string>()->default_value(""));
+    options.add_options("dev")("package-rbi-generation", "Enable rbi generation for stripe packages",
+                               cxxopts::value<bool>());
+    options.add_options("dev")("package-rbi-dir", "The location of generated package rbis",
+                               cxxopts::value<string>()->default_value(""));
+    options.add_options("dev")(
+        "package-skip-rbi-export-enforcement",
+        "Constants defined in RBIs in these directories can be exported (otherwise, this behavior is disallowed)."
+        "This option can only be used in conjunction with --stripe-packages",
+        cxxopts::value<vector<string>>(), "string");
     options.add_options("dev")("dump-package-info", "Dump package info in JSON form to the given file.",
                                cxxopts::value<string>()->default_value(""));
     options.add_options("dev")("suppress-error-code",
@@ -457,6 +504,10 @@ buildOptions(const vector<pipeline::semantic_extension::SemanticExtensionProvide
                                cxxopts::value<string>()->default_value(empty.storeState), "file");
     options.add_options("dev")("cache-dir", "Use the specified folder to cache data",
                                cxxopts::value<string>()->default_value(empty.cacheDir), "dir");
+    options.add_options("dev")("max-cache-size-bytes",
+                               "Must be a multiple of OS page size. Subject to restrictions on mdb_env_set_mapsize "
+                               "function in LMDB API docs.",
+                               cxxopts::value<size_t>()->default_value(to_string(empty.maxCacheSizeBytes)), "dir");
     options.add_options("dev")("suppress-non-critical", "Exit 0 unless there was a critical error");
 
     int defaultThreads = thread::hardware_concurrency();
@@ -556,6 +607,12 @@ bool extractPrinters(cxxopts::ParseResult &raw, Options &opts, shared_ptr<spdlog
     }
     return true;
 }
+void extractAutogenConstCacheConfig(cxxopts::ParseResult &raw, AutogenConstCacheConfig &cfg) {
+    cfg.cacheFile = raw["autogen-constant-cache-file"].as<string>();
+    if (raw.count("autogen-changed-files") > 0) {
+        cfg.changedFiles = raw["autogen-changed-files"].as<vector<string>>();
+    }
+}
 
 Phase extractStopAfter(cxxopts::ParseResult &raw, shared_ptr<spdlog::logger> logger) {
     string opt = raw["stop-after"].as<string>();
@@ -619,38 +676,41 @@ bool extractAutoloaderConfig(cxxopts::ParseResult &raw, Options &opts, shared_pt
             cfg.sameFileModules.emplace_back(absl::StrSplit(fullName, "::"));
         }
     }
+    if (raw.count("autogen-autoloader-pbal-namespaces") > 0) {
+        for (auto &fullName : raw["autogen-autoloader-pbal-namespaces"].as<vector<string>>()) {
+            cfg.pbalNamespaces.emplace_back(absl::StrSplit(fullName, "::"));
+        }
+    }
     cfg.preamble = raw["autogen-autoloader-preamble"].as<string>();
     cfg.registryModule = raw["autogen-registry-module"].as<string>();
     cfg.rootDir = stripTrailingSlashes(raw["autogen-autoloader-root"].as<string>());
-    cfg.packagedAutoloader = raw["autogen-autoloader-packaged"].as<bool>();
-    if (cfg.packagedAutoloader) {
-        // TODO(ngroman) Multi-package autoloader runtime support
-        logger->error("Flag --autogen-autoloader-packaged is currently not supported.");
-        throw EarlyReturnWithCode(1);
-    }
 
     cfg.rootObject = raw["autogen-root-object"].as<string>();
     return true;
 }
 
-void addFilesFromDir(Options &opts, string_view dir, shared_ptr<spdlog::logger> logger) {
+void addFilesFromDir(Options &opts, string_view dir, WorkerPool &workerPool, shared_ptr<spdlog::logger> logger) {
     auto fileNormalized = stripTrailingSlashes(dir);
     opts.rawInputDirNames.emplace_back(fileNormalized);
     // Expand directory into list of files.
     vector<string> containedFiles;
     try {
-        containedFiles = opts.fs->listFilesInDir(fileNormalized, opts.allowedExtensions, true,
+        containedFiles = opts.fs->listFilesInDir(fileNormalized, opts.allowedExtensions, workerPool, true,
                                                  opts.absoluteIgnorePatterns, opts.relativeIgnorePatterns);
-    } catch (sorbet::FileNotFoundException) {
-        logger->error("Directory `{}` not found", dir);
+    } catch (sorbet::FileNotFoundException e) {
+        logger->error(e.what());
         throw EarlyReturnWithCode(1);
     } catch (sorbet::FileNotDirException) {
         logger->error("Path `{}` is not a directory", dir);
         throw EarlyReturnWithCode(1);
     }
-    opts.inputFileNames.reserve(opts.inputFileNames.size() + containedFiles.size());
-    opts.inputFileNames.insert(opts.inputFileNames.end(), std::make_move_iterator(containedFiles.begin()),
-                               std::make_move_iterator(containedFiles.end()));
+    if (opts.inputFileNames.size() == 0) {
+        opts.inputFileNames = move(containedFiles);
+    } else {
+        opts.inputFileNames.reserve(opts.inputFileNames.size() + containedFiles.size());
+        opts.inputFileNames.insert(opts.inputFileNames.end(), std::make_move_iterator(containedFiles.begin()),
+                                   std::make_move_iterator(containedFiles.end()));
+    }
 }
 
 void readOptions(Options &opts,
@@ -679,13 +739,16 @@ void readOptions(Options &opts,
             parseIgnorePatterns(rawIgnorePatterns, opts.absoluteIgnorePatterns, opts.relativeIgnorePatterns);
         }
 
+        int maxInputFileThreads = raw["max-threads"].as<int>();
+        auto workerPool = WorkerPool::create(maxInputFileThreads, *logger);
+
         opts.pathPrefix = raw["remove-path-prefix"].as<string>();
         if (raw.count("files") > 0) {
             auto rawFiles = raw["files"].as<vector<string>>();
             struct stat s;
             for (auto &file : rawFiles) {
                 if (stat(file.c_str(), &s) == 0 && s.st_mode & S_IFDIR) {
-                    addFilesFromDir(opts, file, logger);
+                    addFilesFromDir(opts, file, *workerPool, logger);
                 } else {
                     opts.rawInputFileNames.push_back(file);
                     opts.inputFileNames.push_back(file);
@@ -703,7 +766,7 @@ void readOptions(Options &opts,
             auto rawDirs = raw["dir"].as<vector<string>>();
             for (auto &dir : rawDirs) {
                 // Since we don't stat here, we're unsure if the directory exists / is a directory.
-                addFilesFromDir(opts, dir, logger);
+                addFilesFromDir(opts, dir, *workerPool, logger);
             }
         }
 
@@ -721,12 +784,16 @@ void readOptions(Options &opts,
         bool enableAllLSPFeatures = raw["enable-all-experimental-lsp-features"].as<bool>();
         opts.lspAllBetaFeaturesEnabled = enableAllLSPFeatures || raw["enable-all-beta-lsp-features"].as<bool>();
         opts.lspDocumentSymbolEnabled =
-            enableAllLSPFeatures || raw["enable-experimental-lsp-document-symbol"].as<bool>();
+            opts.lspAllBetaFeaturesEnabled || raw["enable-experimental-lsp-document-symbol"].as<bool>();
         opts.lspDocumentHighlightEnabled =
             enableAllLSPFeatures || raw["enable-experimental-lsp-document-highlight"].as<bool>();
         opts.lspSignatureHelpEnabled = enableAllLSPFeatures || raw["enable-experimental-lsp-signature-help"].as<bool>();
+        opts.rubyfmtPath = raw["rubyfmt-path"].as<string>();
         opts.lspDocumentFormatRubyfmtEnabled =
-            enableAllLSPFeatures || raw["enable-experimental-lsp-document-formatting-rubyfmt"].as<bool>();
+            FileOps::exists(opts.rubyfmtPath) &&
+            (enableAllLSPFeatures || raw["enable-experimental-lsp-document-formatting-rubyfmt"].as<bool>());
+
+        opts.lspExperimentalFastPathEnabled = raw["enable-experimental-lsp-fast-path"].as<bool>();
 
         if (raw.count("lsp-directories-missing-from-client") > 0) {
             auto lspDirsMissingFromClient = raw["lsp-directories-missing-from-client"].as<vector<string>>();
@@ -743,6 +810,7 @@ void readOptions(Options &opts,
         opts.lspErrorCap = raw["lsp-error-cap"].as<int>();
 
         opts.cacheDir = raw["cache-dir"].as<string>();
+        opts.maxCacheSizeBytes = raw["max-cache-size-bytes"].as<size_t>();
         if (!extractPrinters(raw, opts, logger)) {
             throw EarlyReturnWithCode(1);
         }
@@ -763,6 +831,12 @@ void readOptions(Options &opts,
         opts.runLSP = raw["lsp"].as<bool>();
         opts.disableWatchman = raw["disable-watchman"].as<bool>();
         opts.watchmanPath = raw["watchman-path"].as<string>();
+        opts.watchmanPauseStateName = raw["watchman-pause-state-name"].as<string>();
+        if (!opts.watchmanPauseStateName.empty() && !opts.disableWatchman) {
+            logger->error("watchman-pause-state-name must be used with watchman enabled");
+            throw EarlyReturnWithCode(1);
+        }
+
         // Certain features only need certain passes
         if (opts.print.isAutogen() && (opts.stopAfterPhase != Phase::NAMER)) {
             logger->error(
@@ -791,6 +865,18 @@ void readOptions(Options &opts,
                 }
             }
         }
+
+        if (raw.count("autogen-behavior-allowed-in-rbi-files-paths") > 0) {
+            if (!opts.print.isAutogen() || opts.print.AutogenAutoloader.enabled) {
+                logger->error("autogen-behavior-allowed-in-rbi-files-paths can only be used with -p autogen or -p "
+                              "autogen-msgpack");
+                throw EarlyReturnWithCode(1);
+            }
+            opts.autogenBehaviorAllowedInRBIFilesPaths =
+                raw["autogen-behavior-allowed-in-rbi-files-paths"].as<vector<string>>();
+        }
+
+        extractAutogenConstCacheConfig(raw, opts.autogenConstantCacheConfig);
 
         opts.noErrorCount = raw["no-error-count"].as<bool>();
         opts.noStdlib = raw["no-stdlib"].as<bool>();
@@ -833,15 +919,17 @@ void readOptions(Options &opts,
         }
 
         opts.showProgress = raw["P"].as<bool>();
-        opts.skipRewriterPasses = raw["skip-rewriter-passes"].as<bool>();
         opts.suggestTyped = raw["suggest-typed"].as<bool>();
         if (raw.count("suggest-unsafe") > 0) {
             opts.suggestUnsafe = raw["suggest-unsafe"].as<string>();
         }
         opts.waitForDebugger = raw["wait-for-dbg"].as<bool>();
+        opts.traceLexer = raw["trace-lexer"].as<bool>();
         opts.traceParser = raw["trace-parser"].as<bool>();
         opts.stressIncrementalResolver = raw["stress-incremental-resolver"].as<bool>();
-        opts.sleepInSlowPath = raw["sleep-in-slow-path"].as<bool>();
+        if (raw.count("sleep-in-slow-path") > 0) {
+            opts.sleepInSlowPathSeconds = raw["sleep-in-slow-path"].as<int>();
+        }
         opts.enableCounters = raw["counters"].as<bool>();
         opts.silenceDevMessage = raw["silence-dev-message"].as<bool>();
         opts.censorForSnapshotTests = raw["censor-for-snapshot-tests"].as<bool>();
@@ -881,20 +969,29 @@ void readOptions(Options &opts,
         }
         opts.stripeMode = raw["stripe-mode"].as<bool>();
         opts.stripePackages = raw["stripe-packages"].as<bool>();
-        if (raw.count("extra-package-files-directory-prefix")) {
-            if (!opts.stripePackages) {
-                logger->error("--extra-package-files-directory-prefix can only be specified in --stripe-packages mode");
-                throw EarlyReturnWithCode(1);
-            }
-            for (const string &dirName : raw["extra-package-files-directory-prefix"].as<vector<string>>()) {
+
+        if (raw.count("extra-package-files-directory-prefix-underscore")) {
+            for (const string &dirName : raw["extra-package-files-directory-prefix-underscore"].as<vector<string>>()) {
                 if (dirName.back() != '/') {
-                    logger->error(
-                        "--extra-package-files-directory-prefix directory path must have slash (/) at the end");
+                    logger->error("--extra-package-files-directory-prefix-underscore directory path must have slash "
+                                  "(/) at the end");
                     throw EarlyReturnWithCode(1);
                 }
-                opts.extraPackageFilesDirectoryPrefixes.emplace_back(dirName);
+                opts.extraPackageFilesDirectoryUnderscorePrefixes.emplace_back(dirName);
             }
         }
+
+        if (raw.count("extra-package-files-directory-prefix-slash")) {
+            for (const string &dirName : raw["extra-package-files-directory-prefix-slash"].as<vector<string>>()) {
+                if (dirName.back() != '/') {
+                    logger->error("--extra-package-files-directory-prefix-slash directory path must have slash "
+                                  "(/) at the end");
+                    throw EarlyReturnWithCode(1);
+                }
+                opts.extraPackageFilesDirectorySlashPrefixes.emplace_back(dirName);
+            }
+        }
+
         if (raw.count("secondary-test-package-namespaces")) {
             if (!opts.stripePackages) {
                 logger->error("--secondary-test-package-namespaces can only be specified in --stripe-packages mode");
@@ -918,13 +1015,56 @@ void readOptions(Options &opts,
             }
         }
 
-        opts.packageRBIOutput = raw["package-rbi-output"].as<string>();
+        opts.packageRBIGeneration = raw["package-rbi-generation"].as<bool>();
+
+        opts.packageRBIDir = raw["package-rbi-dir"].as<string>();
+        if (!opts.packageRBIDir.empty()) {
+            if (opts.stripePackages) {
+                logger->error("--package-rbi-dir must not be specified in --stripe-packages mode");
+                throw EarlyReturnWithCode(1);
+            }
+        }
+
+        if (raw.count("package-skip-rbi-export-enforcement")) {
+            if (!opts.stripePackages) {
+                logger->error("--package-skip-rbi-export-enforcement can only be specified in --stripe-packages mode");
+                throw EarlyReturnWithCode(1);
+            }
+            for (const string &ns : raw["package-skip-rbi-export-enforcement"].as<vector<string>>()) {
+                opts.packageSkipRBIExportEnforcementDirs.emplace_back(ns);
+            }
+        }
+
+        opts.singlePackage = raw["single-package"].as<string>();
+        if (!opts.singlePackage.empty()) {
+            if (opts.stripePackages) {
+                logger->error("--single-package must not be specified in --stripe-packages mode");
+                throw EarlyReturnWithCode(1);
+            }
+
+            if (opts.packageRBIDir.empty()) {
+                logger->error("--single-package requires --package-rbi-dir also be provided");
+                throw EarlyReturnWithCode(1);
+            }
+
+            if (!opts.packageRBIGeneration) {
+                logger->error("--single-package can only be specified in --package-rbi-generation mode");
+                throw EarlyReturnWithCode(1);
+            }
+        }
+
         opts.dumpPackageInfo = raw["dump-package-info"].as<string>();
+        if (!opts.dumpPackageInfo.empty()) {
+            if (!opts.stripePackages) {
+                logger->error("--dump-package-info can only be specified in --stripe-packages mode");
+                throw EarlyReturnWithCode(1);
+            }
+        }
 
         extractAutoloaderConfig(raw, opts, logger);
         opts.errorUrlBase = raw["error-url-base"].as<string>();
         opts.noErrorSections = raw["no-error-sections"].as<bool>();
-        opts.ruby3KeywordArgs = raw["ruby3-keyword-args"].as<bool>();
+        opts.ruby3KeywordArgs = raw["experimental-ruby3-keyword-args"].as<bool>();
         if (raw.count("error-white-list") > 0) {
             logger->error("`{}` is deprecated; please use `{}` instead", "--error-white-list", "--isolate-error-code");
             auto rawList = raw["error-white-list"].as<vector<int>>();
@@ -955,10 +1095,23 @@ void readOptions(Options &opts,
         }
 
         if (raw.count("e") == 0 && opts.inputFileNames.empty() && !raw["version"].as<bool>() && !opts.runLSP &&
-            opts.storeState.empty()) {
+            opts.storeState.empty() && !opts.print.PayloadSources.enabled) {
             logger->error("You must pass either `{}` or at least one folder or ruby file.\n\n{}", "-e",
                           options.help({""}));
             throw EarlyReturnWithCode(1);
+        }
+
+        if (opts.print.PayloadSources.enabled) {
+            if (opts.noStdlib) {
+                logger->error("You can't pass both `{}` and `{}`.", "--print=payload-sources", "--no-stdlib");
+                throw EarlyReturnWithCode(1);
+            } else if (raw.count("e") > 0) {
+                logger->error("You can't pass both `{}` and `{}`.", "--print=payload-sources", "-e");
+                throw EarlyReturnWithCode(1);
+            } else if (!opts.inputFileNames.empty()) {
+                logger->error("You can't pass both `{}` and paths to typecheck.", "--print=payload-sources");
+                throw EarlyReturnWithCode(1);
+            }
         }
 
         if ((raw["color"].as<string>() == "never") || opts.runLSP) {
@@ -994,9 +1147,9 @@ void readOptions(Options &opts,
             }
         }
 
-        opts.supressNonCriticalErrors = raw["suppress-non-critical"].as<bool>();
+        opts.suppressNonCriticalErrors = raw["suppress-non-critical"].as<bool>();
         if (!raw["typed-override"].as<string>().empty()) {
-            opts.strictnessOverrides = extractStricnessOverrides(raw["typed-override"].as<string>(), logger);
+            opts.strictnessOverrides = extractStrictnessOverrides(raw["typed-override"].as<string>(), logger);
         }
 
         for (auto &provider : semanticExtensionProviders) {
@@ -1014,6 +1167,21 @@ void readOptions(Options &opts,
     } catch (cxxopts::OptionParseException &e) {
         logger->info("{}. To see all available options pass `--help`.", e.what());
         throw EarlyReturnWithCode(1);
+    }
+}
+
+bool readAutogenConstCacheOptions(AutogenConstCacheConfig &cfg, int argc, const char *argv[],
+                                  shared_ptr<spdlog::logger> logger) noexcept(false) { // throw(EarlyReturnWithCode)
+    cxxopts::Options options("sorbet", "Typechecker for Ruby");
+    options.allow_unrecognised_options(); // Don't raise error on other options
+    buildAutogenCacheOptions(options);
+
+    try {
+        cxxopts::ParseResult raw = options.parse(argc, argv);
+        extractAutogenConstCacheConfig(raw, cfg);
+        return true;
+    } catch (cxxopts::OptionParseException &e) {
+        return false;
     }
 }
 

@@ -35,7 +35,7 @@ string getFunctionNamePrefix(CompilerState &cs, core::ClassOrModuleRef sym) {
     }
     string prefix = IREmitterHelpers::isRootishSymbol(cs, sym.data(cs)->owner)
                         ? ""
-                        : getFunctionNamePrefix(cs, sym.data(cs)->owner.asClassOrModuleRef()) + "::";
+                        : getFunctionNamePrefix(cs, sym.data(cs)->owner) + "::";
 
     return prefix + suffix;
 }
@@ -55,6 +55,14 @@ string IREmitterHelpers::getFunctionName(CompilerState &cs, core::MethodRef sym)
     string suffix;
     if (name.kind() == core::NameKind::UTF8) {
         suffix = string(name.shortName(cs));
+    } else if (name.kind() == core::NameKind::UNIQUE && name.dataUnique(cs)->original == core::Names::staticInit()) {
+        // For file-level static init, the unique name generated depends on the
+        // number of files Sorbet is processing (especially, for tests, the number
+        // of files in the payload), which makes the output of just name.toString(cs)
+        // less deterministic than we would like.  For class-level static-init,
+        // the function name will be prefixed with the class name anyway, so we
+        // don't need the unique integer appended to it.
+        suffix = name.dataUnique(cs)->original.toString(cs);
     } else {
         suffix = name.toString(cs);
     }
@@ -317,28 +325,30 @@ llvm::Value *IREmitterHelpers::emitLiteralish(CompilerState &cs, llvm::IRBuilder
     if (lit.derivesFrom(cs, core::Symbols::NilClass())) {
         return Payload::rubyNil(cs, builder);
     }
+    if (core::isa_type<core::IntegerLiteralType>(lit)) {
+        const auto &litInt = core::cast_type_nonnull<core::IntegerLiteralType>(lit);
+        auto *value = Payload::longToRubyValue(cs, builder, litInt.value);
+        Payload::assumeType(cs, builder, value, core::Symbols::Integer());
+        return value;
+    }
+    if (core::isa_type<core::FloatLiteralType>(lit)) {
+        const auto &litFloat = core::cast_type_nonnull<core::FloatLiteralType>(lit);
+        auto *value = Payload::doubleToRubyValue(cs, builder, litFloat.value);
+        Payload::assumeType(cs, builder, value, core::Symbols::Float());
+        return value;
+    }
 
-    auto litType = core::cast_type_nonnull<core::LiteralType>(lit);
+    auto litType = core::cast_type_nonnull<core::NamedLiteralType>(lit);
     switch (litType.literalKind) {
-        case core::LiteralType::LiteralTypeKind::Integer: {
-            auto *value = Payload::longToRubyValue(cs, builder, litType.asInteger());
-            Payload::assumeType(cs, builder, value, core::Symbols::Integer());
-            return value;
-        }
-        case core::LiteralType::LiteralTypeKind::Float: {
-            auto *value = Payload::doubleToRubyValue(cs, builder, litType.asFloat());
-            Payload::assumeType(cs, builder, value, core::Symbols::Float());
-            return value;
-        }
-        case core::LiteralType::LiteralTypeKind::Symbol: {
-            auto str = litType.asName(cs).shortName(cs);
+        case core::NamedLiteralType::LiteralTypeKind::Symbol: {
+            auto str = litType.asName().shortName(cs);
             auto rawId = Payload::idIntern(cs, builder, str);
             auto *value = builder.CreateCall(cs.getFunction("rb_id2sym"), {rawId}, "rawSym");
             Payload::assumeType(cs, builder, value, core::Symbols::Symbol());
             return value;
         }
-        case core::LiteralType::LiteralTypeKind::String: {
-            auto str = litType.asName(cs).shortName(cs);
+        case core::NamedLiteralType::LiteralTypeKind::String: {
+            auto str = litType.asName().shortName(cs);
             auto *value = Payload::cPtrToRubyString(cs, builder, str, true);
             Payload::assumeType(cs, builder, value, core::Symbols::String());
             return value;
@@ -390,23 +400,7 @@ std::string IREmitterHelpers::showClassNameWithoutOwner(const core::GlobalState 
         withoutOwnerStr = name.show(gs);
     };
 
-    // This is a little bit gross.  Symbol performs this sort of logic itself, but
-    // the above calls are done inside NameRef, which doesn't have the necessary
-    // symbol ownership information to do this sort of munging.  So we have to
-    // duplicate the Symbol logic here.
-    if (sym.owner(gs) != core::Symbols::PackageRegistry() || !name.isPackagerName(gs)) {
-        return withoutOwnerStr;
-    }
-
-    if (name.isPackagerPrivateName(gs)) {
-        // Remove _Package_Private before de-munging
-        return absl::StrReplaceAll(
-            withoutOwnerStr.substr(0, withoutOwnerStr.size() - core::PACKAGE_PRIVATE_SUFFIX.size()), {{"_", "::"}});
-    }
-
-    // Remove _Package before de-munging
-    return absl::StrReplaceAll(withoutOwnerStr.substr(0, withoutOwnerStr.size() - core::PACKAGE_SUFFIX.size()),
-                               {{"_", "::"}});
+    return withoutOwnerStr;
 }
 
 bool IREmitterHelpers::isRootishSymbol(const core::GlobalState &gs, core::SymbolRef sym) {
@@ -416,12 +410,6 @@ bool IREmitterHelpers::isRootishSymbol(const core::GlobalState &gs, core::Symbol
 
     // These are the obvious cases.
     if (sym == core::Symbols::root() || sym == core::Symbols::rootSingleton()) {
-        return true;
-    }
-
-    // --stripe-packages interposes its own set of symbols at the toplevel.
-    // Absent any runtime support, we need to consider these as rootish.
-    if (sym == core::Symbols::PackageRegistry() || sym.name(gs).isPackagerName(gs)) {
         return true;
     }
 
@@ -517,7 +505,7 @@ llvm::Value *IREmitterHelpers::receiverFastPathTestWithCache(MethodCallContext &
 llvm::Value *CallCacheFlags::build(CompilerState &cs, llvm::IRBuilderBase &builder) {
     static struct {
         bool CallCacheFlags::*field;
-        string_view functionName;
+        string_view variableName;
         llvm::StringRef flagName;
     } flags[] = {
         {&CallCacheFlags::args_simple, "sorbet_vmCallArgsSimple", "VM_CALL_ARGS_SIMPLE"},
@@ -531,7 +519,11 @@ llvm::Value *CallCacheFlags::build(CompilerState &cs, llvm::IRBuilderBase &build
     llvm::Value *acc = llvm::ConstantInt::get(cs, llvm::APInt(32, 0, false));
     for (auto &flag : flags) {
         if (this->*flag.field) {
-            auto *flagVal = builder.CreateCall(cs.getFunction(flag.functionName), {}, flag.flagName);
+            const bool allowInternal = true;
+            auto *global = cs.module->getGlobalVariable(flag.variableName, allowInternal);
+            ENFORCE(global != nullptr);
+            ENFORCE(global->hasInitializer());
+            auto *flagVal = global->getInitializer();
             acc = builder.CreateBinOp(llvm::Instruction::Or, acc, flagVal);
         }
     }

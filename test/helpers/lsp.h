@@ -16,6 +16,7 @@ std::string uriToFilePath(const LSPConfiguration &config, std::string_view uri);
 std::unique_ptr<InitializeParams>
 makeInitializeParams(std::optional<std::variant<std::string, JSONNullObject>> rootPath,
                      std::variant<std::string, JSONNullObject> rootUri, bool supportsMarkdown,
+                     bool supportsCodeActionResolve,
                      std::optional<std::unique_ptr<SorbetInitializationOptions>> initOptions);
 
 /** Create an LSPMessage containing a textDocument/definition request. */
@@ -23,6 +24,9 @@ std::unique_ptr<LSPMessage> makeDefinitionRequest(int id, std::string_view uri, 
 
 /** Create an LSPMessage containing a textDocument/hover request. */
 std::unique_ptr<LSPMessage> makeHover(int id, std::string_view uri, int line, int character);
+
+/** Create an LSPMessage containing a textDocument/codeAction request. */
+std::unique_ptr<LSPMessage> makeCodeAction(int id, std::string_view uri, int line, int character);
 
 /** Create an LSPMessage containing a textDocument/completion request. */
 std::unique_ptr<LSPMessage> makeCompletion(int id, std::string_view uri, int line, int character);
@@ -76,7 +80,7 @@ std::unique_ptr<WorkspaceEdit> doTextDocumentRename(LSPWrapper &lspWrapper, cons
 /** Sends boilerplate initialization / initialized messages to start a new LSP session. */
 std::vector<std::unique_ptr<LSPMessage>>
 initializeLSP(std::string_view rootPath, std::string_view rootUri, LSPWrapper &lspWrapper, int &nextId,
-              bool supportsMarkdown = true,
+              bool supportsMarkdown = true, bool supportsCodeActionResolve = true,
               std::optional<std::unique_ptr<SorbetInitializationOptions>> initOptions = std::nullopt);
 
 /** Sends the given messages to LSPWrapper, and returns all responses to those messages. Works with single and

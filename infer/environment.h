@@ -192,6 +192,9 @@ class Environment {
 
     void cloneFrom(const Environment &rhs);
 
+    core::TypeAndOrigins getTypeFromRebind(core::Context ctx, const core::DispatchComponent &main,
+                                           cfg::LocalRef fallback);
+
 public:
     Environment(core::Loc ownerLoc);
     Environment(const Environment &rhs) = delete;
@@ -236,12 +239,10 @@ public:
 
     void populateFrom(core::Context ctx, const Environment &other);
 
-    core::TypePtr processBinding(core::Context ctx, const cfg::CFG &inWhat, cfg::Binding &bind, int loopCount,
-                                 int bindMinLoops, KnowledgeFilter &knowledgeFilter, core::TypeConstraint &constr,
-                                 core::TypePtr &methodReturnType);
-
-    void ensureGoodCondition(core::Context ctx, cfg::LocalRef cond) {}
-    void ensureGoodAssignTarget(core::Context ctx, cfg::LocalRef target) {}
+    core::TypePtr
+    processBinding(core::Context ctx, const cfg::CFG &inWhat, cfg::Binding &bind, int loopCount, int bindMinLoops,
+                   KnowledgeFilter &knowledgeFilter, core::TypeConstraint &constr, core::TypePtr &methodReturnType,
+                   const std::optional<cfg::BasicBlock::BlockExitCondInfo> &parentUpdateKnowledgeReceiver);
 
     core::Loc locForUninitialized() const {
         return ownerLoc;

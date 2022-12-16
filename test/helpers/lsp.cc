@@ -1,7 +1,9 @@
 #include "doctest.h"
 // has to go first as it violates requirements
 
+#include "absl/strings/ascii.h"
 #include "absl/strings/match.h"
+#include "absl/strings/str_replace.h"
 #include "common/common.h"
 #include "common/sort.h"
 #include "main/lsp/LSPConfiguration.h"
@@ -69,7 +71,8 @@ unique_ptr<WorkspaceClientCapabilities> makeWorkspaceClientCapabilities() {
     return capabilities;
 }
 
-unique_ptr<TextDocumentClientCapabilities> makeTextDocumentClientCapabilities(bool supportsMarkdown) {
+unique_ptr<TextDocumentClientCapabilities> makeTextDocumentClientCapabilities(bool supportsMarkdown,
+                                                                              bool supportsCodeActionResolve) {
     auto capabilities = make_unique<TextDocumentClientCapabilities>();
     vector<MarkupKind> supportedTextFormats({MarkupKind::Plaintext});
     if (supportsMarkdown) {
@@ -129,18 +132,27 @@ unique_ptr<TextDocumentClientCapabilities> makeTextDocumentClientCapabilities(bo
     capabilities->implementation = makeDynamicRegistrationOption(true);
     capabilities->colorProvider = makeDynamicRegistrationOption(true);
 
+    if (supportsCodeActionResolve) {
+        auto codeActionCaps = make_unique<CodeActionCapabilities>();
+        codeActionCaps->dataSupport = true;
+        codeActionCaps->resolveSupport = make_unique<CodeActionResolveSupport>(vector<string>{"edit"});
+        capabilities->codeAction = move(codeActionCaps);
+    }
+
     return capabilities;
 }
 
 unique_ptr<InitializeParams>
 makeInitializeParams(std::optional<variant<string, JSONNullObject>> rootPath, variant<string, JSONNullObject> rootUri,
-                     bool supportsMarkdown, std::optional<std::unique_ptr<SorbetInitializationOptions>> initOptions) {
+                     bool supportsMarkdown, bool supportsCodeActionResolve,
+                     std::optional<std::unique_ptr<SorbetInitializationOptions>> initOptions) {
     auto initializeParams = make_unique<InitializeParams>(rootUri, make_unique<ClientCapabilities>());
     if (rootPath) {
         initializeParams->rootPath = rootPath;
     }
     initializeParams->capabilities->workspace = makeWorkspaceClientCapabilities();
-    initializeParams->capabilities->textDocument = makeTextDocumentClientCapabilities(supportsMarkdown);
+    initializeParams->capabilities->textDocument =
+        makeTextDocumentClientCapabilities(supportsMarkdown, supportsCodeActionResolve);
     initializeParams->trace = TraceKind::Off;
 
     string stringRootUri;
@@ -169,6 +181,15 @@ unique_ptr<LSPMessage> makeHover(int id, std::string_view uri, int line, int cha
         "2.0", id, LSPMethod::TextDocumentHover,
         make_unique<TextDocumentPositionParams>(make_unique<TextDocumentIdentifier>(string(uri)),
                                                 make_unique<Position>(line, character))));
+}
+
+unique_ptr<LSPMessage> makeCodeAction(int id, std::string_view uri, int line, int character) {
+    auto textDocument = make_unique<TextDocumentIdentifier>(string(uri));
+    auto range = make_unique<Range>(make_unique<Position>(line, character), make_unique<Position>(line, character));
+    auto context = make_unique<CodeActionContext>(vector<unique_ptr<Diagnostic>>{});
+    return make_unique<LSPMessage>(
+        make_unique<RequestMessage>("2.0", id, LSPMethod::TextDocumentCodeAction,
+                                    make_unique<CodeActionParams>(move(textDocument), move(range), move(context))));
 }
 
 unique_ptr<LSPMessage> makeCompletion(int id, std::string_view uri, int line, int character) {
@@ -220,11 +241,7 @@ void checkServerCapabilities(const ServerCapabilities &capabilities) {
     CHECK(capabilities.codeActionProvider.has_value());
     CHECK(capabilities.renameProvider.has_value());
     CHECK_FALSE(capabilities.codeLensProvider.has_value());
-    if (rubyfmt_enabled) {
-        CHECK(capabilities.documentFormattingProvider.value_or(false));
-    } else {
-        CHECK_FALSE(capabilities.documentFormattingProvider.value_or(false));
-    }
+    CHECK(capabilities.documentFormattingProvider.value_or(false));
     CHECK_FALSE(capabilities.documentRangeFormattingProvider.has_value());
     CHECK_FALSE(capabilities.documentRangeFormattingProvider.has_value());
     CHECK_FALSE(capabilities.documentOnTypeFormattingProvider.has_value());
@@ -394,15 +411,15 @@ unique_ptr<CompletionList> doTextDocumentCompletion(LSPWrapper &lspWrapper, cons
 }
 
 vector<unique_ptr<LSPMessage>> initializeLSP(string_view rootPath, string_view rootUri, LSPWrapper &lspWrapper,
-                                             int &nextId, bool supportsMarkdown,
+                                             int &nextId, bool supportsMarkdown, bool supportsCodeActionResolve,
                                              optional<unique_ptr<SorbetInitializationOptions>> initOptions) {
     // Reset next id.
     nextId = 0;
 
     // Send 'initialize' message.
     {
-        auto initializeParams =
-            makeInitializeParams(string(rootPath), string(rootUri), supportsMarkdown, move(initOptions));
+        auto initializeParams = makeInitializeParams(string(rootPath), string(rootUri), supportsMarkdown,
+                                                     supportsCodeActionResolve, move(initOptions));
         auto message = make_unique<LSPMessage>(
             make_unique<RequestMessage>("2.0", nextId++, LSPMethod::Initialize, move(initializeParams)));
         auto responses = getLSPResponsesFor(lspWrapper, move(message));
@@ -480,8 +497,8 @@ vector<unique_ptr<LSPMessage>> getLSPResponsesFor(LSPWrapper &wrapper, vector<un
         vector<unique_ptr<LSPMessage>> responses;
         while (true) {
             // In tests, wait a maximum of 20 seconds for a response. It seems like sanitized builds running locally
-            // take ~10 seconds.
-            auto msg = mtWrapper->read(20000);
+            // take ~10 seconds. Wait 5 minutes if running in the debugger
+            auto msg = mtWrapper->read(amIBeingDebugged() ? 300'000 : 20'000);
             if (!msg) {
                 // We should be guaranteed to receive the fence response, so if this happens something is seriously
                 // wrong.
@@ -508,6 +525,19 @@ vector<unique_ptr<LSPMessage>> getLSPResponsesFor(LSPWrapper &wrapper, unique_pt
     return getLSPResponsesFor(wrapper, move(messages));
 }
 
+namespace {
+
+// Like absl::StripTrailingAsciiWhitespace, but only blank characters (tabs and spaces)
+[[nodiscard]] inline absl::string_view stripTrailingAsciiBlank(absl::string_view str) {
+    // You can use this to jump to def.
+    ENFORCE(true, absl::StripTrailingAsciiWhitespace(""));
+
+    auto it = std::find_if_not(str.rbegin(), str.rend(), absl::ascii_isblank);
+    return str.substr(0, str.rend() - it);
+}
+
+} // namespace
+
 string applyEdit(string_view source, const core::File &file, const Range &range, string_view newText) {
     auto beginLine = static_cast<uint32_t>(range.start->line + 1);
     auto beginCol = static_cast<uint32_t>(range.start->character + 1);
@@ -517,8 +547,14 @@ string applyEdit(string_view source, const core::File &file, const Range &range,
     auto endCol = static_cast<uint32_t>(range.end->character + 1);
     auto endOffset = core::Loc::pos2Offset(file, {endLine, endCol}).value();
 
+    auto lineStartOffset = core::Loc::pos2Offset(file, {beginLine, 1}).value();
+    auto lineStartView = source.substr(lineStartOffset);
+    auto firstNonWhitespace = lineStartView.find_first_not_of(" \t\n");
+    auto indentAfterNewline = absl::StrCat("\n", source.substr(lineStartOffset, firstNonWhitespace));
+
     string actualEditedFileContents = string(source);
-    actualEditedFileContents.replace(beginOffset, endOffset - beginOffset, newText);
+    auto indented = absl::StrReplaceAll(stripTrailingAsciiBlank(newText), {{"\n", indentAfterNewline}});
+    actualEditedFileContents.replace(beginOffset, endOffset - beginOffset, indented);
 
     return actualEditedFileContents;
 }

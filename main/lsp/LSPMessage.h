@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "main/lsp/json_enums.h"
 #include "rapidjson/document.h"
+#include "rapidjson/stringbuffer.h"
 #include <variant>
 
 namespace sorbet::realmain::lsp {
@@ -53,11 +54,11 @@ public:
      * these SorbetErrors to return the error to the client (or to print it in the log), so it can be passed along as if
      * parsing succeeded.
      */
-    static std::unique_ptr<LSPMessage> fromClient(const std::string &json);
+    static std::unique_ptr<LSPMessage> fromClient(std::string_view json);
 
     LSPMessage(RawLSPMessage msg);
     LSPMessage(rapidjson::Document &d);
-    LSPMessage(const std::string &json);
+    LSPMessage(std::string_view json);
     ~LSPMessage();
 
     /**
@@ -131,6 +132,8 @@ public:
      * Returns the message in JSON form.
      */
     std::string toJSON(bool prettyPrint = false) const;
+
+    rapidjson::StringBuffer toJSONBuffer(bool prettyPrint = false) const;
 };
 } // namespace sorbet::realmain::lsp
 

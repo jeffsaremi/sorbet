@@ -13,9 +13,14 @@ public:
                                            WorkerPool &workers);
     Resolver() = delete;
 
-    /** Only runs tree passes, used for incremental changes that do not affect global state. Assumes that `run` was
-     * called on a tree that contains same definitions before (LSP uses heuristics that should only have false negatives
-     * to find this) */
+    /**
+     * Only runs tree passes, used for incremental changes that do not affect global state. Assumes
+     * that `run` was called on a tree that contains same definitions before (LSP uses heuristics
+     * that should only have false negatives to find this)
+     *
+     *
+     * These two versions are explicitly instantiated in resolver.cc
+     */
     static ast::ParsedFilesOrCancelled runIncremental(core::GlobalState &gs, std::vector<ast::ParsedFile> trees);
 
     // used by autogen only
@@ -25,10 +30,6 @@ public:
 private:
     static void finalizeAncestors(core::GlobalState &gs);
     static void finalizeSymbols(core::GlobalState &gs);
-    static void computeLinearization(core::GlobalState &gs);
-    static ast::ParsedFilesOrCancelled resolveSigs(core::GlobalState &gs, std::vector<ast::ParsedFile> trees,
-                                                   WorkerPool &workers);
-    static void sanityCheck(core::GlobalState &gs, std::vector<ast::ParsedFile> &trees);
 };
 
 } // namespace sorbet::resolver

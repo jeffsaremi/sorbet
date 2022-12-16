@@ -1,6 +1,7 @@
 #include "main/lsp/requests/sorbet_show_symbol.h"
+#include "main/lsp/LSPLoop.h"
+#include "main/lsp/LSPQuery.h"
 #include "main/lsp/json_types.h"
-#include "main/lsp/lsp.h"
 
 using namespace std;
 
@@ -17,8 +18,8 @@ unique_ptr<ResponseMessage> SorbetShowSymbolTask::runRequest(LSPTypecheckerDeleg
     // To match the behavior of Go To Definition, we don't error in an untyped file, but instead
     // be okay with returning an empty result for certain queries.
     auto errorIfFileIsUntyped = false;
-    auto result = queryByLoc(typechecker, params->textDocument->uri, *params->position, LSPMethod::SorbetShowSymbol,
-                             errorIfFileIsUntyped);
+    auto result = LSPQuery::byLoc(config, typechecker, params->textDocument->uri, *params->position,
+                                  LSPMethod::SorbetShowSymbol, errorIfFileIsUntyped);
     if (result.error) {
         // An error happened while setting up the query.
         response->error = move(result.error);
@@ -39,7 +40,7 @@ unique_ptr<ResponseMessage> SorbetShowSymbolTask::runRequest(LSPTypecheckerDeleg
         // Using symbolBeforeDealias instead of symbol here lets us show the name of the actual
         // constant under the user's cursor, not what it aliases to.
         sym = c->symbolBeforeDealias;
-    } else if (auto d = resp->isDefinition()) {
+    } else if (auto d = resp->isMethodDef()) {
         sym = d->symbol;
     } else if (auto f = resp->isField()) {
         sym = f->symbol;

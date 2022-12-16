@@ -21,15 +21,6 @@ module Sorbet::Private::Static
   end
 
   sig do
-    params(
-        expr: T.untyped,
-    )
-    .void
-  end
-  def self.keep_for_typechecking(expr)
-  end
-
-  sig do
     type_parameters(:U)
       .params(this: T.untyped, fun: T.all(T.type_parameter(:U), Symbol), kind: Symbol)
       .returns(T.type_parameter(:U))
@@ -116,7 +107,7 @@ end
 class Sorbet::Private::Static::ENVClass
   extend T::Generic
   include Enumerable
-  Elem = type_member(:out, fixed: [String, T.nilable(String)])
+  Elem = type_member(:out) {{fixed: [String, String]}}
 
   sig do
     params(
@@ -261,6 +252,14 @@ class Sorbet::Private::Static::ENVClass
 
   sig do
     params(
+        key: String
+    )
+    .returns(T::Boolean)
+  end
+  def include?(key); end
+
+  sig do
+    params(
         blk: T.proc.params(name: String, value: String).returns(BasicObject),
     )
     .returns(Sorbet::Private::Static::ENVClass)
@@ -338,6 +337,11 @@ class Sorbet::Private::Static::ENVClass
   end
   sig {returns(T::Enumerator[Elem])}
   def select!(&blk); end
+
+  sig do
+    returns(T::Hash[String, T.nilable(String)])
+  end
+  def to_hash; end
 
   sig do
     params(

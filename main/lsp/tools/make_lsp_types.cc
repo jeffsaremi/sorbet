@@ -87,30 +87,36 @@ void makeLSPTypes(vector<shared_ptr<JSONClassType>> &enumTypes, vector<shared_pt
                                    },
                                    classTypes);
 
-    auto Position = makeObject("Position",
-                               {
-                                   makeField("line", JSONInt),
-                                   makeField("character", JSONInt),
-                               },
-                               classTypes,
-                               {
-                                   "int cmp(const Position &b) const;",
-                                   "std::unique_ptr<Position> copy() const;",
-                               });
+    auto Position =
+        makeObject("Position",
+                   {
+                       makeField("line", JSONInt),
+                       makeField("character", JSONInt),
+                   },
+                   classTypes,
+                   {
+                       "int cmp(const Position &b) const;",
+                       "std::unique_ptr<Position> copy() const;",
+                       "std::string showRaw() const;",
+                       "std::optional<core::Loc> toLoc(const core::GlobalState &gs, core::FileRef fref) const;",
+                   });
 
-    auto Range = makeObject("Range",
-                            {
-                                makeField("start", Position),
-                                makeField("end", Position),
-                            },
-                            classTypes,
-                            {
-                                "// Returns nullptr if loc does not exist",
-                                "static std::unique_ptr<Range> fromLoc(const core::GlobalState &gs, core::Loc loc);",
-                                "core::Loc toLoc(const core::GlobalState &gs, core::FileRef file) const;",
-                                "int cmp(const Range &b) const;",
-                                "std::unique_ptr<Range> copy() const;",
-                            });
+    auto Range =
+        makeObject("Range",
+                   {
+                       makeField("start", Position),
+                       makeField("end", Position),
+                   },
+                   classTypes,
+                   {
+                       "// Returns nullptr if loc does not exist",
+                       "static std::unique_ptr<Range> fromLoc(const core::GlobalState &gs, core::Loc loc);",
+                       "std::optional<core::Loc> toLoc(const core::GlobalState &gs, core::FileRef file) const;",
+                       "int cmp(const Range &b) const;",
+                       "std::unique_ptr<Range> copy() const;",
+                       "bool contains(const Range &b) const;",
+                       "bool contains(const Position &b) const;",
+                   });
 
     auto Location = makeObject("Location",
                                {
@@ -136,12 +142,20 @@ void makeLSPTypes(vector<shared_ptr<JSONClassType>> &enumTypes, vector<shared_pt
 
     auto DiagnosticTag = makeIntEnum("DiagnosticTag", {{"Unnecessary", 1}, {"Deprecated", 2}}, enumTypes);
 
+    auto CodeDescription = makeObject("CodeDescription",
+                                      {
+                                          // URI
+                                          makeField("href", JSONString),
+                                      },
+                                      classTypes);
+
     auto Diagnostic =
         makeObject("Diagnostic",
                    {
                        makeField("range", Range),
                        makeField("severity", makeOptional(DiagnosticSeverity)),
                        makeField("code", makeOptional(makeVariant({JSONInt, JSONString}))),
+                       makeField("codeDescription", makeOptional(CodeDescription)),
                        makeField("source", makeOptional(JSONString)),
                        makeField("message", JSONString),
                        makeField("relatedInformation", makeOptional(makeArray(DiagnosticRelatedInformation))),
@@ -149,13 +163,28 @@ void makeLSPTypes(vector<shared_ptr<JSONClassType>> &enumTypes, vector<shared_pt
                    },
                    classTypes, {"std::unique_ptr<Diagnostic> copy() const;"});
 
-    auto Command = makeObject("Command",
-                              {
-                                  makeField("title", JSONString), makeField("command", JSONString),
-                                  // Unused in Sorbet.
-                                  // makeField("arguments", makeOptional(makeArray(JSONAny))),
-                              },
-                              classTypes);
+    auto TextDocumentIdentifier = makeObject("TextDocumentIdentifier",
+                                             {
+                                                 makeField("uri", JSONString),
+                                             },
+                                             classTypes);
+
+    auto TextDocumentPositionParams = makeObject("TextDocumentPositionParams",
+                                                 {
+                                                     makeField("textDocument", TextDocumentIdentifier),
+                                                     makeField("position", Position),
+                                                 },
+                                                 classTypes);
+    auto Command = makeObject(
+        "Command",
+        {
+            makeField("title", JSONString),
+            makeField("command", JSONString),
+            // the `arguments` field is declared as `LSPAny` in the LSP spec,
+            // but we use it only to call `sorbet.rename` so the type is limited to TextDocumentPositionParams
+            makeField("arguments", makeOptional(makeArray(TextDocumentPositionParams))),
+        },
+        classTypes);
 
     auto TextEdit = makeObject("TextEdit",
                                {
@@ -227,12 +256,6 @@ void makeLSPTypes(vector<shared_ptr<JSONClassType>> &enumTypes, vector<shared_pt
                                      makeField("documentChanges", makeOptional(makeArray(TextDocumentEdit)))},
                                     classTypes);
 
-    auto TextDocumentIdentifier = makeObject("TextDocumentIdentifier",
-                                             {
-                                                 makeField("uri", JSONString),
-                                             },
-                                             classTypes);
-
     auto TextDocumentItem = makeObject("TextDocumentItem",
                                        {
                                            makeField("uri", JSONString),
@@ -241,13 +264,6 @@ void makeLSPTypes(vector<shared_ptr<JSONClassType>> &enumTypes, vector<shared_pt
                                            makeField("text", JSONString),
                                        },
                                        classTypes);
-
-    auto TextDocumentPositionParams = makeObject("TextDocumentPositionParams",
-                                                 {
-                                                     makeField("textDocument", TextDocumentIdentifier),
-                                                     makeField("position", Position),
-                                                 },
-                                                 classTypes);
 
     auto DocumentFilter = makeObject("DocumentFilter",
                                      {
@@ -419,11 +435,15 @@ void makeLSPTypes(vector<shared_ptr<JSONClassType>> &enumTypes, vector<shared_pt
                                                },
                                                classTypes);
 
+    auto CodeActionResolveSupport =
+        makeObject("CodeActionResolveSupport", {makeField("properties", makeArray(JSONString))}, classTypes);
     auto CodeActionCapabilities =
         makeObject("CodeActionCapabilities",
                    {
                        makeField("dynamicRegistration", makeOptional(JSONBool)),
                        makeField("codeActionLiteralSupport", makeOptional(CodeActionLiteralSupport)),
+                       makeField("dataSupport", makeOptional(JSONBool)),
+                       makeField("resolveSupport", makeOptional(CodeActionResolveSupport)),
                    },
                    classTypes);
 
@@ -496,6 +516,7 @@ void makeLSPTypes(vector<shared_ptr<JSONClassType>> &enumTypes, vector<shared_pt
     auto CodeActionOptions = makeObject("CodeActionOptions",
                                         {
                                             makeField("codeActionKinds", makeOptional(makeArray(CodeActionKind))),
+                                            makeField("resolveProvider", makeOptional(JSONBool)),
                                         },
                                         classTypes);
 
@@ -1058,6 +1079,9 @@ void makeLSPTypes(vector<shared_ptr<JSONClassType>> &enumTypes, vector<shared_pt
                                      makeField("diagnostics", makeOptional(makeArray(Diagnostic))),
                                      makeField("edit", makeOptional(WorkspaceEdit)),
                                      makeField("command", makeOptional(Command)),
+                                     // The LSP spec defines the `data` field as `LSPAny`,
+                                     // but we use it only to transfer `CodeActionParams`
+                                     makeField("data", makeOptional(CodeActionParams)),
                                  },
                                  classTypes);
 
@@ -1291,6 +1315,25 @@ void makeLSPTypes(vector<shared_ptr<JSONClassType>> &enumTypes, vector<shared_pt
                                             },
                                             classTypes);
 
+    auto WatchmanStateEnter = makeObject("WatchmanStateEnter",
+                                         {
+                                             makeField("subscription", JSONString),
+                                             makeField("root", JSONString),
+                                             makeField("state-enter", "stateEnter", JSONString),
+                                             makeField("clock", JSONString),
+                                         },
+                                         classTypes);
+
+    auto WatchmanStateLeave = makeObject("WatchmanStateLeave",
+                                         {
+                                             makeField("subscription", JSONString),
+                                             makeField("root", JSONString),
+                                             makeField("state-leave", "stateLeave", JSONString),
+                                             makeField("clock", JSONString),
+                                             makeField("abandoned", makeOptional(JSONBool)),
+                                         },
+                                         classTypes);
+
     auto SorbetWorkspaceEditParams =
         makeObject("SorbetWorkspaceEditParams", {}, classTypes,
                    {
@@ -1312,10 +1355,12 @@ void makeLSPTypes(vector<shared_ptr<JSONClassType>> &enumTypes, vector<shared_pt
     auto SorbetTypecheckRunStatus =
         makeIntEnum("SorbetTypecheckRunStatus", {{"Started", 0}, {"Cancelled", 1}, {"Ended", 2}}, enumTypes);
 
+    auto TypecheckingPath = makeStrEnum("TypecheckingPath", {"fast", "slow"}, enumTypes);
+
     auto SorbetTypecheckRunInfo = makeObject("SorbetTypecheckRunInfo",
                                              {
                                                  makeField("status", SorbetTypecheckRunStatus),
-                                                 makeField("fastPath", JSONBool),
+                                                 makeField("typecheckingPath", TypecheckingPath),
                                                  makeField("filesTypechecked", makeArray(JSONString)),
                                              },
                                              classTypes);
@@ -1337,13 +1382,17 @@ void makeLSPTypes(vector<shared_ptr<JSONClassType>> &enumTypes, vector<shared_pt
                                      "shutdown",
                                      "sorbet/error",
                                      "sorbet/fence",
+                                     "sorbet/indexerInitialization",
                                      "sorbet/readFile",
                                      "sorbet/showOperation",
                                      "sorbet/showSymbol",
                                      "sorbet/typecheckRunInfo",
                                      "sorbet/watchmanFileChange",
+                                     "sorbet/watchmanStateEnter",
+                                     "sorbet/watchmanStateLeave",
                                      "sorbet/workspaceEdit",
                                      "textDocument/codeAction",
+                                     "codeAction/resolve",
                                      "textDocument/completion",
                                      "textDocument/definition",
                                      "textDocument/typeDefinition",
@@ -1382,6 +1431,7 @@ void makeLSPTypes(vector<shared_ptr<JSONClassType>> &enumTypes, vector<shared_pt
                                                 {"textDocument/rename", RenameParams},
                                                 {"textDocument/signatureHelp", TextDocumentPositionParams},
                                                 {"textDocument/codeAction", CodeActionParams},
+                                                {"codeAction/resolve", CodeAction},
                                                 {"textDocument/implementation", ImplementationParams},
                                                 {"textDocument/formatting", DocumentFormattingParams},
                                                 {"workspace/symbol", WorkspaceSymbolParams},
@@ -1426,6 +1476,7 @@ void makeLSPTypes(vector<shared_ptr<JSONClassType>> &enumTypes, vector<shared_pt
             // TODO: the following are more correct but I can only get the above to work.
             // {"textDocument/codeAction", makeVariant({JSONNull, makeArray(makeVariant({CodeAction, Command}))})},
             // {"textDocument/codeAction", makeVariant({JSONNull, makeArray(CodeAction), makeArray(Command)})},
+            {"codeAction/resolve", makeOptional(CodeAction)},
             {"textDocument/implementation", makeVariant({JSONNull, makeArray(Location)})},
             {"workspace/symbol", makeVariant({JSONNull, makeArray(SymbolInformation)})},
             {"sorbet/error", SorbetErrorParams},
@@ -1455,7 +1506,10 @@ void makeLSPTypes(vector<shared_ptr<JSONClassType>> &enumTypes, vector<shared_pt
                                                 {"window/showMessage", ShowMessageParams},
                                                 {"__PAUSE__", makeOptional(JSONNull)},
                                                 {"__RESUME__", makeOptional(JSONNull)},
+                                                {"sorbet/indexerInitialization", makeOptional(JSONNull)},
                                                 {"sorbet/watchmanFileChange", WatchmanQueryResponse},
+                                                {"sorbet/watchmanStateEnter", WatchmanStateEnter},
+                                                {"sorbet/watchmanStateLeave", WatchmanStateLeave},
                                                 {"sorbet/showOperation", SorbetShowOperationParams},
                                                 {"sorbet/error", SorbetErrorParams},
                                                 {"sorbet/fence", JSONInt},

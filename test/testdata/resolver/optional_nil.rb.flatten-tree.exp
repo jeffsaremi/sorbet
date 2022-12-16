@@ -3,7 +3,7 @@ begin
   class <emptyTree><<C <root>>> < (::<todo sym>)
     def self.<static-init><<static-init>$CENSORED>(<blk>)
       begin
-        ::<Magic>.<define-top-class-or-module>(::Test)
+        <emptyTree>
         ::Sorbet::Private::Static.keep_for_ide(::Test)
         <emptyTree>
       end
@@ -28,23 +28,23 @@ begin
 
     def self.<static-init>(<blk>)
       begin
-        ::Sorbet::Private::Static::ResolvedSig.sig(<self>, false, :foo) do ||
+        ::Sorbet::Private::Static.sig(<self>) do ||
           <self>.params(:x, ::String).returns(::String)
         end
-        ::Sorbet::Private::Static::ResolvedSig.sig(<self>, false, :bar) do ||
+        ::Sorbet::Private::Static.sig(<self>) do ||
           <self>.params(:y, ::String).returns(::String)
         end
-        ::Sorbet::Private::Static::ResolvedSig.sig(<self>, false, :qux) do ||
+        ::Sorbet::Private::Static.sig(<self>) do ||
           <self>.params(:z, ::String).returns(::String)
         end
-        ::Sorbet::Private::Static::ResolvedSig.sig(<self>, false, :baz) do ||
+        ::Sorbet::Private::Static.sig(<self>) do ||
           <self>.params(:w, ::String).returns(::String)
         end
         <self>.extend(::T::Sig)
-        ::Sorbet::Private::Static.keep_def(<self>, :foo, :normal)
-        ::Sorbet::Private::Static.keep_def(<self>, :bar, :normal)
-        ::Sorbet::Private::Static.keep_def(<self>, :qux, :normal)
-        ::Sorbet::Private::Static.keep_def(<self>, :baz, :normal)
+        <runtime method definition of foo>
+        <runtime method definition of bar>
+        <runtime method definition of qux>
+        <runtime method definition of baz>
         <emptyTree>
       end
     end

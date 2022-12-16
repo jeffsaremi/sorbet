@@ -8,7 +8,8 @@ end
 module Helper2
   extend T::Helpers
 
-  requires_ancestor # error: `requires_ancestor` requires a block parameter, but no block was passed
+  requires_ancestor
+  #                ^ error: `requires_ancestor` requires a block parameter, but no block was passed
 end
 
 module Helper3
@@ -17,6 +18,10 @@ module Helper3
   requires_ancestor { NotFound }
   #                   ^^^^^^^^ error: Argument to `requires_ancestor` must be statically resolvable to a class or a module
   #                   ^^^^^^^^ error: Unable to resolve constant `NotFound`
+
+  requires_ancestor { T.class_of(NotFound) }
+  #                   ^^^^^^^^^^^^^^^^^^^^ error: Argument to `class_of` must be statically resolvable to a class or a module
+  #                              ^^^^^^^^ error: Unable to resolve constant `NotFound`
 end
 
 class Helper4
@@ -33,11 +38,11 @@ end
 module Helper5
   extend T::Helpers
 
-  requires_ancestor { "Object" } # error: Expected `Module` but found `String("Object")` for block result type
+  requires_ancestor { "Object" }
   #                   ^^^^^^^^ error: Argument to `requires_ancestor` must be statically resolvable to a class or a module
 
-  requires_ancestor { T.class_of(Object) } # error: Expected `Module` but found `<Type: T.class_of(Object)>` for block result type
-  #                   ^^^^^^^^^^^^^^^^^^ error: Argument to `requires_ancestor` must be statically resolvable to a class or a module
+  requires_ancestor { Object.superclass }
+  #                   ^^^^^^^^^^^^^^^^^ error: Argument to `requires_ancestor` must be statically resolvable to a class or a module
 end
 
 module Helper6
@@ -45,6 +50,9 @@ module Helper6
 
   requires_ancestor { Helper6 }
   #                   ^^^^^^^ error: Must not pass yourself to `requires_ancestor`
+
+  requires_ancestor { T.class_of(Helper6) }
+  #                   ^^^^^^^^^^^^^^^^^^^ error: Must not pass yourself to `class_of` inside of `requires_ancestor`
 end
 
 module Helper7
@@ -77,22 +85,22 @@ module Helper10
   extend T::Helpers
 
   requires_ancestor
-# ^^^^^^^^^^^^^^^^^ error: `requires_ancestor` requires a block parameter, but no block was passed
+  #                ^ error: `requires_ancestor` requires a block parameter, but no block was passed
 end
 
 module Helper11
   extend T::Helpers
 
   requires_ancestor (Kernel)
-# ^^^^^^^^^^^^^^^^^^^^^^^^^^ error: Too many arguments provided for method `T::Helpers#requires_ancestor`. Expected: `0`, got: `1`
+  #                  ^^^^^^ error: Too many arguments provided for method `T::Helpers#requires_ancestor`. Expected: `0`, got: `1`
 # ^^^^^^^^^^^^^^^^^^^^^^^^^^ error: `requires_ancestor` only accepts a block
-# ^^^^^^^^^^^^^^^^^^^^^^^^^^ error: `requires_ancestor` requires a block parameter, but no block was passed
+  #                         ^ error: `requires_ancestor` requires a block parameter, but no block was passed
 end
 
 module Helper12
   extend T::Helpers
 
   requires_ancestor (Kernel) { Kernel }
-# ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ error: Too many arguments provided for method `T::Helpers#requires_ancestor`. Expected: `0`, got: `1`
+  #                  ^^^^^^ error: Too many arguments provided for method `T::Helpers#requires_ancestor`. Expected: `0`, got: `1`
 # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ error: `requires_ancestor` only accepts a block
 end

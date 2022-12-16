@@ -1,7 +1,8 @@
 #include "main/lsp/requests/implementation.h"
 #include "core/lsp/QueryResponse.h"
+#include "main/lsp/LSPLoop.h"
+#include "main/lsp/LSPQuery.h"
 #include "main/lsp/json_types.h"
-#include "main/lsp/lsp.h"
 
 using namespace std;
 
@@ -64,8 +65,8 @@ unique_ptr<ResponseMessage> ImplementationTask::runRequest(LSPTypecheckerDelegat
     auto response = make_unique<ResponseMessage>("2.0", id, LSPMethod::TextDocumentImplementation);
 
     const core::GlobalState &gs = typechecker.state();
-    auto queryResult =
-        queryByLoc(typechecker, params->textDocument->uri, *params->position, LSPMethod::TextDocumentImplementation);
+    auto queryResult = LSPQuery::byLoc(config, typechecker, params->textDocument->uri, *params->position,
+                                       LSPMethod::TextDocumentImplementation);
 
     if (queryResult.error) {
         // An error happened while setting up the query.
@@ -79,7 +80,7 @@ unique_ptr<ResponseMessage> ImplementationTask::runRequest(LSPTypecheckerDelegat
 
     vector<unique_ptr<Location>> result;
     auto queryResponse = move(queryResult.responses[0]);
-    if (auto def = queryResponse->isDefinition()) {
+    if (auto def = queryResponse->isMethodDef()) {
         // User called "Go to Implementation" from the abstract function definition
         core::SymbolRef maybeMethod = def->symbol;
         if (!maybeMethod.isMethod()) {
@@ -106,7 +107,7 @@ unique_ptr<ResponseMessage> ImplementationTask::runRequest(LSPTypecheckerDelegat
         // User called "Go to Implementation" from the abstract class reference
         auto classSymbol = constant->symbol.asClassOrModuleRef();
 
-        if (!classSymbol.data(gs)->isClassOrModule() || !classSymbol.data(gs)->isClassOrModuleAbstract()) {
+        if (!classSymbol.data(gs)->flags.isAbstract) {
             response->error = makeInvalidRequestError(classSymbol, gs);
             return response;
         }

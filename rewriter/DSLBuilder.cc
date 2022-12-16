@@ -44,14 +44,13 @@ vector<ast::ExpressionPtr> DSLBuilder::run(core::MutableContext ctx, ast::Send *
         return empty;
     }
     auto *sym = ast::cast_tree<ast::Literal>(send->getPosArg(0));
-    if (sym == nullptr || !sym->isSymbol(ctx)) {
+    if (sym == nullptr || !sym->isSymbol()) {
         return empty;
     }
-    name = sym->asSymbol(ctx);
+    name = sym->asSymbol();
 
-    ENFORCE(core::Loc(ctx.file, sym->loc).exists());
-    ENFORCE(!core::Loc(ctx.file, sym->loc).source(ctx).value().empty() &&
-            core::Loc(ctx.file, sym->loc).source(ctx).value()[0] == ':');
+    ENFORCE(ctx.locAt(sym->loc).exists());
+    ENFORCE(!ctx.locAt(sym->loc).source(ctx).value().empty() && ctx.locAt(sym->loc).source(ctx).value()[0] == ':');
     auto nameLoc = core::LocOffsets{sym->loc.beginPos() + 1, sym->loc.endPos()};
 
     type = ASTUtil::dupType(send->getPosArg(1));

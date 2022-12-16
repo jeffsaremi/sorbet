@@ -7,10 +7,9 @@
 
 using namespace std;
 
-namespace spd = spdlog;
 namespace sorbet::core::serialize {
 
-auto logger = spd::stderr_color_mt("serialize_test");
+auto logger = spdlog::stderr_color_mt("serialize_test");
 
 TEST_CASE("U4") { // NOLINT
     Pickler p;
@@ -81,15 +80,25 @@ TEST_CASE("Strings") { // NOLINT
 TEST_CASE("Symbol flags") {
     Field::Flags fieldFlags;
     Method::Flags mflags;
+    TypeParameter::Flags tpflags;
+    ClassOrModule::Flags cmflags;
     // All unused bits should be zero, and all flags should default to false.
     CHECK_EQ(fieldFlags.serialize(), 0);
     CHECK_EQ(mflags.serialize(), 0);
+    CHECK_EQ(tpflags.serialize(), 0);
+    CHECK_EQ(cmflags.serialize(), 0);
 
     mflags.isAbstract = true;
     CHECK_NE(mflags.serialize(), 0);
 
     fieldFlags.isField = true;
     CHECK_NE(fieldFlags.serialize(), 0);
+
+    tpflags.isContravariant = true;
+    CHECK_NE(tpflags.serialize(), 0);
+
+    cmflags.isAbstract = true;
+    CHECK_NE(cmflags.serialize(), 0);
 
     // I wish I could check that the mask is correct.
     // https://stackoverflow.com/a/45837449 indicates it is possible to count the number of fields in a class, but it

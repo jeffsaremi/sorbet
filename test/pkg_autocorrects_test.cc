@@ -16,8 +16,7 @@
 
 using namespace std;
 
-namespace spd = spdlog;
-auto logger = spd::stderr_color_mt("pkg-autocorrects-test");
+auto logger = spdlog::stderr_color_mt("pkg-autocorrects-test");
 auto errorQueue = make_shared<sorbet::core::ErrorQueue>(*logger, *logger);
 
 string examplePackage = "class Opus::ExamplePackage < PackageSpec\nend\n";
@@ -51,8 +50,8 @@ struct TestPackageFile {
             core::UnfreezeNameTable nameTableAccess(gs);
             // run parser
             for (auto file : files) {
-                auto trace = false;
-                auto nodes = parser::Parser::run(gs, file, trace);
+                auto settings = parser::Parser::Settings{};
+                auto nodes = parser::Parser::run(gs, file, settings);
 
                 core::MutableContext ctx(gs, core::Symbols::root(), file);
                 auto parsedFile = ast::ParsedFile{ast::desugar::node2Tree(ctx, move(nodes)), file};
@@ -242,30 +241,7 @@ TEST_CASE("Simple add export") {
 
     auto &package = test.targetPackage(gs);
     ENFORCE(package.exists());
-    auto addExport = package.addExport(gs, test.getConstantRef(gs, {"Opus", "MyPackage", "NewExport"}), false);
-    ENFORCE(addExport, "Expected to get an autocorrect from `addImport`");
-    auto replaced = addExport->applySingleEditForTesting(pkg_source);
-    CHECK_EQ(expected, replaced);
-}
-
-TEST_CASE("Simple add export_for_test") {
-    core::GlobalState gs(errorQueue);
-    gs.initEmpty();
-
-    string pkg_source = "class Opus::MyPackage < PackageSpec\n"
-                        "  export Opus::MyPackage::This\n"
-                        "end\n";
-
-    string expected = "class Opus::MyPackage < PackageSpec\n"
-                      "  export Opus::MyPackage::This\n"
-                      "  export_for_test Opus::MyPackage::NewExport\n"
-                      "end\n";
-
-    auto test = TestPackageFile::create(gs, "my_package/__package.rb", pkg_source);
-
-    auto &package = test.targetPackage(gs);
-    ENFORCE(package.exists());
-    auto addExport = package.addExport(gs, test.getConstantRef(gs, {"Opus", "MyPackage", "NewExport"}), true);
+    auto addExport = package.addExport(gs, test.getConstantRef(gs, {"Opus", "MyPackage", "NewExport"}));
     ENFORCE(addExport, "Expected to get an autocorrect from `addImport`");
     auto replaced = addExport->applySingleEditForTesting(pkg_source);
     CHECK_EQ(expected, replaced);

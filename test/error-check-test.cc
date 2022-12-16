@@ -14,9 +14,7 @@
 
 using namespace std;
 
-namespace spd = spdlog;
-
-auto logger = spd::stderr_color_mt("error-check-test");
+auto logger = spdlog::stderr_color_mt("error-check-test");
 auto errorCollector = make_shared<sorbet::core::ErrorCollector>();
 auto errorQueue = make_shared<sorbet::core::ErrorQueue>(*logger, *logger, errorCollector);
 
@@ -38,8 +36,8 @@ TEST_CASE("ParserCheck") {
     sorbet::core::UnfreezeFileTable ft(gs);
 
     core::FileRef fileId = gs.enterFile("<test input>", "a");
-    auto trace = false;
-    auto ast = sorbet::parser::Parser::run(gs, fileId, trace);
+    auto settings = parser::Parser::Settings{};
+    auto ast = sorbet::parser::Parser::run(gs, fileId, settings);
 
     try {
         sorbet::core::MutableContext ctx(gs, core::Symbols::root(), fileId);

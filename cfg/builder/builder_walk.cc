@@ -44,6 +44,12 @@ void CFGBuilder::unconditionalJump(BasicBlock *from, BasicBlock *to, CFG &inWhat
 namespace {
 
 LocalRef global2Local(CFGContext cctx, core::SymbolRef what) {
+    if (what == core::Symbols::StubModule()) {
+        // We don't need all stub module assignments to alias to the same temporary.
+        // (The fact that there's a StubModule at all means an error was already reported elsewhere)
+        return cctx.newTemporary(what.name(cctx.ctx));
+    }
+
     // Note: this will add an empty local to aliases if 'what' is not there
     LocalRef &alias = cctx.aliases[what];
     if (!alias.exists()) {
@@ -52,7 +58,7 @@ LocalRef global2Local(CFGContext cctx, core::SymbolRef what) {
     return alias;
 }
 
-LocalRef unresolvedIdent2Local(CFGContext cctx, const ast::UnresolvedIdent &id) {
+pair<LocalRef, bool> unresolvedIdent2Local(CFGContext cctx, const ast::UnresolvedIdent &id, bool isAssign) {
     core::ClassOrModuleRef klass;
 
     switch (id.kind) {
@@ -76,21 +82,91 @@ LocalRef unresolvedIdent2Local(CFGContext cctx, const ast::UnresolvedIdent &id) 
 
     auto sym = klass.data(cctx.ctx)->findMemberTransitive(cctx.ctx, id.name);
     if (!sym.exists()) {
+        auto hasError = id.kind != ast::UnresolvedIdent::Kind::Global && id.name != core::Names::ivarNameMissing() &&
+                        id.name != core::Names::cvarNameMissing();
+
         auto fnd = cctx.discoveredUndeclaredFields.find(id.name);
         if (fnd == cctx.discoveredUndeclaredFields.end()) {
-            if (id.kind != ast::UnresolvedIdent::Kind::Global) {
+            // For reads (not assigns) we only report the problem on the first offense.
+            if (hasError && !isAssign) {
                 if (auto e = cctx.ctx.beginError(id.loc, core::errors::CFG::UndeclaredVariable)) {
                     e.setHeader("Use of undeclared variable `{}`", id.name.show(cctx.ctx));
+                    e.addErrorNote("Use `{}` to declare this variable.\n"
+                                   "    For more information, see https://sorbet.org/docs/type-annotations",
+                                   "T.let");
                 }
             }
             auto ret = cctx.newTemporary(id.name);
             cctx.discoveredUndeclaredFields[id.name] = ret;
-            return ret;
+            return {ret, hasError && isAssign};
         }
-        return fnd->second;
+        return {fnd->second, hasError && isAssign};
     } else {
-        return global2Local(cctx, sym);
+        return {global2Local(cctx, sym), false};
     }
+}
+
+bool sendRecvIsT(ast::Send &s) {
+    if (auto cnst = ast::cast_tree<ast::ConstantLit>(s.recv)) {
+        return cnst->symbol == core::Symbols::T();
+    } else {
+        return false;
+    }
+}
+
+InstructionPtr maybeMakeTypeParameterAlias(CFGContext &cctx, ast::Send &s) {
+    const auto &ctx = cctx.ctx;
+    auto method = cctx.inWhat.symbol;
+    if (!method.data(ctx)->flags.isGenericMethod) {
+        // Using staticInit as a crude proxy for "is inside a `sig` block"
+        // This means we do not report as many errors as we should (but cheaply guards against false positives)
+        if (!method.data(ctx)->name.isAnyStaticInitName(ctx)) {
+            if (auto e = ctx.beginError(s.loc, core::errors::CFG::UnknownTypeParameter)) {
+                e.setHeader("Method `{}` does not declare any type parameters", method.show(ctx));
+                e.addErrorLine(method.data(ctx)->loc(), "`{}` defined here", method.show(ctx));
+            }
+        }
+
+        return nullptr;
+    }
+
+    if (s.numPosArgs() != 1 || !ast::isa_tree<ast::Literal>(s.getPosArg(0))) {
+        // Infer will report normal type error
+        return nullptr;
+    }
+    const auto &namedLiteral = ast::cast_tree_nonnull<ast::Literal>(s.getPosArg(0));
+    if (!namedLiteral.isSymbol()) {
+        // Infer will report normal type error
+        return nullptr;
+    }
+
+    auto typeVarName = ctx.state.lookupNameUnique(core::UniqueNameKind::TypeVarName, namedLiteral.asSymbol(), 1);
+    if (!typeVarName.exists()) {
+        if (auto e = ctx.beginError(namedLiteral.loc, core::errors::CFG::UnknownTypeParameter)) {
+            e.setHeader("Type parameter `{}` does not exist on `{}`", namedLiteral.toStringWithTabs(ctx, 0),
+                        method.show(ctx));
+            e.addErrorLine(method.data(ctx)->loc(), "`{}` defined here", method.show(ctx));
+        }
+        return nullptr;
+    }
+
+    core::TypeArgumentRef typeParam;
+    for (const auto &it : method.data(ctx)->typeArguments()) {
+        if (it.data(ctx)->name == typeVarName) {
+            typeParam = it;
+        }
+    }
+
+    if (!typeParam.exists()) {
+        if (auto e = ctx.beginError(namedLiteral.loc, core::errors::CFG::UnknownTypeParameter)) {
+            e.setHeader("Type parameter `{}` does not exist on `{}`", namedLiteral.toStringWithTabs(ctx, 0),
+                        method.show(ctx));
+            e.addErrorLine(method.data(ctx)->loc(), "`{}` defined here", method.show(ctx));
+        }
+        return nullptr;
+    }
+
+    return make_insn<Alias>(typeParam);
 }
 
 } // namespace
@@ -111,7 +187,7 @@ void CFGBuilder::jumpToDead(BasicBlock *from, CFG &inWhat, core::LocOffsets loc)
 
 void CFGBuilder::synthesizeExpr(BasicBlock *bb, LocalRef var, core::LocOffsets loc, InstructionPtr inst) {
     auto &inserted = bb->exprs.emplace_back(var, loc, move(inst));
-    inserted.value->isSynthetic = true;
+    inserted.value.setSynthetic();
 }
 
 BasicBlock *CFGBuilder::walkHash(CFGContext cctx, ast::Hash &h, BasicBlock *current, core::NameRef method) {
@@ -169,7 +245,8 @@ tuple<LocalRef, BasicBlock *, BasicBlock *> CFGBuilder::walkDefault(CFGContext c
 
     if (argInfo.type != nullptr) {
         auto tmp = cctx.newTemporary(core::Names::castTemp());
-        synthesizeExpr(defaultNext, tmp, defLoc, make_insn<Cast>(result, argInfo.type, core::Names::let()));
+        synthesizeExpr(defaultNext, tmp, defLoc,
+                       make_insn<Cast>(result, core::LocOffsets::none(), argInfo.type, core::Names::let()));
         cctx.inWhat.minLoops[tmp.id()] = CFG::MIN_LOOP_LET;
     }
 
@@ -272,7 +349,8 @@ BasicBlock *CFGBuilder::walk(CFGContext cctx, ast::ExpressionPtr &what, BasicBlo
                 ret = current;
             },
             [&](const ast::UnresolvedIdent &id) {
-                LocalRef loc = unresolvedIdent2Local(cctx, id);
+                auto isAssign = false;
+                auto [loc, _foundError] = unresolvedIdent2Local(cctx, id, isAssign);
                 ENFORCE(loc.exists());
                 current->exprs.emplace_back(cctx.target, id.loc, make_insn<Ident>(loc));
 
@@ -319,10 +397,29 @@ BasicBlock *CFGBuilder::walk(CFGContext cctx, ast::ExpressionPtr &what, BasicBlo
                 } else if (auto lhsLocal = ast::cast_tree<ast::Local>(a.lhs)) {
                     lhs = cctx.inWhat.enterLocal(lhsLocal->localVariable);
                 } else if (auto ident = ast::cast_tree<ast::UnresolvedIdent>(a.lhs)) {
-                    lhs = unresolvedIdent2Local(cctx, *ident);
+                    auto isAssign = true;
+                    auto [newLhs, foundError] = unresolvedIdent2Local(cctx, *ident, isAssign);
+                    lhs = newLhs;
+                    // Detect if we would have reported an error
+                    // Only do this transformation if we're sure that it would produce an error, so
+                    // that we don't pay the performance cost of inflating the CFG needlessly.
+                    auto shouldReportErrorOn = cctx.ctx.state.shouldReportErrorOn(
+                        cctx.ctx.locAt(a.loc), core::errors::CFG::UndeclaredVariable);
+                    if (foundError && shouldReportErrorOn) {
+                        auto zeroLoc = a.loc.copyWithZeroLength();
+                        auto magic = ast::MK::Constant(zeroLoc, core::Symbols::Magic());
+                        auto fieldKind = ident->kind == ast::UnresolvedIdent::Kind::Class ? core::Names::class_()
+                                                                                          : core::Names::instance();
+                        // Mutate a.rhs before walking.
+                        a.rhs =
+                            ast::MK::Send4(a.lhs.loc(), move(magic), core::Names::suggestFieldType(), zeroLoc,
+                                           move(a.rhs), ast::MK::String(zeroLoc, fieldKind),
+                                           ast::MK::String(zeroLoc, cctx.ctx.owner.asMethodRef().data(cctx.ctx)->name),
+                                           ast::MK::Symbol(zeroLoc, ident->name));
+                    }
                     ENFORCE(lhs.exists());
                 } else {
-                    Exception::raise("should never be reached");
+                    Exception::raise("Unexpected Assign::lhs in builder_walk.cc: {}", a.nodeName());
                 }
 
                 auto rhsCont = walk(cctx.withTarget(lhs), a.rhs, current);
@@ -339,48 +436,57 @@ BasicBlock *CFGBuilder::walk(CFGContext cctx, ast::ExpressionPtr &what, BasicBlo
             [&](ast::Send &s) {
                 LocalRef recv;
 
-                if (s.fun == core::Names::absurd()) {
-                    if (auto cnst = ast::cast_tree<ast::ConstantLit>(s.recv)) {
-                        if (cnst->symbol == core::Symbols::T()) {
-                            if (s.hasKwArgs()) {
-                                if (auto e = cctx.ctx.beginError(s.loc, core::errors::CFG::MalformedTAbsurd)) {
-                                    e.setHeader("`{}` does not accept keyword arguments", "T.absurd");
-                                }
-                                ret = current;
-                                return;
-                            }
-
-                            if (s.numPosArgs() != 1) {
-                                if (auto e = cctx.ctx.beginError(s.loc, core::errors::CFG::MalformedTAbsurd)) {
-                                    e.setHeader("`{}` expects exactly one argument but got `{}`", "T.absurd",
-                                                s.numPosArgs());
-                                }
-                                ret = current;
-                                return;
-                            }
-
-                            if (!ast::isa_tree<ast::Local>(s.getPosArg(0)) &&
-                                !ast::isa_tree<ast::UnresolvedIdent>(s.getPosArg(0))) {
-                                if (auto e = cctx.ctx.beginError(s.loc, core::errors::CFG::MalformedTAbsurd)) {
-                                    // Providing a send is the most common way T.absurd is misused, so we provide a
-                                    // little extra hint in the error message in that case.
-                                    if (ast::isa_tree<ast::Send>(s.getPosArg(0))) {
-                                        e.setHeader("`{}` expects to be called on a variable, not a method call",
-                                                    "T.absurd");
-                                    } else {
-                                        e.setHeader("`{}` expects to be called on a variable", "T.absurd");
-                                    }
-                                }
-                                ret = current;
-                                return;
-                            }
-
-                            auto temp = cctx.newTemporary(core::Names::statTemp());
-                            current = walk(cctx.withTarget(temp), s.getPosArg(0), current);
-                            current->exprs.emplace_back(cctx.target, s.loc, make_insn<TAbsurd>(temp));
-                            ret = current;
-                            return;
+                // For performance, we do the name check first (single integer comparison in the
+                // common case)
+                if (s.fun == core::Names::absurd() && sendRecvIsT(s)) {
+                    if (s.hasKwArgs()) {
+                        if (auto e = cctx.ctx.beginError(s.loc, core::errors::CFG::MalformedTAbsurd)) {
+                            e.setHeader("`{}` does not accept keyword arguments", "T.absurd");
                         }
+                        ret = current;
+                        return;
+                    }
+
+                    if (s.numPosArgs() != 1) {
+                        if (auto e = cctx.ctx.beginError(s.loc, core::errors::CFG::MalformedTAbsurd)) {
+                            e.setHeader("`{}` expects exactly one argument but got `{}`", "T.absurd", s.numPosArgs());
+                        }
+                        ret = current;
+                        return;
+                    }
+
+                    auto &posArg0 = s.getPosArg(0);
+                    if (!ast::isa_tree<ast::Local>(posArg0) && !ast::isa_tree<ast::UnresolvedIdent>(posArg0)) {
+                        if (auto e = cctx.ctx.beginError(s.loc, core::errors::CFG::MalformedTAbsurd)) {
+                            // Providing a send is the most common way T.absurd is misused, so we provide a
+                            // little extra hint in the error message in that case.
+                            if (ast::isa_tree<ast::Send>(posArg0)) {
+                                e.setHeader("`{}` expects to be called on a variable, not a method call", "T.absurd");
+                            } else {
+                                e.setHeader("`{}` expects to be called on a variable", "T.absurd");
+                            }
+                            e.addErrorLine(core::Loc(cctx.ctx.file, posArg0.loc()),
+                                           "Assign this expression to a variable, and use it in both the "
+                                           "conditional and the `{}` call",
+                                           "T.absurd");
+                        }
+                        ret = current;
+                        return;
+                    }
+
+                    auto temp = cctx.newTemporary(core::Names::statTemp());
+                    current = walk(cctx.withTarget(temp), posArg0, current);
+                    current->exprs.emplace_back(cctx.target, s.loc, make_insn<TAbsurd>(temp));
+                    ret = current;
+                    return;
+                } else if (s.fun == core::Names::attachedClass() && sendRecvIsT(s)) {
+                    s.recv = ast::MK::Magic(s.recv.loc());
+                    s.addPosArg(ast::MK::Self(s.recv.loc()));
+                } else if (s.fun == core::Names::typeParameter() && sendRecvIsT(s)) {
+                    if (auto insn = maybeMakeTypeParameterAlias(cctx, s)) {
+                        current->exprs.emplace_back(cctx.target, s.loc, move(insn));
+                        ret = current;
+                        return;
                     }
                 }
 
@@ -422,7 +528,7 @@ BasicBlock *CFGBuilder::walk(CFGContext cctx, ast::ExpressionPtr &what, BasicBlo
                 if (auto *block = s.block()) {
                     auto newRubyRegionId = ++cctx.inWhat.maxRubyRegionId;
                     auto &blockArgs = block->args;
-                    vector<ast::ParsedArg> blockArgFlags = ast::ArgParsing::parseArgs(blockArgs);
+                    vector<core::ParsedArg> blockArgFlags = ast::ArgParsing::parseArgs(blockArgs);
                     vector<core::ArgInfo::ArgFlags> argFlags;
                     for (auto &e : blockArgFlags) {
                         argFlags.emplace_back(e.flags);
@@ -774,19 +880,31 @@ BasicBlock *CFGBuilder::walk(CFGContext cctx, ast::ExpressionPtr &what, BasicBlo
             },
 
             [&](ast::Cast &c) {
+                // This is kind of gross, but it is the only way to ensure that the bits in the
+                // type expression make it into the CFG for LSP to hit on their locations.
+                LocalRef deadSym = cctx.newTemporary(core::Names::keepForIde());
+                current = walk(cctx.withTarget(deadSym), c.typeExpr, current);
+                // Ensure later passes don't delete the results of the typeExpr.
+                current->exprs.emplace_back(deadSym, core::LocOffsets::none(), make_insn<KeepAlive>(deadSym));
                 LocalRef tmp = cctx.newTemporary(core::Names::castTemp());
+                core::LocOffsets argLoc = c.arg.loc();
                 current = walk(cctx.withTarget(tmp), c.arg, current);
                 if (c.cast == core::Names::uncheckedLet()) {
                     current->exprs.emplace_back(cctx.target, c.loc, make_insn<Ident>(tmp));
-                } else if (c.cast == core::Names::bind()) {
+                } else if (c.cast == core::Names::bind() || c.cast == core::Names::syntheticBind()) {
+                    auto isSynthetic = c.cast == core::Names::syntheticBind();
                     if (c.arg.isSelfReference()) {
                         auto self = cctx.inWhat.enterLocal(core::LocalVariable::selfVariable());
-                        current->exprs.emplace_back(self, c.loc, make_insn<Cast>(tmp, c.type, core::Names::cast()));
+                        auto &inserted = current->exprs.emplace_back(
+                            self, c.loc, make_insn<Cast>(tmp, argLoc, c.type, core::Names::cast()));
+                        if (isSynthetic) {
+                            inserted.value.setSynthetic();
+                        }
                         current->exprs.emplace_back(cctx.target, c.loc, make_insn<Ident>(self));
 
                         if (cctx.rescueScope) {
-                            cctx.rescueScope->exprs.emplace_back(self, c.loc,
-                                                                 make_insn<Cast>(tmp, c.type, core::Names::cast()));
+                            cctx.rescueScope->exprs.emplace_back(
+                                self, c.loc, make_insn<Cast>(tmp, argLoc, c.type, core::Names::cast()));
                             cctx.rescueScope->exprs.emplace_back(cctx.target, c.loc, make_insn<Ident>(self));
                         }
                     } else {
@@ -795,7 +913,7 @@ BasicBlock *CFGBuilder::walk(CFGContext cctx, ast::ExpressionPtr &what, BasicBlo
                         }
                     }
                 } else {
-                    current->exprs.emplace_back(cctx.target, c.loc, make_insn<Cast>(tmp, c.type, c.cast));
+                    current->exprs.emplace_back(cctx.target, c.loc, make_insn<Cast>(tmp, argLoc, c.type, c.cast));
                 }
                 if (c.cast == core::Names::let()) {
                     cctx.inWhat.minLoops[cctx.target.id()] = CFG::MIN_LOOP_LET;
@@ -804,16 +922,30 @@ BasicBlock *CFGBuilder::walk(CFGContext cctx, ast::ExpressionPtr &what, BasicBlo
                 ret = current;
             },
 
+            [&](ast::RuntimeMethodDefinition &rmd) {
+                current->exprs.emplace_back(
+                    cctx.target, rmd.loc.copyWithZeroLength(),
+                    make_insn<Literal>(core::make_type<core::NamedLiteralType>(core::Symbols::Symbol(), rmd.name)));
+                ret = current;
+            },
+
             [&](const ast::EmptyTree &n) { ret = current; },
 
             [&](const ast::ClassDef &c) { Exception::raise("Should have been removed by FlattenWalk"); },
             [&](const ast::MethodDef &c) { Exception::raise("Should have been removed by FlattenWalk"); },
 
-            [&](const ast::ExpressionPtr &n) { Exception::raise("Unimplemented AST Node: {}", what.nodeName()); });
+            [&](const ast::ExpressionPtr &n) {
+                if (n == nullptr) {
+                    Exception::raise("Tried to convert `nullptr` to CFG in ctx.file=\"{}\"",
+                                     cctx.ctx.file.data(cctx.ctx).path());
+                } else {
+                    Exception::raise("Unimplemented AST Node: {}", what.nodeName());
+                }
+            });
 
         // For, Rescue,
         // Symbol, Array,
-        ENFORCE(ret != nullptr, "CFB builder ret unset");
+        ENFORCE(ret != nullptr, "CFG builder ret unset");
         return ret;
     } catch (SorbetException &) {
         Exception::failInFuzzer();

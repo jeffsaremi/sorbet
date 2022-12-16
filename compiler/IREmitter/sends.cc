@@ -247,15 +247,11 @@ void setSendArgsEntry(CompilerState &cs, llvm::IRBuilderBase &builder, llvm::Val
     // just means to offset 0 from the pointer's contents. Then the second index is into the
     // array (so for this type of pointer-to-array, the first index will always be 0,
     // unless you're trying to do something more powerful with GEP, like compute sizeof)
-    llvm::Value *indices[] = {llvm::ConstantInt::get(cs, llvm::APInt(32, 0, true)),
-                              llvm::ConstantInt::get(cs, llvm::APInt(64, index, true))};
-    builder.CreateStore(val, builder.CreateGEP(sendArgs, indices, fmt::format("callArgs{}Addr", index)));
+    builder.CreateStore(val, builder.CreateConstGEP2_64(sendArgs, 0, index, fmt::format("callArgs{}Addr", index)));
 }
 
 llvm::Value *getSendArgsPointer(CompilerState &cs, llvm::IRBuilderBase &builder, llvm::Value *sendArgs) {
-    llvm::Value *indices[] = {llvm::ConstantInt::get(cs, llvm::APInt(64, 0, true)),
-                              llvm::ConstantInt::get(cs, llvm::APInt(64, 0, true))};
-    return builder.CreateGEP(sendArgs, indices);
+    return builder.CreateConstGEP2_64(sendArgs, 0, 0);
 }
 
 } // namespace
@@ -464,11 +460,11 @@ llvm::Value *IREmitterHelpers::emitMethodCallViaRubyVM(MethodCallContext &mcctx)
     // gone wrong.
     if (auto *at = core::cast_type<core::AppliedType>(send->recv.type)) {
         if (at->klass == core::Symbols::MagicSingleton()) {
-            failCompilation(cs, core::Loc(irctx.cfg.file, send->receiverLoc),
+            failCompilation(cs, core::Loc(cs.file, send->receiverLoc),
                             "No runtime implemention for <Magic> method exists");
         }
         if (at->klass == core::Symbols::Sorbet_Private_StaticSingleton()) {
-            failCompilation(cs, core::Loc(irctx.cfg.file, send->receiverLoc),
+            failCompilation(cs, core::Loc(cs.file, send->receiverLoc),
                             "No runtime implementation for Sorbet::Private::Static method exists");
         }
     }
@@ -512,29 +508,23 @@ llvm::Value *IREmitterHelpers::makeInlineCache(CompilerState &cs, llvm::IRBuilde
         auto *argcVal = llvm::ConstantInt::get(cs, llvm::APInt(32, argc, true));
 
         auto *keywordsLenVal = llvm::ConstantInt::get(cs, llvm::APInt(32, keywords.size(), true));
-        llvm::Value *keywordsVal = nullptr;
 
-        if (keywords.empty()) {
-            keywordsVal = llvm::ConstantPointerNull::get(llvm::Type::getInt64Ty(cs)->getPointerTo());
-        } else {
-            // NOTE: we may want to create one array that has the max number of slots available and re-use it for each
-            // initialization
-            auto *numKeywords = llvm::ConstantInt::get(cs, llvm::APInt(32, keywords.size()));
-            keywordsVal = builder.CreateAlloca(llvm::Type::getInt64Ty(cs), numKeywords, "keywords");
+        auto *flagVal = flags.build(cs, builder);
 
-            int index = 0;
+        vector<llvm::Value *> args;
+        args.push_back(cache);
+        args.push_back(midVal);
+        args.push_back(flagVal);
+        args.push_back(argcVal);
+        args.push_back(keywordsLenVal);
+        if (!keywords.empty()) {
             for (auto kw : keywords) {
                 auto *kwVal = Payload::idIntern(cs, builder, kw);
-                auto *symVal = builder.CreateCall(cs.getFunction("sorbet_IDToSym"), {kwVal}, "symbol");
-
-                auto *offset = llvm::ConstantInt::get(cs, llvm::APInt(32, index++, false));
-                llvm::Value *indices[] = {offset};
-                builder.CreateStore(symVal, builder.CreateGEP(keywordsVal, indices));
+                args.push_back(kwVal);
             }
         }
 
-        auto *flagVal = flags.build(cs, builder);
-        builder.CreateCall(setupFn, {cache, midVal, flagVal, argcVal, keywordsLenVal, keywordsVal});
+        builder.CreateCall(setupFn, args);
 
         builder.restoreIP(restore);
     }

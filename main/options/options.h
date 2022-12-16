@@ -85,6 +85,7 @@ struct Printers {
     PrinterConfig AutogenSubclasses;
     PrinterConfig Packager;
     PrinterConfig MinimizeRBI;
+    PrinterConfig PayloadSources;
     // Ensure everything here is in PrinterConfig::printers().
 
     std::vector<std::reference_wrapper<PrinterConfig>> printers();
@@ -113,13 +114,30 @@ struct AutoloaderConfig {
     std::string rootObject;
     std::vector<std::string> requireExcludes;
     std::vector<std::vector<std::string>> sameFileModules;
+    std::vector<std::vector<std::string>> pbalNamespaces;
     std::vector<std::string> stripPrefixes;
 
     std::vector<std::string> absoluteIgnorePatterns;
     std::vector<std::string> relativeIgnorePatterns;
-
-    bool packagedAutoloader;
 };
+
+struct AutogenConstCacheConfig {
+    // A file which contains a cache that can be used to potentially skip autogen
+    std::string cacheFile;
+    // A list of files which have changed since the last autogen run.
+    std::vector<std::string> changedFiles;
+};
+
+namespace {
+
+#if !defined(EMSCRIPTEN)
+constexpr size_t MAX_CACHE_SIZE_BYTES = 4L * 1024 * 1024 * 1024; // 4 GiB
+#else
+// Cache is unused in emscripten, so this value doesn't matter, but sizeof(size_t) on emscripten is 4 bytes
+constexpr size_t MAX_CACHE_SIZE_BYTES = 1L * 1024 * 1024 * 1024; // 1 GiB
+#endif
+
+} // namespace
 
 struct Options {
     Printers print;
@@ -140,17 +158,18 @@ struct Options {
     bool silenceErrors = false;
     bool silenceDevMessage = false;
     bool suggestSig = false;
-    bool supressNonCriticalErrors = false;
+    bool suppressNonCriticalErrors = false;
     bool runLSP = false;
     bool disableWatchman = false;
     std::string watchmanPath = "watchman";
+    std::string watchmanPauseStateName;
     bool stressIncrementalResolver = false;
-    bool sleepInSlowPath = false;
+    std::optional<int> sleepInSlowPathSeconds = std::nullopt;
+    bool traceLexer = false;
     bool traceParser = false;
     bool noErrorCount = false;
     bool autocorrect = false;
     bool waitForDebugger = false;
-    bool skipRewriterPasses = false;
     bool censorForSnapshotTests = false;
     bool forceHashing = false;
     int threads = 0;
@@ -159,10 +178,14 @@ struct Options {
     bool stripeMode = false;
     bool stripePackages = false;
     std::string stripePackagesHint = "";
-    std::vector<std::string> extraPackageFilesDirectoryPrefixes;
+    std::vector<std::string> extraPackageFilesDirectoryUnderscorePrefixes;
+    std::vector<std::string> extraPackageFilesDirectorySlashPrefixes;
     std::vector<std::string> secondaryTestPackageNamespaces;
     std::string typedSource = "";
     std::string cacheDir = "";
+    // This configured both maximum filesystem db size and max virtual memory usage
+    // Needs to be a multiple of getpagesize(2) which is 4096 by default on macOS and Linux
+    size_t maxCacheSizeBytes = MAX_CACHE_SIZE_BYTES;
     UnorderedMap<std::string, core::StrictLevel> strictnessOverrides;
     std::string storeState = "";
     bool enableCounters = false;
@@ -201,8 +224,11 @@ struct Options {
     std::string metricsSha = "none";
     std::map<std::string, std::string> metricsExtraTags; // be super careful with cardinality here
 
+    bool packageRBIGeneration = false;
     std::string dumpPackageInfo = "";
-    std::string packageRBIOutput = "";
+    std::string singlePackage = "";
+    std::string packageRBIDir = "";
+    std::vector<std::string> packageSkipRBIExportEnforcementDirs;
 
     // Contains the allowed extensions Sorbet can parse.
     UnorderedSet<std::string> allowedExtensions;
@@ -222,9 +248,15 @@ struct Options {
     std::vector<std::string> autogenSubclassesAbsoluteIgnorePatterns;
     // Ignore patterns that can occur anywhere in a file's path from an input folder.
     std::vector<std::string> autogenSubclassesRelativeIgnorePatterns;
+    // Allow RBI files to define behavior if they are in one of these paths.
+    std::vector<std::string> autogenBehaviorAllowedInRBIFilesPaths;
+    AutogenConstCacheConfig autogenConstantCacheConfig;
+
     // List of directories not available editor-side. References to files in these directories should be sent via
     // sorbet: URIs to clients that support them.
     std::vector<std::string> lspDirsMissingFromClient;
+    // Path to the executable used for document formatting
+    std::string rubyfmtPath = "rubyfmt";
     // Enable stable-but-not-yet-shipped features suitable for late-stage beta-testing.
     bool lspAllBetaFeaturesEnabled = false;
     // Booleans enabling various experimental LSP features. Each will be removed once corresponding feature stabilizes.
@@ -232,6 +264,7 @@ struct Options {
     bool lspDocumentSymbolEnabled = false;
     bool lspDocumentFormatRubyfmtEnabled = false;
     bool lspSignatureHelpEnabled = false;
+    bool lspExperimentalFastPathEnabled = false;
 
     // Experimental feature `requires_ancestor`
     bool requiresAncestorEnabled = false;
@@ -271,6 +304,10 @@ void readOptions(
     Options &, std::vector<std::unique_ptr<pipeline::semantic_extension::SemanticExtension>> &configuredExtensions,
     int argc, char *argv[],
     const std::vector<pipeline::semantic_extension::SemanticExtensionProvider *> &semanticExtensionProviders,
+    std::shared_ptr<spdlog::logger> logger) noexcept(false); // throw(EarlyReturnWithCode);
+
+bool readAutogenConstCacheOptions(
+    AutogenConstCacheConfig &cfg, int argc, const char *argv[],
     std::shared_ptr<spdlog::logger> logger) noexcept(false); // throw(EarlyReturnWithCode);
 
 void flushPrinters(Options &);

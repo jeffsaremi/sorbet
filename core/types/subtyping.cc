@@ -263,7 +263,7 @@ TypePtr Types::lub(const GlobalState &gs, const TypePtr &t1, const TypePtr &t2) 
         auto t1d = underlying(gs, t1);
         auto t2filtered = dropLubComponents(gs, t2, t1d);
         if (t2filtered != t2) {
-            return lub(gs, t1, t2filtered);
+            return lub(gs, t1d, t2filtered);
         }
         if (isa_type<OrType>(t1)) {
             return lubDistributeOr(gs, t1, t2);
@@ -313,19 +313,22 @@ TypePtr Types::lub(const GlobalState &gs, const TypePtr &t1, const TypePtr &t2) 
                 i++;
             }
             ENFORCE(i < a1->klass.data(gs)->typeMembers().size());
-            if (idxTypeMember.data(gs)->isCovariant()) {
+            if (idxTypeMember.data(gs)->flags.isCovariant) {
                 newTargs.emplace_back(Types::any(gs, a1->targs[i], a2->targs[j]));
-            } else if (idxTypeMember.data(gs)->isInvariant()) {
+            } else if (idxTypeMember.data(gs)->flags.isInvariant) {
                 if (!Types::equiv(gs, a1->targs[i], a2->targs[j])) {
                     return OrType::make_shared(t1s, t2s);
                 }
+                // We don't need to check the idxTypeMember upper/lower bounds like the corresponding case in glb
+                // because it's a2->targs[j] is already within the bounds of idxTypeMember (or an error was reported
+                // already), and a1->targs[i] is untyped so it trivially matches all bounds.
                 if (a1->targs[i].isUntyped()) {
                     newTargs.emplace_back(a1->targs[i]);
                 } else {
                     newTargs.emplace_back(a2->targs[j]);
                 }
 
-            } else if (idxTypeMember.data(gs)->isContravariant()) {
+            } else if (idxTypeMember.data(gs)->flags.isContravariant) {
                 newTargs.emplace_back(Types::all(gs, a1->targs[i], a2->targs[j]));
             }
             changedFromT2 = changedFromT2 || newTargs.back() != a2->targs[j];
@@ -387,20 +390,15 @@ TypePtr Types::lub(const GlobalState &gs, const TypePtr &t1, const TypePtr &t2) 
                             bool differ2 = false;
                             for (auto &el2 : h2->keys) {
                                 ++i;
-                                auto el2l = cast_type_nonnull<LiteralType>(el2);
-                                auto fnd = absl::c_find_if(h1.keys, [&](auto &candidate) -> bool {
-                                    auto el1l = cast_type_nonnull<LiteralType>(candidate);
-                                    return el1l.equals(el2l); // from lambda
-                                });
-                                if (fnd != h1.keys.end()) {
-                                    auto &inserted = valueLubs.emplace_back(
-                                        lub(gs, h1.values[fnd - h1.keys.begin()], h2->values[i]));
-                                    differ1 = differ1 || inserted != h1.values[fnd - h1.keys.begin()];
-                                    differ2 = differ2 || inserted != h2->values[i];
-                                } else {
+                                auto optind = h1.indexForKey(el2);
+                                if (!optind.has_value()) {
                                     result = Types::hashOfUntyped();
                                     return;
                                 }
+                                auto &inserted =
+                                    valueLubs.emplace_back(lub(gs, h1.values[optind.value()], h2->values[i]));
+                                differ1 = differ1 || inserted != h1.values[optind.value()];
+                                differ2 = differ2 || inserted != h2->values[i];
                             }
                             if (!differ1) {
                                 result = t1;
@@ -421,14 +419,14 @@ TypePtr Types::lub(const GlobalState &gs, const TypePtr &t1, const TypePtr &t2) 
                         }
                     }
                 },
-                [&](const LiteralType &l1) {
-                    if (isa_type<LiteralType>(t2)) {
-                        auto l2 = cast_type_nonnull<LiteralType>(t2);
+                [&](const NamedLiteralType &l1) {
+                    if (isa_type<NamedLiteralType>(t2)) {
+                        auto l2 = cast_type_nonnull<NamedLiteralType>(t2);
                         auto underlyingL1 = l1.underlying(gs);
                         auto underlyingL2 = l2.underlying(gs);
-                        auto uint8_t = cast_type_nonnull<ClassType>(underlyingL1);
-                        auto uint16_t = cast_type_nonnull<ClassType>(underlyingL2);
-                        if (uint8_t.symbol == uint16_t.symbol) {
+                        auto class1 = cast_type_nonnull<ClassType>(underlyingL1);
+                        auto class2 = cast_type_nonnull<ClassType>(underlyingL2);
+                        if (class1.symbol == class2.symbol) {
                             if (l1.equals(l2)) {
                                 result = t1;
                             } else {
@@ -436,6 +434,30 @@ TypePtr Types::lub(const GlobalState &gs, const TypePtr &t1, const TypePtr &t2) 
                             }
                         } else {
                             result = lubGround(gs, l1.underlying(gs), l2.underlying(gs));
+                        }
+                    } else {
+                        result = lub(gs, l1.underlying(gs), t2.underlying(gs));
+                    }
+                },
+                [&](const IntegerLiteralType &l1) {
+                    if (isa_type<IntegerLiteralType>(t2)) {
+                        auto &l2 = cast_type_nonnull<IntegerLiteralType>(t2);
+                        if (l1.equals(l2)) {
+                            result = t1;
+                        } else {
+                            result = l1.underlying(gs);
+                        }
+                    } else {
+                        result = lub(gs, l1.underlying(gs), t2.underlying(gs));
+                    }
+                },
+                [&](const FloatLiteralType &l1) {
+                    if (isa_type<FloatLiteralType>(t2)) {
+                        auto &l2 = cast_type_nonnull<FloatLiteralType>(t2);
+                        if (l1.equals(l2)) {
+                            result = t1;
+                        } else {
+                            result = l1.underlying(gs);
                         }
                     } else {
                         result = lub(gs, l1.underlying(gs), t2.underlying(gs));
@@ -601,8 +623,13 @@ TypePtr glbGround(const GlobalState &gs, const TypePtr &t1, const TypePtr &t2) {
         categoryCounterInc("glb.<class>.collapsed", "yes");
         return t2;
     } else {
-        if (sym1.data(gs)->isClassOrModuleClass() && sym2.data(gs)->isClassOrModuleClass()) {
+        if (sym1.data(gs)->isClass() && sym2.data(gs)->isClass()) {
             categoryCounterInc("glb.<class>.collapsed", "bottom");
+            return Types::bottom();
+        } else if (sym1.data(gs)->flags.isFinal || sym2.data(gs)->flags.isFinal) {
+            // If at least one of them is a module, the only way this type could ever be inhabited
+            // is if a descendant of one of the symbols later includes the module symbol. This can't
+            // happen if either one is final.
             return Types::bottom();
         }
         categoryCounterInc("glb.<class>.collapsed", "no");
@@ -739,26 +766,21 @@ TypePtr Types::glb(const GlobalState &gs, const TypePtr &t1, const TypePtr &t2) 
                         bool canReuseT2 = true;
                         for (auto &el2 : h2.keys) {
                             ++i;
-                            auto el2l = cast_type_nonnull<LiteralType>(el2);
-                            auto fnd = absl::c_find_if(h1.keys, [&](auto &candidate) -> bool {
-                                auto el1l = cast_type_nonnull<LiteralType>(candidate);
-                                return el1l.equals(el2l); // from lambda
-                            });
-                            if (fnd != h1.keys.end()) {
-                                auto left = h1.values[fnd - h1.keys.begin()];
-                                auto right = h2.values[i];
-                                auto glbe = glb(gs, left, right);
-                                if (glbe.isBottom()) {
-                                    result = Types::bottom();
-                                    return;
-                                }
-                                canReuseT1 &= glbe == left;
-                                canReuseT2 &= glbe == right;
-                                valueLubs.emplace_back(glbe);
-                            } else {
+                            auto optind = h1.indexForKey(el2);
+                            if (!optind.has_value()) {
                                 result = Types::bottom();
                                 return;
                             }
+                            auto &left = h1.values[optind.value()];
+                            auto &right = h2.values[i];
+                            auto glbe = glb(gs, left, right);
+                            if (glbe.isBottom()) {
+                                result = Types::bottom();
+                                return;
+                            }
+                            canReuseT1 &= glbe == left;
+                            canReuseT2 &= glbe == right;
+                            valueLubs.emplace_back(glbe);
                         }
                         if (canReuseT1) {
                             result = t1;
@@ -772,18 +794,34 @@ TypePtr Types::glb(const GlobalState &gs, const TypePtr &t1, const TypePtr &t2) 
                     }
 
                 },
-                [&](const LiteralType &l1) {
-                    auto l2 = cast_type_nonnull<LiteralType>(t2);
+                [&](const NamedLiteralType &l1) {
+                    auto l2 = cast_type_nonnull<NamedLiteralType>(t2);
                     auto underlyingL1 = l1.underlying(gs);
                     auto underlyingL2 = l2.underlying(gs);
-                    auto uint8_t = cast_type_nonnull<ClassType>(underlyingL1);
-                    auto uint16_t = cast_type_nonnull<ClassType>(underlyingL2);
-                    if (uint8_t.symbol == uint16_t.symbol) {
+                    auto class1 = cast_type_nonnull<ClassType>(underlyingL1);
+                    auto class2 = cast_type_nonnull<ClassType>(underlyingL2);
+                    if (class1.symbol == class2.symbol) {
                         if (l1.equals(l2)) {
                             result = t1;
                         } else {
                             result = Types::bottom();
                         }
+                    } else {
+                        result = Types::bottom();
+                    }
+                },
+                [&](const IntegerLiteralType &l1) {
+                    auto &l2 = cast_type_nonnull<IntegerLiteralType>(t2);
+                    if (l1.equals(l2)) {
+                        result = t1;
+                    } else {
+                        result = Types::bottom();
+                    }
+                },
+                [&](const FloatLiteralType &l1) {
+                    auto &l2 = cast_type_nonnull<FloatLiteralType>(t2);
+                    if (l1.equals(l2)) {
+                        result = t1;
                     } else {
                         result = Types::bottom();
                     }
@@ -885,14 +923,14 @@ TypePtr Types::glb(const GlobalState &gs, const TypePtr &t1, const TypePtr &t2) 
     if (auto *a1 = cast_type<AppliedType>(t1)) {
         auto *a2 = cast_type<AppliedType>(t2);
         if (a2 == nullptr) {
-            if (a1->klass.data(gs)->isClassOrModuleModule() || !isa_type<ClassType>(t2)) {
+            if (a1->klass.data(gs)->isModule() || !isa_type<ClassType>(t2)) {
                 return AndType::make_shared(t1, t2);
             }
             auto c2 = cast_type_nonnull<ClassType>(t2);
             if (a1->klass.data(gs)->derivesFrom(gs, c2.symbol)) {
                 return t1;
             }
-            if (c2.symbol.data(gs)->isClassOrModuleModule()) {
+            if (c2.symbol.data(gs)->isModule()) {
                 return AndType::make_shared(t1, t2);
             }
             return Types::bottom();
@@ -900,10 +938,15 @@ TypePtr Types::glb(const GlobalState &gs, const TypePtr &t1, const TypePtr &t2) 
         bool rtl = a1->klass == a2->klass || a1->klass.data(gs)->derivesFrom(gs, a2->klass);
         bool ltr = !rtl && a2->klass.data(gs)->derivesFrom(gs, a1->klass);
         if (!rtl && !ltr) {
-            if (a1->klass.data(gs)->isClassOrModuleClass() && a2->klass.data(gs)->isClassOrModuleClass()) {
+            if (a1->klass.data(gs)->isClass() && a2->klass.data(gs)->isClass()) {
                 // At this point, the two types are both classes, and unrelated
                 // to each other. Because ruby does not support multiple
                 // inheritance, this type is empty.
+                return Types::bottom();
+            } else if (a1->klass.data(gs)->flags.isFinal || a2->klass.data(gs)->flags.isFinal) {
+                // If at least one of them is a module, the only way this type could ever be
+                // inhabited is if a descendant of one of the symbols later includes the module
+                // symbol. This can't happen if either one is final.
                 return Types::bottom();
             } else {
                 return AndType::make_shared(t1, t2); // we can as well return nothing here?
@@ -921,8 +964,7 @@ TypePtr Types::glb(const GlobalState &gs, const TypePtr &t1, const TypePtr &t2) 
         vector<TypePtr> newTargs;
         newTargs.reserve(a1->klass.data(gs)->typeMembers().size());
         int j = 0;
-        for (SymbolRef idx : a1->klass.data(gs)->typeMembers()) {
-            TypeMemberRef idxTypeMember = idx.asTypeMemberRef();
+        for (auto idx : a1->klass.data(gs)->typeMembers()) {
             int i = 0;
             if (j >= indexes.size()) {
                 i = INT_MAX;
@@ -933,18 +975,21 @@ TypePtr Types::glb(const GlobalState &gs, const TypePtr &t1, const TypePtr &t2) 
             if (i >= a2->klass.data(gs)->typeMembers().size()) { // a1 has more tparams, this is fine, it's a child
                 newTargs.emplace_back(a1->targs[j]);
             } else {
-                if (idxTypeMember.data(gs)->isCovariant()) {
+                auto a2TypeMember = a2->klass.data(gs)->typeMembers()[i];
+                if (a2TypeMember.data(gs)->flags.isCovariant) {
                     newTargs.emplace_back(Types::all(gs, a1->targs[j], a2->targs[i]));
-                } else if (idxTypeMember.data(gs)->isInvariant()) {
+                } else if (a2TypeMember.data(gs)->flags.isInvariant) {
                     if (!Types::equiv(gs, a1->targs[j], a2->targs[i])) {
                         return AndType::make_shared(t1, t2);
                     }
-                    if (a1->targs[j].isUntyped()) {
+                    const auto &lambdaParam = cast_type<LambdaParam>(idx.data(gs)->resultType);
+                    if (a1->targs[j].isUntyped() && Types::isSubType(gs, lambdaParam->lowerBound, a2->targs[i]) &&
+                        Types::isSubType(gs, a2->targs[i], lambdaParam->upperBound)) {
                         newTargs.emplace_back(a2->targs[i]);
                     } else {
                         newTargs.emplace_back(a1->targs[j]);
                     }
-                } else if (idxTypeMember.data(gs)->isContravariant()) {
+                } else if (a2TypeMember.data(gs)->flags.isContravariant) {
                     newTargs.emplace_back(Types::any(gs, a1->targs[j], a2->targs[i]));
                 }
             }
@@ -1020,6 +1065,7 @@ void compareToUntyped(const GlobalState &gs, TypeConstraint &constr, const TypeP
         compareToUntyped(gs, constr, t->right, blame);
     } else if (auto *t = cast_type<TypeVar>(ty)) {
         constr.rememberIsSubtype(gs, ty, blame);
+        constr.rememberIsSubtype(gs, blame, ty);
     }
 }
 
@@ -1038,7 +1084,7 @@ bool isSubTypeUnderConstraintSingle(const GlobalState &gs, TypeConstraint &const
         if (constr.isSolved()) {
             return constr.isAlreadyASubType(gs, t1, t2);
         } else {
-            return constr.rememberIsSubtype(gs, t1, t2);
+            return constr.rememberIsSubtype(gs, Types::dropLiteral(gs, t1), Types::dropLiteral(gs, t2));
         }
     }
 
@@ -1166,17 +1212,21 @@ bool isSubTypeUnderConstraintSingle(const GlobalState &gs, TypeConstraint &const
 
                 ENFORCE(i < a1->klass.data(gs)->typeMembers().size());
 
-                if (idxTypeMember.data(gs)->isCovariant()) {
+                if (idxTypeMember.data(gs)->flags.isCovariant) {
                     result = Types::isSubTypeUnderConstraint(gs, constr, a1->targs[i], a2->targs[j], mode);
-                } else if (idxTypeMember.data(gs)->isInvariant()) {
+                } else if (idxTypeMember.data(gs)->flags.isInvariant) {
                     auto &a = a1->targs[i];
                     auto &b = a2->targs[j];
                     if (mode == UntypedMode::AlwaysCompatible) {
-                        result = Types::equiv(gs, a, b);
+                        result = Types::equivUnderConstraint(gs, constr, a, b);
                     } else {
-                        result = Types::equivNoUntyped(gs, a, b);
+                        // At the time of writing, we never set mode == UntypedMode::AlwaysIncompatible
+                        // except when `constr` is EmptyFrozenConstraint, so there's no observable
+                        // difference whether we use equivNoUntyped or equivNoUntypedUnderConstraint here.
+                        // May as well do it for symmetry though.
+                        result = Types::equivNoUntypedUnderConstraint(gs, constr, a, b);
                     }
-                } else if (idxTypeMember.data(gs)->isContravariant()) {
+                } else if (idxTypeMember.data(gs)->flags.isContravariant) {
                     result = Types::isSubTypeUnderConstraint(gs, constr, a2->targs[j], a1->targs[i], mode);
                 }
                 if (!result) {
@@ -1225,27 +1275,46 @@ bool isSubTypeUnderConstraintSingle(const GlobalState &gs, TypeConstraint &const
                     int i = -1;
                     for (auto &el2 : h2->keys) {
                         ++i;
-                        auto el2l = cast_type_nonnull<LiteralType>(el2);
-                        auto fnd = absl::c_find_if(h1.keys, [&](auto &candidate) -> bool {
-                            auto el1l = cast_type_nonnull<LiteralType>(candidate);
-                            return el1l.equals(el2l); // from lambda
-                        });
-                        result = fnd != h1.keys.end() &&
-                                 Types::isSubTypeUnderConstraint(gs, constr, h1.values[fnd - h1.keys.begin()],
-                                                                 h2->values[i], mode);
-                        if (!result) {
+                        auto optind = h1.indexForKey(el2);
+                        if (!optind.has_value()) {
+                            result = false;
+                            return;
+                        }
+                        if (!Types::isSubTypeUnderConstraint(gs, constr, h1.values[optind.value()], h2->values[i],
+                                                             mode)) {
+                            result = false;
                             return;
                         }
                     }
                 },
-                [&](const LiteralType &l1) {
-                    if (!isa_type<LiteralType>(t2)) {
+                [&](const NamedLiteralType &l1) {
+                    if (!isa_type<NamedLiteralType>(t2)) {
                         // is a literal a subtype of a different kind of proxy
                         result = false;
                         return;
                     }
 
-                    auto l2 = cast_type_nonnull<LiteralType>(t2);
+                    auto l2 = cast_type_nonnull<NamedLiteralType>(t2);
+                    result = l1.equals(l2);
+                },
+                [&](const IntegerLiteralType &l1) {
+                    if (!isa_type<IntegerLiteralType>(t2)) {
+                        // is a literal a subtype of a different kind of proxy
+                        result = false;
+                        return;
+                    }
+
+                    auto &l2 = cast_type_nonnull<IntegerLiteralType>(t2);
+                    result = l1.equals(l2);
+                },
+                [&](const FloatLiteralType &l1) {
+                    if (!isa_type<FloatLiteralType>(t2)) {
+                        // is a literal a subtype of a different kind of proxy
+                        result = false;
+                        return;
+                    }
+
+                    auto &l2 = cast_type_nonnull<FloatLiteralType>(t2);
                     result = l1.equals(l2);
                 },
                 [&](const MetaType &m1) {
@@ -1278,6 +1347,14 @@ bool isSubTypeUnderConstraintSingle(const GlobalState &gs, TypeConstraint &const
         }
         Exception::raise("isSubTypeUnderConstraint({}, {}): unreachable", t1.typeName(), t2.typeName());
     }
+}
+
+bool Types::isAsSpecificAs(const GlobalState &gs, const TypePtr &t1, const TypePtr &t2) {
+    return isSubTypeUnderConstraint(gs, TypeConstraint::EmptyFrozenConstraint, t1, t2, UntypedMode::AlwaysIncompatible);
+}
+
+bool Types::isSubType(const GlobalState &gs, const TypePtr &t1, const TypePtr &t2) {
+    return isSubTypeUnderConstraint(gs, TypeConstraint::EmptyFrozenConstraint, t1, t2, UntypedMode::AlwaysCompatible);
 }
 
 bool Types::isSubTypeUnderConstraint(const GlobalState &gs, TypeConstraint &constr, const TypePtr &t1,
@@ -1364,15 +1441,36 @@ bool Types::isSubTypeUnderConstraint(const GlobalState &gs, TypeConstraint &cons
         if (isa_type<TypeVar>(t1) && !constr.isSolved()) {
             return constr.rememberIsSubtype(gs, t1, t2);
         }
-        return Types::isSubTypeUnderConstraint(gs, constr, t1, o2->left, mode) ||
-               Types::isSubTypeUnderConstraint(gs, constr, t1, o2->right, mode);
+
+        // This is a hack. isSubTypeUnderConstraint is trying to do double duty as constraint generation and constraint
+        // solving. It essentially implements a greedy algorithm despite no greedy algorithm being correct.
+        // There are a handful of places where we try to work around those hacks with more hacks, and this is one of
+        // them.
+        //
+        // Concretely, it's still possible to come up with cases where this heuristic isn't good enough.
+        // For more, see the comment in `no_short_circuit_type_constraint.rb`
+        auto leftIsSubType = Types::isSubTypeUnderConstraint(gs, constr, t1, o2->left, mode);
+        auto stillNeedToCheckRight = t1.isUntyped() && o2->left.isFullyDefined() && !o2->right.isFullyDefined();
+        if (leftIsSubType && !stillNeedToCheckRight) {
+            // Short circuit to save time
+            return true;
+        } else {
+            return Types::isSubTypeUnderConstraint(gs, constr, t1, o2->right, mode);
+        }
     }
     if (a1 != nullptr) { // 4
         if (isa_type<TypeVar>(t2) && !constr.isSolved()) {
             return constr.rememberIsSubtype(gs, t1, t2);
         }
-        return Types::isSubTypeUnderConstraint(gs, constr, a1->left, t2, mode) ||
-               Types::isSubTypeUnderConstraint(gs, constr, a1->right, t2, mode);
+        // See explanation in "// 3"
+        auto leftIsSubType = Types::isSubTypeUnderConstraint(gs, constr, a1->left, t2, mode);
+        auto stillNeedToCheckRight = t2.isUntyped() && a1->left.isFullyDefined() && !a1->right.isFullyDefined();
+        if (leftIsSubType && !stillNeedToCheckRight) {
+            // Short circuit to save time
+            return true;
+        } else {
+            return Types::isSubTypeUnderConstraint(gs, constr, a1->right, t2, mode);
+        }
     }
 
     return isSubTypeUnderConstraintSingle(gs, constr, mode, t1, t2); // 1
@@ -1382,8 +1480,19 @@ bool Types::equiv(const GlobalState &gs, const TypePtr &t1, const TypePtr &t2) {
     return isSubType(gs, t1, t2) && isSubType(gs, t2, t1);
 }
 
+bool Types::equivUnderConstraint(const GlobalState &gs, TypeConstraint &constr, const TypePtr &t1, const TypePtr &t2) {
+    auto mode = UntypedMode::AlwaysCompatible;
+    return isSubTypeUnderConstraint(gs, constr, t1, t2, mode) && isSubTypeUnderConstraint(gs, constr, t2, t1, mode);
+}
+
 bool Types::equivNoUntyped(const GlobalState &gs, const TypePtr &t1, const TypePtr &t2) {
     return isAsSpecificAs(gs, t1, t2) && isAsSpecificAs(gs, t2, t1);
+}
+
+bool Types::equivNoUntypedUnderConstraint(const GlobalState &gs, TypeConstraint &constr, const TypePtr &t1,
+                                          const TypePtr &t2) {
+    auto mode = UntypedMode::AlwaysIncompatible;
+    return isSubTypeUnderConstraint(gs, constr, t1, t2, mode) && isSubTypeUnderConstraint(gs, constr, t2, t1, mode);
 }
 
 } // namespace sorbet::core

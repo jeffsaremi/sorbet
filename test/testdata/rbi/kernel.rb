@@ -52,6 +52,38 @@ system(env, ['echo', 'echo'], out: :err)
 system(env, ['echo', 'echo'], 'hello')
 system(env, ['echo', 'echo'], 'hello', out: :err)
 
+# then
+obj = T.let("foo", String)
+# Object#then, with a block
+T.reveal_type(obj.then(&:to_i)) # error: Revealed type: `T.untyped`
+
+# object_id
+obj = T.let("foo", String)
+T.assert_type!(obj.object_id, Integer)
+
+# itself
+obj = T.let("foo", String)
+T.assert_type!(obj.itself, String)
+
 y = loop do
 end
 puts y # error: This code is unreachable
+
+class CustomError < StandardError
+  def initialize(cause, team)
+    @cause = cause
+    @team = team
+  end
+end
+
+def raises_fail
+  fail CustomError.new("Problem", "DevOops")
+end
+
+def raises_raise
+  raise CustomError.new("Problem", "DevOops")
+end
+
+def fail_class_message
+  fail StandardError, "message"
+end

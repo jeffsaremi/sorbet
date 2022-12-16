@@ -27,6 +27,8 @@ struct AutoloaderConfig {
     // Should definitions in this namespace be collapsed into their
     // parent if they all are from the same file?
     bool sameFileCollapsable(const std::vector<core::NameRef> &module) const;
+    // This package is registered for path-based autoloading
+    bool registeredForPBAL(const std::vector<core::NameRef> &pkgParts) const;
     // normalize the path relative to the provided prefixes
     std::string_view normalizePath(const core::GlobalState &gs, core::FileRef file) const;
 
@@ -37,10 +39,10 @@ struct AutoloaderConfig {
     UnorderedSet<core::NameRef> topLevelNamespaceRefs;
     UnorderedSet<core::NameRef> excludedRequireRefs;
     UnorderedSet<std::vector<core::NameRef>> nonCollapsableModuleNames;
+    UnorderedSet<std::vector<core::NameRef>> pbalNamespaces;
     std::vector<std::string> absoluteIgnorePatterns;
     std::vector<std::string> relativeIgnorePatterns;
     std::vector<std::string> stripPrefixes;
-    bool packagedAutoloader = false;
 
     AutoloaderConfig() = default;
     AutoloaderConfig(const AutoloaderConfig &) = delete;
@@ -66,8 +68,8 @@ struct NamedDefinition {
     NamedDefinition() = default;
     NamedDefinition(Definition def, QualifiedName qname, QualifiedName parentName,
                     std::vector<core::NameRef> requireStatements, core::FileRef fileRef, uint32_t pathDepth)
-        : def(def), qname(qname), parentName(parentName), requireStatements(std::move(requireStatements)),
-          fileRef(fileRef), pathDepth(pathDepth) {}
+        : def(def), qname(std::move(qname)), parentName(std::move(parentName)),
+          requireStatements(std::move(requireStatements)), fileRef(fileRef), pathDepth(pathDepth) {}
     NamedDefinition(const NamedDefinition &) = delete;
     NamedDefinition(NamedDefinition &&) = default;
     NamedDefinition &operator=(const NamedDefinition &) = delete;
@@ -95,6 +97,7 @@ public:
     std::string fullName(const core::GlobalState &) const;
 
     std::string renderAutoloadSrc(const core::GlobalState &gs, const AutoloaderConfig &) const;
+    bool mustRender(const core::GlobalState &gs, std::string_view filePath) const;
 
     DefTree() = default;
     DefTree(const DefTree &) = delete;
@@ -104,6 +107,7 @@ public:
 
 private:
     core::FileRef file() const;
+    core::FileRef definingFile() const;
     void predeclare(const core::GlobalState &gs, std::string_view fullName, fmt::memory_buffer &buf) const;
     void requireStatements(const core::GlobalState &gs, const AutoloaderConfig &, fmt::memory_buffer &buf) const;
     bool hasDifferentFile(core::FileRef) const;
@@ -111,6 +115,7 @@ private:
     const NamedDefinition &definition(const core::GlobalState &) const;
     Definition::Type definitionType(const core::GlobalState &) const;
     void markPackageNamespace(core::NameRef mangledName, const std::vector<core::NameRef> &nameParts);
+    DefTree *findNode(const std::vector<core::NameRef> &nameParts);
 
     friend class DefTreeBuilder;
 };
@@ -124,7 +129,7 @@ public:
                              NamedDefinition);
 
     static DefTree merge(const core::GlobalState &gs, DefTree lhs, DefTree rhs);
-    static void markPackages(const core::GlobalState &gs, DefTree &root);
+    static void markPackages(const core::GlobalState &gs, DefTree &root, const AutoloaderConfig &autoloaderConfig);
     static void collapseSameFileDefs(const core::GlobalState &gs, const AutoloaderConfig &, DefTree &root);
 
 private:

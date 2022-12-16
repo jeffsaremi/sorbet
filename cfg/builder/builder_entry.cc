@@ -12,7 +12,7 @@ unique_ptr<CFG> CFGBuilder::buildFor(core::Context ctx, ast::MethodDef &md) {
     ENFORCE(md.symbol.exists());
     ENFORCE(!md.symbol.data(ctx)->flags.isOverloaded);
     unique_ptr<CFG> res(new CFG); // private constructor
-    res->file = ctx.file;
+    res->loc = md.loc;
     res->symbol = md.symbol.data(ctx)->dealiasMethod(ctx);
     uint32_t temporaryCounter = 1;
     UnorderedMap<core::SymbolRef, LocalRef> aliases;
@@ -31,9 +31,9 @@ unique_ptr<CFG> CFGBuilder::buildFor(core::Context ctx, ast::MethodDef &md) {
         if (!selfClaz.exists()) {
             selfClaz = md.symbol.enclosingClass(ctx);
         }
-        synthesizeExpr(
-            entry, LocalRef::selfVariable(), core::LocOffsets::none(),
-            make_insn<Cast>(LocalRef::selfVariable(), selfClaz.data(ctx)->selfType(ctx), core::Names::cast()));
+        synthesizeExpr(entry, LocalRef::selfVariable(), core::LocOffsets::none(),
+                       make_insn<Cast>(LocalRef::selfVariable(), core::LocOffsets::none(),
+                                       selfClaz.data(ctx)->selfType(ctx), core::Names::cast()));
 
         BasicBlock *presentCont = entry;
         BasicBlock *defaultCont = nullptr;
@@ -91,7 +91,7 @@ unique_ptr<CFG> CFGBuilder::buildFor(core::Context ctx, ast::MethodDef &md) {
     core::LocOffsets rvLoc;
     if (cont->exprs.empty() || isa_instruction<LoadArg>(cont->exprs.back().value)) {
         auto beginAdjust = md.loc.endPos() - md.loc.beginPos() - 3;
-        auto endLoc = core::Loc(ctx.file, md.loc).adjust(ctx, beginAdjust, 0);
+        auto endLoc = ctx.locAt(md.loc).adjust(ctx, beginAdjust, 0);
         if (endLoc.source(ctx) == "end") {
             rvLoc = endLoc.offsets();
             res->implicitReturnLoc = rvLoc;
@@ -112,7 +112,12 @@ unique_ptr<CFG> CFGBuilder::buildFor(core::Context ctx, ast::MethodDef &md) {
         if (global.isFieldOrStaticField()) {
             res->minLoops[local.id()] = CFG::MIN_LOOP_FIELD;
         } else {
-            res->minLoops[local.id()] = CFG::MIN_LOOP_GLOBAL;
+            // We used to have special handling here for "MIN_LOOP_GLOBAL" but it was meaningless,
+            // because it only happened for type members, and we already prohibit re-assigning type
+            // members (in namer). If this ENFORCE fails, we might have to resurrect the old logic
+            // we had for handling MIN_LOOP_GLOBAL (or at least, add some tests that would trigger
+            // pinning errors).
+            ENFORCE(global.isTypeMember());
         }
     }
     for (auto kv : discoveredUndeclaredFields) {

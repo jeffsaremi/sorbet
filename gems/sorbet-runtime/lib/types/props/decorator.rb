@@ -58,6 +58,14 @@ class T::Props::Decorator
     @props = @props.merge(prop => rules.freeze).freeze
   end
 
+  # Heads up!
+  #
+  # There are already too many ad-hoc options on the prop DSL.
+  #
+  # We have already done a lot of work to remove unnecessary and confusing
+  # options. If you're considering adding a new rule key, please come chat with
+  # the Sorbet team first, as we'd really like to learn more about how to best
+  # solve the problem you're encountering.
   VALID_RULE_KEYS = T.let(%i[
     enum
     foreign
@@ -155,7 +163,7 @@ class T::Props::Decorator
     .checked(:never)
   end
   def prop_get(instance, prop, rules=prop_rules(prop))
-    val = instance.instance_variable_get(rules[:accessor_key])
+    val = instance.instance_variable_get(rules[:accessor_key]) if instance.instance_variable_defined?(rules[:accessor_key])
     if !val.nil?
       val
     elsif (d = rules[:ifunset])
@@ -175,7 +183,7 @@ class T::Props::Decorator
     .checked(:never)
   end
   def prop_get_if_set(instance, prop, rules=prop_rules(prop))
-    instance.instance_variable_get(rules[:accessor_key])
+    instance.instance_variable_get(rules[:accessor_key]) if instance.instance_variable_defined?(rules[:accessor_key])
   end
   alias_method :get, :prop_get_if_set # Alias for backwards compatibility
 
@@ -292,7 +300,9 @@ class T::Props::Decorator
     .checked(:never)
   end
   private def prop_nilable?(cls, rules)
-    T::Utils::Nilable.is_union_with_nilclass(cls) || (cls == T.untyped && rules.key?(:default) && rules[:default].nil?)
+    # NB: `prop` and `const` do not `T::Utils::coerce the type of the prop if it is a `Module`,
+    # hence the bare `NilClass` check.
+    T::Utils::Nilable.is_union_with_nilclass(cls) || ((cls == T.untyped || cls == NilClass) && rules.key?(:default) && rules[:default].nil?)
   end
 
   # checked(:never) - Rules hash is expensive to check
@@ -418,9 +428,9 @@ class T::Props::Decorator
     else
       nonnil_type = T::Utils.unwrap_nilable(type)
       if nonnil_type
-        T.nilable(T.all(nonnil_type, T.deprecated_enum(enum)))
+        T.unsafe(T.nilable(T.all(nonnil_type, T.deprecated_enum(enum))))
       else
-        T.all(type, T.deprecated_enum(enum))
+        T.unsafe(T.all(T.unsafe(type), T.deprecated_enum(enum)))
       end
     end
   end

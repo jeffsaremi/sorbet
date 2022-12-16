@@ -158,6 +158,13 @@ class T::Enum
     serialize.to_json(*args)
   end
 
+  sig {params(args: T.untyped).returns(T.untyped)}
+  def as_json(*args)
+    serialized_val = serialize
+    return serialized_val unless serialized_val.respond_to?(:as_json)
+    serialized_val.as_json(*args)
+  end
+
   sig {returns(String)}
   def to_s
     inspect
@@ -281,19 +288,23 @@ class T::Enum
     # Historical note: We convert to lowercase names because the majority of existing calls to
     # `make_accessible` were arrays of lowercase strings. Doing this conversion allowed for the
     # least amount of repetition in migrated declarations.
-    const_name.to_s.downcase.freeze
+    -const_name.to_s.downcase.freeze
   end
 
   sig {returns(T::Boolean)}
   def self.started_initializing?
-    @started_initializing = T.let(@started_initializing, T.nilable(T::Boolean))
-    @started_initializing ||= false
+    unless defined?(@started_initializing)
+      @started_initializing = T.let(false, T.nilable(T::Boolean))
+    end
+    T.must(@started_initializing)
   end
 
   sig {returns(T::Boolean)}
   def self.fully_initialized?
-    @fully_initialized = T.let(@fully_initialized, T.nilable(T::Boolean))
-    @fully_initialized ||= false
+    unless defined?(@fully_initialized)
+      @fully_initialized = T.let(false, T.nilable(T::Boolean))
+    end
+    T.must(@fully_initialized)
   end
 
   # Maintains the order in which values are defined
@@ -308,8 +319,8 @@ class T::Enum
   sig {params(blk: T.proc.void).void}
   def self.enums(&blk)
     raise "enums cannot be defined for T::Enum" if self == T::Enum
-    raise "Enum #{self} was already initialized" if @fully_initialized
-    raise "Enum #{self} is still initializing" if @started_initializing
+    raise "Enum #{self} was already initialized" if fully_initialized?
+    raise "Enum #{self} is still initializing" if started_initializing?
 
     @started_initializing = true
 

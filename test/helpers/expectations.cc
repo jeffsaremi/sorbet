@@ -4,6 +4,7 @@
 #include "absl/strings/match.h"
 #include "absl/strings/str_split.h"
 #include "common/FileOps.h"
+#include "common/concurrency/WorkerPool.h"
 #include "common/sort.h"
 #include "dtl/dtl.hpp"
 #include "test/helpers/expectations.h"
@@ -86,11 +87,14 @@ bool addToExpectations(Expectations &exp, string_view filePath, bool isDirectory
         exp.expectations[kind][source_file_path] = filePath;
         return true;
     } else if (absl::EndsWith(filePath, ".rbupdate")) {
-        // Should be `.[number].rbupdate`
-        auto pos = filePath.rfind('.', filePath.length() - 10);
+        int suffixLength = strlen(".rbupdate");
+
+        auto pos = filePath.rfind('.', filePath.length() - suffixLength - 1);
         if (pos != string::npos) {
-            int version = stoi(string(filePath.substr(pos + 1, filePath.length() - 9)));
-            exp.sourceLSPFileUpdates[version].emplace_back(absl::StrCat(filePath.substr(0, pos), ".rb"), filePath);
+            int version = stoi(string(filePath.substr(pos + 1, filePath.length() - suffixLength)));
+
+            auto &updates = exp.sourceLSPFileUpdates[version];
+            updates.emplace_back(absl::StrCat(filePath.substr(0, pos), ".rb"), filePath);
         } else {
             cout << "Ignoring " << filePath << ": No version number provided (expected .[number].rbupdate).\n";
         }
@@ -101,8 +105,9 @@ bool addToExpectations(Expectations &exp, string_view filePath, bool isDirectory
 }
 
 vector<string> listTrimmedTestFilesInDir(string_view dir, bool recursive) {
+    unique_ptr<WorkerPool> workerPool = WorkerPool::create(0, *spdlog::default_logger());
     vector<string> names =
-        sorbet::FileOps::listFilesInDir(dir, {".rb", ".rbi", ".rbupdate", ".exp"}, recursive, {}, {});
+        sorbet::FileOps::listFilesInDir(dir, {".rb", ".rbi", ".rbupdate", ".exp"}, *workerPool, recursive, {}, {});
     const int prefixLen = dir.length() + 1;
     // Trim off the input directory from the name.
     transform(names.begin(), names.end(), names.begin(),
@@ -164,7 +169,6 @@ Expectations getExpectationsForTest(string_view parentDir, string_view testName)
 } // namespace
 
 Expectations Expectations::getExpectations(std::string singleTest) {
-    vector<Expectations> result;
     if (singleTest.empty()) {
         Exception::raise("No test specified. Pass one with --single_test=<test_path>");
     }

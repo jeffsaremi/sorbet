@@ -43,16 +43,40 @@ string UnresolvedAppliedType::toStringWithTabs(const GlobalState &gs, int tabs) 
     return this->show(gs);
 }
 
+namespace {
+string argTypeForUnresolvedAppliedType(const GlobalState &gs, const TypePtr &t, ShowOptions options) {
+    if (auto *m = cast_type<MetaType>(t)) {
+        return m->wrapped.show(gs, options);
+    }
+    return t.show(gs, options);
+}
+} // namespace
+
 string UnresolvedAppliedType::show(const GlobalState &gs, ShowOptions options) const {
-    return fmt::format("{}[{}] (unresolved)", this->klass.show(gs, options),
-                       fmt::map_join(targs, ", ", [&](auto targ) { return targ.show(gs, options); }));
+    string resolvedString = options.showForRBI ? "" : " (unresolved)";
+    ClassOrModuleRef symForPrinting;
+
+    if (options.showForRBI) {
+        auto attachedClass = this->klass.data(gs)->attachedClass(gs);
+        symForPrinting = attachedClass;
+    } else {
+        symForPrinting = this->klass;
+    }
+
+    return fmt::format("{}[{}]{}", symForPrinting.show(gs, options),
+                       fmt::map_join(targs, ", ",
+                                     [&](auto targ) {
+                                         return options.showForRBI ? argTypeForUnresolvedAppliedType(gs, targ, options)
+                                                                   : targ.show(gs, options);
+                                     }),
+                       resolvedString);
 }
 
-string LiteralType::toStringWithTabs(const GlobalState &gs, int tabs) const {
+string NamedLiteralType::toStringWithTabs(const GlobalState &gs, int tabs) const {
     return fmt::format("{}({})", this->underlying(gs).toStringWithTabs(gs, tabs), showValue(gs));
 }
 
-string LiteralType::show(const GlobalState &gs, ShowOptions options) const {
+string NamedLiteralType::show(const GlobalState &gs, ShowOptions options) const {
     if (options.showForRBI) {
         // RBI generator: Users type the class name, not `String("value")`.
         return fmt::format("{}", this->underlying(gs).show(gs, options));
@@ -61,23 +85,53 @@ string LiteralType::show(const GlobalState &gs, ShowOptions options) const {
     return fmt::format("{}({})", this->underlying(gs).show(gs, options), showValue(gs));
 }
 
-string LiteralType::showValue(const GlobalState &gs) const {
+string NamedLiteralType::showValue(const GlobalState &gs) const {
     switch (literalKind) {
-        case LiteralType::LiteralTypeKind::String:
-            return fmt::format("\"{}\"", absl::CEscape(asName(gs).show(gs)));
-        case LiteralType::LiteralTypeKind::Symbol: {
-            auto shown = asName(gs).show(gs);
+        case NamedLiteralType::LiteralTypeKind::String:
+            return fmt::format("\"{}\"", absl::CEscape(asName().show(gs)));
+        case NamedLiteralType::LiteralTypeKind::Symbol: {
+            auto shown = asName().show(gs);
             if (absl::StrContains(shown, " ")) {
                 return fmt::format(":\"{}\"", absl::CEscape(shown));
             } else {
                 return fmt::format(":{}", shown);
             }
         }
-        case LiteralType::LiteralTypeKind::Integer:
-            return to_string(asInteger());
-        case LiteralType::LiteralTypeKind::Float:
-            return to_string(asFloat());
     }
+}
+
+string IntegerLiteralType::toStringWithTabs(const GlobalState &gs, int tabs) const {
+    return fmt::format("{}({})", this->underlying(gs).toStringWithTabs(gs, tabs), showValue(gs));
+}
+
+string IntegerLiteralType::show(const GlobalState &gs, ShowOptions options) const {
+    if (options.showForRBI) {
+        // RBI generator: Users type the class name, not `String("value")`.
+        return fmt::format("{}", this->underlying(gs).show(gs, options));
+    }
+
+    return fmt::format("{}({})", this->underlying(gs).show(gs, options), showValue(gs));
+}
+
+string IntegerLiteralType::showValue(const GlobalState &gs) const {
+    return to_string(this->value);
+}
+
+string FloatLiteralType::toStringWithTabs(const GlobalState &gs, int tabs) const {
+    return fmt::format("{}({})", this->underlying(gs).toStringWithTabs(gs, tabs), showValue(gs));
+}
+
+string FloatLiteralType::show(const GlobalState &gs, ShowOptions options) const {
+    if (options.showForRBI) {
+        // RBI generator: Users type the class name, not `String("value")`.
+        return fmt::format("{}", this->underlying(gs).show(gs, options));
+    }
+
+    return fmt::format("{}({})", this->underlying(gs).show(gs, options), showValue(gs));
+}
+
+string FloatLiteralType::showValue(const GlobalState &gs) const {
+    return to_string(this->value);
 }
 
 string TupleType::toStringWithTabs(const GlobalState &gs, int tabs) const {
@@ -130,20 +184,31 @@ string ShapeType::show(const GlobalState &gs, ShowOptions options) const {
             fmt::format_to(std::back_inserter(buf), ", ");
         }
 
-        const auto &keyLiteral = cast_type_nonnull<LiteralType>(key);
         const auto &value = *valueIterator;
+        ++valueIterator;
 
+        string keyStr;
+        string_view sepStr = " => ";
         // properties beginning with $ need to be printed as :$prop => type.
-        if (keyLiteral.literalKind == core::LiteralType::LiteralTypeKind::Symbol &&
-            !absl::StartsWith(keyLiteral.asName(gs).shortName(gs), "$")) {
-            fmt::format_to(std::back_inserter(buf), "{}: {}", keyLiteral.asName(gs).show(gs), value.show(gs, options));
+        if (isa_type<NamedLiteralType>(key)) {
+            const auto &keyLiteral = cast_type_nonnull<NamedLiteralType>(key);
+            if (keyLiteral.literalKind == core::NamedLiteralType::LiteralTypeKind::Symbol &&
+                !absl::StartsWith(keyLiteral.asName().shortName(gs), "$")) {
+                keyStr = keyLiteral.asName().show(gs);
+                sepStr = ": ";
+            } else {
+                keyStr = options.showForRBI ? keyLiteral.showValue(gs) : keyLiteral.show(gs, options);
+            }
+        } else if (isa_type<IntegerLiteralType>(key)) {
+            const auto &keyLiteral = cast_type_nonnull<IntegerLiteralType>(key);
+            keyStr = options.showForRBI ? keyLiteral.showValue(gs) : keyLiteral.show(gs, options);
         } else {
-            fmt::format_to(std::back_inserter(buf), "{} => {}",
-                           options.showForRBI ? keyLiteral.showValue(gs) : keyLiteral.show(gs, options),
-                           value.show(gs, options));
+            ENFORCE(isa_type<FloatLiteralType>(key));
+            const auto &keyLiteral = cast_type_nonnull<FloatLiteralType>(key);
+            keyStr = options.showForRBI ? keyLiteral.showValue(gs) : keyLiteral.show(gs, options);
         }
 
-        ++valueIterator;
+        fmt::format_to(std::back_inserter(buf), "{}{}{}", keyStr, sepStr, value.show(gs, options));
     }
     fmt::format_to(std::back_inserter(buf), "}}");
     return to_string(buf);
@@ -377,6 +442,8 @@ string AppliedType::show(const GlobalState &gs, ShowOptions options) const {
         fmt::format_to(std::back_inserter(buf), "T::Enumerable");
     } else if (this->klass == Symbols::Enumerator()) {
         fmt::format_to(std::back_inserter(buf), "T::Enumerator");
+    } else if (this->klass == Symbols::Enumerator_Lazy()) {
+        fmt::format_to(std::back_inserter(buf), "T::Enumerator::Lazy");
     } else if (this->klass == Symbols::Range()) {
         fmt::format_to(std::back_inserter(buf), "T::Range");
     } else if (this->klass == Symbols::Set()) {
@@ -429,7 +496,7 @@ string AppliedType::show(const GlobalState &gs, ShowOptions options) const {
     auto it = targs.begin();
     for (auto typeMember : typeMembers) {
         auto tm = typeMember;
-        if (tm.data(gs)->isFixed()) {
+        if (tm.data(gs)->flags.isFixed) {
             it = targs.erase(it);
         } else if (typeMember.data(gs)->name == core::Names::Constants::AttachedClass()) {
             it = targs.erase(it);
@@ -450,7 +517,7 @@ string AppliedType::show(const GlobalState &gs, ShowOptions options) const {
 string LambdaParam::toStringWithTabs(const GlobalState &gs, int tabs) const {
     auto defName = this->definition.toStringFullName(gs);
     auto upperStr = this->upperBound.toString(gs);
-    if (this->definition.data(gs)->isFixed()) {
+    if (this->definition.data(gs)->flags.isFixed) {
         return fmt::format("LambdaParam({}, fixed={})", defName, upperStr);
     } else {
         auto lowerStr = this->lowerBound.toString(gs);
@@ -487,7 +554,7 @@ string MetaType::toStringWithTabs(const GlobalState &gs, int tabs) const {
 }
 
 string MetaType::show(const GlobalState &gs, ShowOptions options) const {
-    return "<Type: " + wrapped.show(gs, options) + ">";
+    return fmt::format("Runtime object representing type: {}", wrapped.show(gs, options));
 }
 
 } // namespace sorbet::core

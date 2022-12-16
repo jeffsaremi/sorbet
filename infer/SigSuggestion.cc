@@ -28,7 +28,7 @@ optional<core::AutocorrectSuggestion::Edit> maybeSuggestExtendTSig(core::Context
     }
 
     auto inFileOfMethod = [&](const auto &loc) { return loc.file() == method->loc().file(); };
-    auto classLocs = enclosingClass.data(ctx)->locs();
+    auto &classLocs = enclosingClass.data(ctx)->locs();
     auto classLoc = absl::c_find_if(classLocs, inFileOfMethod);
 
     if (classLoc == classLocs.end()) {
@@ -142,10 +142,10 @@ void extractSendArgumentKnowledge(core::Context ctx, core::LocOffsets bindLoc, c
         // extract the keyword argument name when the send contains inlined keyword arguments
         optional<core::NameRef> keyword;
         if (inKwArgs) {
-            if (core::isa_type<core::LiteralType>(snd->args[i].type)) {
-                auto lit = core::cast_type_nonnull<core::LiteralType>(snd->args[i].type);
-                if (lit.literalKind == core::LiteralType::LiteralTypeKind::Symbol) {
-                    keyword = lit.asName(ctx);
+            if (core::isa_type<core::NamedLiteralType>(snd->args[i].type)) {
+                auto lit = core::cast_type_nonnull<core::NamedLiteralType>(snd->args[i].type);
+                if (lit.literalKind == core::NamedLiteralType::LiteralTypeKind::Symbol) {
+                    keyword = lit.asName();
                 }
             }
 
@@ -304,7 +304,7 @@ UnorderedMap<core::NameRef, core::TypePtr> guessArgumentTypes(core::Context ctx,
 core::MethodRef closestOverridenMethod(core::Context ctx, core::ClassOrModuleRef enclosingClassSymbol,
                                        core::NameRef name) {
     auto enclosingClass = enclosingClassSymbol.data(ctx);
-    ENFORCE(enclosingClass->isClassOrModuleLinearizationComputed(), "Should have been linearized by resolver");
+    ENFORCE(enclosingClass->flags.isLinearizationComputed, "Should have been linearized by resolver");
 
     for (const auto &mixin : enclosingClass->mixins()) {
         auto mixinMethod = mixin.data(ctx)->findMethod(ctx, name);
@@ -418,7 +418,7 @@ optional<core::AutocorrectSuggestion> SigSuggestion::maybeSuggestSig(core::Conte
     }
 
     fmt::format_to(std::back_inserter(ss), "sig");
-    if (enclosingClass.data(ctx)->isClassOrModuleFinal()) {
+    if (enclosingClass.data(ctx)->flags.isFinal) {
         fmt::format_to(std::back_inserter(ss), "(:final)");
     }
     fmt::format_to(std::back_inserter(ss), " {{");
@@ -469,7 +469,8 @@ optional<core::AutocorrectSuggestion> SigSuggestion::maybeSuggestSig(core::Conte
                 // TODO: maybe combine the old and new types in some way?
                 chosenType = oldType;
             }
-            fmt::format_to(std::back_inserter(ss), "{}: {}", argSym.argumentName(ctx), chosenType.show(ctx));
+            auto options = core::ShowOptions().withShowForRBI();
+            fmt::format_to(std::back_inserter(ss), "{}: {}", argSym.argumentName(ctx), chosenType.show(ctx, options));
         }
         fmt::format_to(std::back_inserter(ss), ").");
     }

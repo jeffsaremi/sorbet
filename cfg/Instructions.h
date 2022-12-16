@@ -17,6 +17,7 @@ public:
     core::TypePtr type;
     VariableUseSite() = default;
     VariableUseSite(LocalRef local) : variable(local){};
+    VariableUseSite(LocalRef local, core::TypePtr type) : variable(local), type(std::move(type)){};
     VariableUseSite(const VariableUseSite &) = delete;
     const VariableUseSite &operator=(const VariableUseSite &rhs) = delete;
     VariableUseSite(VariableUseSite &&) = default;
@@ -46,6 +47,7 @@ enum class Tag : uint8_t {
     YieldLoadArg,
     Cast,
     TAbsurd,
+    KeepAlive,
 };
 
 // A mapping from instruction type to its corresponding tag.
@@ -56,9 +58,6 @@ class Instruction;
 
 // When adding a new subtype, see if you need to add it to fillInBlockArguments
 class Instruction {
-public:
-    bool isSynthetic = false;
-
 protected:
     Instruction() = default;
     ~Instruction() = default;
@@ -92,13 +91,15 @@ public:
     std::string toString(const core::GlobalState &gs, const CFG &cfg) const;
     std::string showRaw(const core::GlobalState &gs, const CFG &cfg, int tabs = 0) const;
 };
-CheckSize(Alias, 16, 8);
+CheckSize(Alias, 8, 8);
 
 INSN(SolveConstraint) : public Instruction {
 public:
     LocalRef send;
     std::shared_ptr<core::SendAndBlockLink> link;
-    SolveConstraint(const std::shared_ptr<core::SendAndBlockLink> &link, LocalRef send) : send(send), link(link){};
+    SolveConstraint(const std::shared_ptr<core::SendAndBlockLink> &link, LocalRef send) : send(send), link(link) {
+        categoryCounterInc("cfg", "solveconstraint");
+    };
     std::string toString(const core::GlobalState &gs, const CFG &cfg) const;
     std::string showRaw(const core::GlobalState &gs, const CFG &cfg, int tabs = 0) const;
 };
@@ -120,10 +121,12 @@ public:
          const InlinedVector<LocalRef, 2> &args, InlinedVector<core::LocOffsets, 2> argLocs, bool isPrivateOk = false,
          const std::shared_ptr<core::SendAndBlockLink> &link = nullptr);
 
+    core::LocOffsets locWithoutBlock(core::LocOffsets bindLoc);
+
     std::string toString(const core::GlobalState &gs, const CFG &cfg) const;
     std::string showRaw(const core::GlobalState &gs, const CFG &cfg, int tabs = 0) const;
 };
-CheckSize(Send, 144, 8);
+CheckSize(Send, 120, 8);
 
 INSN(Return) : public Instruction {
 public:
@@ -134,7 +137,7 @@ public:
     std::string toString(const core::GlobalState &gs, const CFG &cfg) const;
     std::string showRaw(const core::GlobalState &gs, const CFG &cfg, int tabs = 0) const;
 };
-CheckSize(Return, 40, 8);
+CheckSize(Return, 24, 8);
 
 INSN(BlockReturn) : public Instruction {
 public:
@@ -145,7 +148,7 @@ public:
     std::string toString(const core::GlobalState &gs, const CFG &cfg) const;
     std::string showRaw(const core::GlobalState &gs, const CFG &cfg, int tabs = 0) const;
 };
-CheckSize(BlockReturn, 48, 8);
+CheckSize(BlockReturn, 32, 8);
 
 INSN(LoadSelf) : public Instruction {
 public:
@@ -165,7 +168,7 @@ public:
     std::string toString(const core::GlobalState &gs, const CFG &cfg) const;
     std::string showRaw(const core::GlobalState &gs, const CFG &cfg, int tabs = 0) const;
 };
-CheckSize(Literal, 24, 8);
+CheckSize(Literal, 8, 8);
 
 INSN(GetCurrentException) : public Instruction {
 public:
@@ -212,19 +215,19 @@ public:
     std::shared_ptr<core::SendAndBlockLink> link;
 
     LoadYieldParams(const std::shared_ptr<core::SendAndBlockLink> &link) : link(link) {
-        categoryCounterInc("cfg", "loadarg");
+        categoryCounterInc("cfg", "loadyieldparams");
     };
     std::string toString(const core::GlobalState &gs, const CFG &cfg) const;
     std::string showRaw(const core::GlobalState &gs, const CFG &cfg, int tabs = 0) const;
 };
-CheckSize(LoadYieldParams, 24, 8);
+CheckSize(LoadYieldParams, 16, 8);
 
 INSN(YieldParamPresent) : public Instruction {
 public:
     uint16_t argId;
 
     YieldParamPresent(uint16_t argId) : argId{argId} {
-        categoryCounterInc("cfg", "argpresent");
+        categoryCounterInc("cfg", "yieldparampresent");
     };
     std::string toString(const core::GlobalState &gs, const CFG &cfg) const;
     std::string showRaw(const core::GlobalState &gs, const CFG &cfg, int tabs = 0) const;
@@ -244,20 +247,24 @@ public:
     std::string toString(const core::GlobalState &gs, const CFG &cfg) const;
     std::string showRaw(const core::GlobalState &gs, const CFG &cfg, int tabs = 0) const;
 };
-CheckSize(YieldLoadArg, 32, 8);
+CheckSize(YieldLoadArg, 24, 8);
 
 INSN(Cast) : public Instruction {
 public:
     core::NameRef cast;
     VariableUseSite value;
+    core::LocOffsets valueLoc;
     core::TypePtr type;
 
-    Cast(LocalRef value, const core::TypePtr &type, core::NameRef cast) : cast(cast), value(value), type(type) {}
+    Cast(LocalRef value, core::LocOffsets valueLoc, const core::TypePtr &type, core::NameRef cast)
+        : cast(cast), value(value), valueLoc(valueLoc), type(type) {
+        categoryCounterInc("cfg", "cast");
+    }
 
     std::string toString(const core::GlobalState &gs, const CFG &cfg) const;
     std::string showRaw(const core::GlobalState &gs, const CFG &cfg, int tabs = 0) const;
 };
-CheckSize(Cast, 48, 8);
+CheckSize(Cast, 40, 8);
 
 INSN(TAbsurd) : public Instruction {
 public:
@@ -270,14 +277,29 @@ public:
     std::string toString(const core::GlobalState &gs, const CFG &cfg) const;
     std::string showRaw(const core::GlobalState &gs, const CFG &cfg, int tabs = 0) const;
 };
-CheckSize(TAbsurd, 32, 8);
+CheckSize(TAbsurd, 16, 8);
+
+INSN(KeepAlive) : public Instruction {
+public:
+    LocalRef what;
+
+    KeepAlive(LocalRef what) : what(what) {
+        categoryCounterInc("cfg", "volatileread");
+    }
+
+    std::string toString(const core::GlobalState &gs, const CFG &cfg) const;
+    std::string showRaw(const core::GlobalState &gs, const CFG &cfg, int tabs = 0) const;
+};
+CheckSize(KeepAlive, 8, 8);
 
 class InstructionPtr final {
     using tagged_storage = uint64_t;
 
-    static constexpr tagged_storage TAG_MASK = 0xffff;
-
-    static constexpr tagged_storage PTR_MASK = ~TAG_MASK;
+    static constexpr tagged_storage TAG_MASK = 0xff;
+    static constexpr tagged_storage FLAG_MASK = 0xff00;
+    static constexpr tagged_storage SYNTHETIC_FLAG = 0x0100;
+    static_assert((TAG_MASK & FLAG_MASK) == 0, "no bits should be shared between tags and flags");
+    static constexpr tagged_storage PTR_MASK = ~(FLAG_MASK | TAG_MASK);
 
     tagged_storage ptr;
 
@@ -355,20 +377,34 @@ public:
     }
 
     explicit operator bool() const noexcept {
-        return get() != nullptr;
+        return ptr != 0;
     }
 
     bool operator==(const InstructionPtr &other) const noexcept {
-        return get() == other.get();
+        return ptr == other.ptr;
+    }
+    bool operator==(std::nullptr_t) const noexcept {
+        return ptr == 0;
     }
     bool operator!=(const InstructionPtr &other) const noexcept {
-        return get() != other.get();
+        return ptr != other.ptr;
+    }
+    bool operator!=(std::nullptr_t) const noexcept {
+        return ptr != 0;
     }
 
     Tag tag() const noexcept {
         ENFORCE(ptr != 0);
 
         return static_cast<Tag>(ptr & TAG_MASK);
+    }
+
+    bool isSynthetic() const noexcept {
+        return (this->ptr & SYNTHETIC_FLAG) != 0;
+    }
+
+    void setSynthetic() noexcept {
+        this->ptr |= SYNTHETIC_FLAG;
     }
 
     std::string toString(const core::GlobalState &gs, const CFG &cfg) const;

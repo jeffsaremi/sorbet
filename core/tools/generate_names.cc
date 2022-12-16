@@ -59,8 +59,12 @@ NameDef names[] = {
 
     // Used in parser for error recovery
     {"methodNameMissing", "<method-name-missing>"},
+    {"methodDefNameMissing", "<method-def-name-missing>"},
+    {"ivarNameMissing", "@<ivar-name-missing>"},
+    {"cvarNameMissing", "@@<cvar-name-missing>"},
     {"ConstantNameMissing", "<ConstantNameMissing>", true},
     {"ErrorNode", "<ErrorNode>", true},
+    {"dynamicConstAssign", "<dynamic-const-assign>"},
 
     // used in CFG for temporaries
     {"whileTemp", "<whileTemp>"},
@@ -143,8 +147,10 @@ NameDef names[] = {
     {"cast"},
     {"let"},
     {"uncheckedLet", "<unchecked_let>"},
+    {"syntheticBind", "<synthetic bind>"},
     {"unsafe"},
     {"must"},
+    {"mustBecause", "must_because"},
     {"declareInterface", "interface!"},
     {"declareAbstract", "abstract!"},
     {"declareFinal", "final!"},
@@ -170,6 +176,7 @@ NameDef names[] = {
     {"protected_", "protected"},
     {"public_", "public"},
     {"privateClassMethod", "private_class_method"},
+    {"publicClassMethod", "public_class_method"},
     {"privateConstant", "private_constant"},
     {"moduleFunction", "module_function"},
     {"aliasMethod", "alias_method"},
@@ -185,7 +192,6 @@ NameDef names[] = {
     {"typeTemplate", "type_template"},
     {"covariant", "out"},
     {"contravariant", "in"},
-    {"invariant", "<invariant>"},
     {"fixed"},
     {"lower"},
     {"upper"},
@@ -213,6 +219,7 @@ NameDef names[] = {
     {"updated"},
     {"merchant"},
     {"foreign"},
+    {"allowDirectMutation", "allow_direct_mutation"},
     {"ifunset"},
     {"withoutAccessors", "without_accessors"},
     {"instanceVariableGet", "instance_variable_get"},
@@ -223,12 +230,15 @@ NameDef names[] = {
     {"computedBy", "computed_by"},
     {"factory"},
     {"InexactStruct", "InexactStruct", true},
+    {"ImmutableStruct", "ImmutableStruct", true},
     {"Chalk", "Chalk", true},
     {"ODM", "ODM", true},
     {"Document", "Document", true},
     {"DeprecatedNumeric", "DeprecatedNumeric", true},
     {"Private", "Private", true},
     {"Types", "Types", true},
+    {"Methods", "Methods", true},
+    {"DeclBuilder", "DeclBuilder", true},
     {"Chalk_ODM_Document", "::Chalk::ODM::Document"},
 
     {"prefix"},
@@ -324,7 +334,6 @@ NameDef names[] = {
     {"classMethods", "class_methods"},
 
     {"blockTemp", "<block>"},
-    {"blockRetrunType", "<block-return-type>"},
     {"blockPreCallTemp", "<block-pre-call-temp>"},
     {"blockPassTemp", "<block-pass>"},
     {"forTemp"},
@@ -332,8 +341,10 @@ NameDef names[] = {
     {"blockCall", "<block-call>"},
     {"blockBreakAssign", "<block-break-assign>"},
     {"arg", "<arg>"},
+    {"kwargs", "<kwargs>"},
     {"blkArg", "<blk>"},
     {"blockGiven_p", "block_given?"},
+    {"anonymousBlock", "<anonymous-block>"},
 
     // Used to generate temporary names for destructuring arguments ala proc do
     //  |(x,y)|; end
@@ -356,18 +367,19 @@ NameDef names[] = {
     {"toHashNoDup", "<to-hash-nodup>"},
     {"splat", "<splat>"},
     {"expandSplat", "<expand-splat>"},
-    {"suggestType", "<suggest-type>"},
+    {"suggestConstantType", "<suggest-constant-type>"},
+    {"suggestFieldType", "<suggest-field-type>"},
     {"checkMatchArray", "<check-match-array>"},
     {"definedInstanceVar", "<defined-instance-var>"},
     {"definedClassVar", "<defined-class-var>"},
     {"arg0"},
     {"arg1"},
     {"arg2"},
+    {"arg3"},
     {"opts"},
     {"args"},
     {"Elem", "Elem", true},
     {"keepForIde", "keep_for_ide"},
-    {"keepForTypechecking", "keep_for_typechecking"},
     {"keepDef", "keep_def"},
     {"keepSelfDef", "keep_self_def"},
     {"keepForCfg", "<keep-for-cfg>"},
@@ -394,6 +406,8 @@ NameDef names[] = {
     {"min"},
     {"max"},
     {"sum"},
+    {"sample"},
+    {"at"},
 
     // Argument forwarding
     {"fwdArgs", "<fwd-args>"},
@@ -403,7 +417,8 @@ NameDef names[] = {
     // Enumerable#flat_map has special-case logic in Infer
     {"flatMap", "flat_map"},
 
-    // Array#flatten, #product, #compact and #zip are also custom-implemented
+    // Array#dig, Array#flatten, #product, #compact and #zip are also custom-implemented
+    {"dig"},
     {"flatten"},
     {"product"},
     {"compact"},
@@ -429,11 +444,12 @@ NameDef names[] = {
     {"import"},
     {"test_import"},
     {"export_", "export"},
-    {"export_for_test"},
     {"restrict_to_service"},
+    {"autoloader_compatibility"},
+    {"legacy"},
+    {"strict"},
     {"PackageSpec", "PackageSpec", true},
-    {"PackageRegistry", "<PackageRegistry>", true},
-    {"PackageTests", "<PackageTests>", true},
+    {"PackageSpecRegistry", "<PackageSpecRegistry>", true},
 
     // Compiler
     {"runningCompiled_p", "running_compiled?"},
@@ -458,6 +474,7 @@ NameDef names[] = {
     {"NilClass", "NilClass", true},
     {"Class", "Class", true},
     {"Module", "Module", true},
+    {"Time", "Time", true},
     {"Todo", "<todo sym>", true},
     {"TodoMethod", "<todo method>", false},
     {"TodoTypeArgument", "<todo typeargument>", true},
@@ -477,6 +494,10 @@ NameDef names[] = {
     {"Rational", "Rational", true},
     // A magic non user-creatable class with methods to keep state between passes
     {"Magic", "<Magic>", true},
+    // A magic non user-creatable class for binding procs to attached_class
+    {"BindToAttachedClass", "<BindToAttachedClass>", true},
+    // A magic non user-creatable class for binding procs to self_type
+    {"BindToSelfType", "<BindToSelfType>", true},
     // A magic non user-creatable class for mimicing the decl builder during cfg
     // construction
     {"DeclBuilderForProcs", "<DeclBuilderForProcs>", true},
@@ -527,7 +548,13 @@ NameDef names[] = {
     {"Test", "Test", true},
     {"Autogen", "Autogen", true},
     {"Tokens", "Tokens", true},
-    {"AccountModelMerchantToken", "AccountModelMerchantToken", true},
+    {"AccountModelMerchant", "AccountModelMerchant", true},
+    {"Token", "Token", true},
+
+    // Typos
+    {"Int", "Int", true},
+    {"Timestamp", "Timestamp", true},
+    {"Bool", "Bool", true},
 
     // used by the compiler
     {"returnValue", "<returnValue>"},

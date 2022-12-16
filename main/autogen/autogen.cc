@@ -1,4 +1,5 @@
 #include "main/autogen/autogen.h"
+#include "absl/strings/match.h"
 #include "ast/Helpers.h"
 #include "ast/ast.h"
 #include "ast/treemap/treemap.h"
@@ -16,6 +17,7 @@ class AutogenWalk {
     vector<Reference> refs;
     vector<core::NameRef> requireStatements;
     vector<DefinitionRef> nesting;
+    const AutogenConfig *autogenCfg;
 
     enum class ScopeType { Class, Block };
     vector<ast::Send *> ignoring;
@@ -48,27 +50,23 @@ class AutogenWalk {
     }
 
 public:
-    AutogenWalk() {
+    AutogenWalk(const AutogenConfig &autogenConfig) {
         auto &def = defs.emplace_back();
         def.id = 0;
         def.type = Definition::Type::Module;
         def.defines_behavior = false;
         def.is_empty = false;
         nesting.emplace_back(def.id);
+        autogenCfg = &autogenConfig;
     }
 
-    ast::ExpressionPtr preTransformClassDef(core::Context ctx, ast::ExpressionPtr tree) {
+    void preTransformClassDef(core::Context ctx, ast::ExpressionPtr &tree) {
         auto &original = ast::cast_tree_nonnull<ast::ClassDef>(tree);
 
         if (!ast::isa_tree<ast::ConstantLit>(original.name)) {
-            return tree;
+            return;
         }
         scopeTypes.emplace_back(ScopeType::Class);
-
-        if (original.symbol.data(ctx)->owner == core::Symbols::PackageRegistry()) {
-            // this is a package, so do not enter a definition for it
-            return tree;
-        }
 
         // create a new `Definition`
         auto &def = defs.emplace_back();
@@ -84,16 +82,22 @@ public:
         // is it (recursively) empty?
         def.is_empty =
             absl::c_all_of(original.rhs, [](auto &tree) { return sorbet::ast::BehaviorHelpers::checkEmptyDeep(tree); });
-        // does it define behavior? It is impossible for .rbi files to define behavior.
-        def.defines_behavior =
-            !ctx.file.data(ctx).isRBI() && sorbet::ast::BehaviorHelpers::checkClassDefinesBehavior(tree);
+
+        // does it define behavior? It is impossible for .rbi files to define behavior (unless they are from the
+        // allow-listed set of RBI paths).
+        std::string_view filePath = ctx.file.data(ctx).path();
+        bool ignoreRBI = ctx.file.data(ctx).isRBI() &&
+                         !absl::c_any_of(autogenCfg->behaviorAllowedInRBIsPaths,
+                                         [&](auto &allowedPath) { return absl::StartsWith(filePath, allowedPath); });
+
+        def.defines_behavior = !ignoreRBI && sorbet::ast::BehaviorHelpers::checkClassDefinesBehavior(tree);
 
         // TODO: ref.parent_of, def.parent_ref
         // TODO: expression_range
 
         // we're 'pre-traversing' the constant literal here (instead of waiting for the walk to get to it naturally)
         // which means that we'll have entered in a `Reference` for it already.
-        original.name = ast::TreeMap::apply(ctx, *this, move(original.name));
+        ast::TreeWalk::apply(ctx, *this, original.name);
         // ...find the reference we just created for it
         auto it = refMap.find(original.name.get());
         ENFORCE(it != refMap.end());
@@ -109,7 +113,7 @@ public:
         if (original.kind == ast::ClassDef::Kind::Class && !original.ancestors.empty()) {
             // we need to do name resolution for that class "outside" of the class body, so handle this before we've
             // modified the current scoping
-            *ait = ast::TreeMap::apply(ctx, *this, move(*ait));
+            ast::TreeWalk::apply(ctx, *this, *ait);
             ++ait;
         }
 
@@ -119,10 +123,10 @@ public:
 
         // ...and then run the treemap over all the includes and extends
         for (; ait != original.ancestors.end(); ++ait) {
-            *ait = ast::TreeMap::apply(ctx, *this, move(*ait));
+            ast::TreeWalk::apply(ctx, *this, *ait);
         }
         for (auto &ancst : original.singletonAncestors) {
-            ancst = ast::TreeMap::apply(ctx, *this, move(ancst));
+            ast::TreeWalk::apply(ctx, *this, ancst);
         }
 
         // and now that we've processed all the ancestors, we should have created references for them all, so traverse
@@ -147,34 +151,28 @@ public:
             // otherwise, make sure we know the ref is the parent of this `Definition`
             refs[it->second.id()].parent_of = def.id;
         }
-
-        return tree;
     }
 
-    ast::ExpressionPtr postTransformClassDef(core::Context ctx, ast::ExpressionPtr tree) {
+    void postTransformClassDef(core::Context ctx, ast::ExpressionPtr &tree) {
         auto &original = ast::cast_tree_nonnull<ast::ClassDef>(tree);
 
         if (!ast::isa_tree<ast::ConstantLit>(original.name)) {
             // if the name of the class wasn't a constant, then we didn't run the `preTransformClassDef` step anyway, so
             // just skip it
-            return tree;
+            return;
         }
 
         // remove the stuff added to handle the class scope here
         nesting.pop_back();
         scopeTypes.pop_back();
-
-        return tree;
     }
 
-    ast::ExpressionPtr preTransformBlock(core::Context ctx, ast::ExpressionPtr block) {
+    void preTransformBlock(core::Context ctx, ast::ExpressionPtr &block) {
         scopeTypes.emplace_back(ScopeType::Block);
-        return block;
     }
 
-    ast::ExpressionPtr postTransformBlock(core::Context ctx, ast::ExpressionPtr block) {
+    void postTransformBlock(core::Context ctx, ast::ExpressionPtr &block) {
         scopeTypes.pop_back();
-        return block;
     }
 
     // `true` if the constant is fully qualified and can be traced back to the root scope, `false` otherwise
@@ -190,16 +188,16 @@ public:
         return false;
     }
 
-    ast::ExpressionPtr postTransformConstantLit(core::Context ctx, ast::ExpressionPtr tree) {
+    void postTransformConstantLit(core::Context ctx, ast::ExpressionPtr &tree) {
         auto &original = ast::cast_tree_nonnull<ast::ConstantLit>(tree);
 
         if (!ignoring.empty()) {
             // this is either a constant in a `keepForIde` node (in which case we don't care) or it was an `include` or
             // an `extend` which already got handled in `preTransformClassDef` (in which case don't handle it again)
-            return tree;
+            return;
         }
         if (original.original == nullptr) {
-            return tree;
+            return;
         }
 
         // Create a new `Reference`
@@ -238,22 +236,21 @@ public:
         }
         // now, add it to the refmap
         refMap[tree.get()] = ref.id;
-        return tree;
     }
 
-    ast::ExpressionPtr postTransformAssign(core::Context ctx, ast::ExpressionPtr tree) {
+    void postTransformAssign(core::Context ctx, ast::ExpressionPtr &tree) {
         auto &original = ast::cast_tree_nonnull<ast::Assign>(tree);
 
         // autogen only cares about constant assignments/definitions, so bail otherwise
         auto *lhs = ast::cast_tree<ast::ConstantLit>(original.lhs);
         if (lhs == nullptr || lhs->original == nullptr) {
-            return tree;
+            return;
         }
 
         if (ctx.file.data(ctx).isRBI()) {
             // We are only concerned with references in RBI files so that dependencies can be
             // accurately tracked. Definitions of casgns are not needed.
-            return tree;
+            return;
         }
 
         // Create the Definition for it
@@ -289,11 +286,9 @@ public:
         // Constant definitions always count as non-empty behavior-defining definitions
         def.defines_behavior = true;
         def.is_empty = false;
-
-        return tree;
     }
 
-    ast::ExpressionPtr preTransformSend(core::Context ctx, ast::ExpressionPtr tree) {
+    void preTransformSend(core::Context ctx, ast::ExpressionPtr &tree) {
         auto *original = ast::cast_tree<ast::Send>(tree);
 
         bool inBlock = !scopeTypes.empty() && scopeTypes.back() == ScopeType::Block;
@@ -308,20 +303,18 @@ public:
         // This means it's a `require`; mark it as such
         if (original->flags.isPrivateOk && original->fun == core::Names::require() && original->numPosArgs() == 1) {
             auto *lit = ast::cast_tree<ast::Literal>(original->getPosArg(0));
-            if (lit && lit->isString(ctx)) {
-                requireStatements.emplace_back(lit->asString(ctx));
+            if (lit && lit->isString()) {
+                requireStatements.emplace_back(lit->asString());
             }
         }
-        return tree;
     }
 
-    ast::ExpressionPtr postTransformSend(core::Context ctx, ast::ExpressionPtr tree) {
+    void postTransformSend(core::Context ctx, ast::ExpressionPtr &tree) {
         auto *original = ast::cast_tree<ast::Send>(tree);
         // if this send was something we were ignoring (i.e. a `keepForIde` or an `include` or `require`) then pop this
         if (!ignoring.empty() && ignoring.back() == original) {
             ignoring.pop_back();
         }
-        return tree;
     }
 
     ParsedFile parsedFile() {
@@ -337,9 +330,10 @@ public:
 
 // Convert a Sorbet `ParsedFile` into an Autogen `ParsedFile` by walking it as above and also recording the checksum of
 // the current file
-ParsedFile Autogen::generate(core::Context ctx, ast::ParsedFile tree, const CRCBuilder &crcBuilder) {
-    AutogenWalk walk;
-    tree.tree = ast::TreeMap::apply(ctx, walk, move(tree.tree));
+ParsedFile Autogen::generate(core::Context ctx, ast::ParsedFile tree, const AutogenConfig &autogenCfg,
+                             const CRCBuilder &crcBuilder) {
+    AutogenWalk walk(autogenCfg);
+    ast::TreeWalk::apply(ctx, walk, tree.tree);
     auto pf = walk.parsedFile();
     pf.path = string(tree.file.data(ctx).path());
     auto src = tree.file.data(ctx).source();

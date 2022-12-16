@@ -212,6 +212,15 @@ module Kernel
   end
   def catch(tag=Object.new, &blk); end
 
+  # Returns the class of *obj*. This method must always be called with an
+  # explicit receiver, as
+  # [`class`](https://docs.ruby-lang.org/en/2.7.0/Kernel.html#method-i-class) is
+  # also a reserved word in Ruby.
+  #
+  # ```ruby
+  # 1.class      #=> Integer
+  # self.class   #=> Object
+  # ```
   sig do
     # In a perfect world this should be:
     #
@@ -237,7 +246,7 @@ module Kernel
   sig do
     params(
         symbol: T.any(Symbol, String),
-        blk: BasicObject
+        blk: T.untyped
     )
     .returns(Symbol)
   end
@@ -268,21 +277,7 @@ module Kernel
   end
   def eval(arg0, arg1=T.unsafe(nil), filename=T.unsafe(nil), lineno=T.unsafe(nil)); end
 
-  # Returns `true` if `yield` would execute a block in the current context. The
-  # `iterator?` form is mildly deprecated.
-  #
-  # ```ruby
-  # def try
-  #   if block_given?
-  #     yield
-  #   else
-  #     "no block"
-  #   end
-  # end
-  # try                  #=> "no block"
-  # try { "hello" }      #=> "hello"
-  # try do "hello" end   #=> "hello"
-  # ```
+  # Deprecated. Use block\_given? instead.
   sig {returns(T::Boolean)}
   def iterator?(); end
 
@@ -298,8 +293,8 @@ module Kernel
   sig {returns(T::Array[Symbol])}
   def local_variables(); end
 
-  # Seeds the system pseudo-random number generator, Random::DEFAULT, with
-  # `number`. The previous seed value is returned.
+  # Seeds the system pseudo-random number generator, with `number`. The previous
+  # seed value is returned.
   #
   # If `number` is omitted, seeds the generator using a source of entropy
   # provided by the operating system, if available (/dev/urandom on Unix systems
@@ -357,8 +352,29 @@ module Kernel
   end
   def =~(other); end
 
-  sig {returns(T.self_type)}
-  def clone(); end
+  # Produces a shallow copy of *obj*---the instance variables of *obj* are
+  # copied, but not the objects they reference.
+  # [`clone`](https://docs.ruby-lang.org/en/2.7.0/Kernel.html#method-i-clone)
+  # copies the frozen value state of *obj*, unless the `:freeze` keyword
+  # argument is given with a false or true value. See also the discussion under
+  # [`Object#dup`](https://docs.ruby-lang.org/en/2.7.0/Object.html#method-i-dup).
+  #
+  # ```ruby
+  # class Klass
+  #    attr_accessor :str
+  # end
+  # s1 = Klass.new      #=> #<Klass:0x401b3a38>
+  # s1.str = "Hello"    #=> "Hello"
+  # s2 = s1.clone       #=> #<Klass:0x401b3998 @str="Hello">
+  # s2.str[1,4] = "i"   #=> "i"
+  # s1.inspect          #=> "#<Klass:0x401b3a38 @str=\"Hi\">"
+  # s2.inspect          #=> "#<Klass:0x401b3998 @str=\"Hi\">"
+  # ```
+  #
+  # This method may have class-specific behavior. If so, that behavior will be
+  # documented under the #`initialize_copy` method of the class.
+  sig { params(freeze: T.nilable(T::Boolean)).returns(T.self_type) }
+  def clone(freeze: nil); end
 
   sig do
     params(
@@ -382,7 +398,7 @@ module Kernel
     params(
         method: Symbol,
         args: BasicObject,
-        blk: BasicObject,
+        blk: T.untyped,
     )
     .returns(T::Enumerator[T.untyped])
   end
@@ -429,13 +445,20 @@ module Kernel
     params(
         blk: T.proc.returns(BasicObject),
     )
-    .returns(T.nilable(Integer))
+    .returns(Integer)
   end
   def fork(&blk); end
 
   sig {returns(T.self_type)}
   def freeze(); end
 
+  # Returns the freeze status of *obj*.
+  #
+  # ```ruby
+  # a = [ "a", "b", "c" ]
+  # a.freeze    #=> ["a", "b", "c"]
+  # a.frozen?   #=> true
+  # ```
   sig {returns(T::Boolean)}
   def frozen?(); end
 
@@ -589,7 +612,7 @@ module Kernel
     params(
         arg0: T.any(String, Symbol),
         arg1: BasicObject,
-        blk: BasicObject,
+        blk: T.untyped,
     )
     .returns(T.untyped)
   end
@@ -620,6 +643,16 @@ module Kernel
   sig {returns(T::Boolean)}
   def tainted?(); end
 
+  # Yields self to the block, and then returns self. The primary purpose of this
+  # method is to "tap into" a method chain, in order to perform operations on
+  # intermediate results within the chain.
+  #
+  # ```ruby
+  # (1..10)                  .tap {|x| puts "original: #{x}" }
+  #   .to_a                  .tap {|x| puts "array:    #{x}" }
+  #   .select {|x| x.even? } .tap {|x| puts "evens:    #{x}" }
+  #   .map {|x| x*x }        .tap {|x| puts "squares:  #{x}" }
+  # ```
   sig do
     params(
       blk: T.proc.params(x: T.untyped).void
@@ -639,7 +672,7 @@ module Kernel
     params(
         method: Symbol,
         args: BasicObject,
-        blk: BasicObject,
+        blk: T.untyped,
     )
     .returns(T::Enumerator[T.untyped])
   end
@@ -687,68 +720,71 @@ module Kernel
   # Array(nil)         #=> []
   # Array(1)           #=> [1]
   # ```
+  sig { params(x: NilClass).returns(T::Array[T.untyped]) }
   sig do
-    params(
-        x: BasicObject,
-    )
-    .returns(T::Array[T.untyped])
+    type_parameters(:Elem)
+      .params(
+        x: T.any(T::Enumerable[T.type_parameter(:Elem)], T.type_parameter(:Elem), T.nilable(T.type_parameter(:Elem)))
+      )
+      .returns(T::Array[T.type_parameter(:Elem)])
   end
-  sig {params(x: NilClass).returns([])}
   def Array(x); end
 
-  # Create a new
-  # [`BigDecimal`](https://docs.ruby-lang.org/en/2.7.0/BigDecimal.html) object.
+  # ```
+  # Returns the \BigDecimal converted from +value+
+  # with a precision of +ndigits+ decimal digits.
   #
-  # initial
-  # :   The initial value, as an
-  #     [`Integer`](https://docs.ruby-lang.org/en/2.7.0/Integer.html), a
-  #     [`Float`](https://docs.ruby-lang.org/en/2.7.0/Float.html), a
-  #     [`Rational`](https://docs.ruby-lang.org/en/2.7.0/Rational.html), a
-  #     [`BigDecimal`](https://docs.ruby-lang.org/en/2.7.0/BigDecimal.html), or
-  #     a [`String`](https://docs.ruby-lang.org/en/2.7.0/String.html).
+  # When +ndigits+ is less than the number of significant digits
+  # in the value, the result is rounded to that number of digits,
+  # according to the current rounding mode; see BigDecimal.mode.
+  # ```
   #
-  #     If it is a [`String`](https://docs.ruby-lang.org/en/2.7.0/String.html),
-  #     spaces are ignored and unrecognized characters terminate the value.
+  # Returns `value` converted to a
+  # [`BigDecimal`](https://docs.ruby-lang.org/en/2.7.0/BigDecimal.html),
+  # depending on the type of `value`:
   #
-  # digits
-  # :   The number of significant digits, as an
-  #     [`Integer`](https://docs.ruby-lang.org/en/2.7.0/Integer.html). If
-  #     omitted or 0, the number of significant digits is determined from the
-  #     initial value.
-  #
-  #     The actual number of significant digits used in computation is usually
-  #     larger than the specified number.
-  #
-  # exception
-  # :   Whether an exception should be raised on invalid arguments. `true` by
-  #     default, if passed `false`, just returns `nil` for invalid.
-  #
-  #
-  # #### Exceptions
-  #
-  # [`TypeError`](https://docs.ruby-lang.org/en/2.7.0/TypeError.html)
-  # :   If the `initial` type is neither
-  #     [`Integer`](https://docs.ruby-lang.org/en/2.7.0/Integer.html),
+  # *   [`Integer`](https://docs.ruby-lang.org/en/2.7.0/Integer.html),
   #     [`Float`](https://docs.ruby-lang.org/en/2.7.0/Float.html),
-  #     [`Rational`](https://docs.ruby-lang.org/en/2.7.0/Rational.html), nor
-  #     [`BigDecimal`](https://docs.ruby-lang.org/en/2.7.0/BigDecimal.html),
-  #     this exception is raised.
+  #     [`Rational`](https://docs.ruby-lang.org/en/2.7.0/Rational.html),
+  #     [`Complex`](https://docs.ruby-lang.org/en/2.7.0/Complex.html), or
+  #     BigDecimal: converted directly:
   #
-  # [`TypeError`](https://docs.ruby-lang.org/en/2.7.0/TypeError.html)
-  # :   If the `digits` is not an
-  #     [`Integer`](https://docs.ruby-lang.org/en/2.7.0/Integer.html), this
-  #     exception is raised.
+  # ```ruby
+  # # Integer, Complex, or BigDecimal value does not require ndigits; ignored if given.
+  # BigDecimal(2)                     # => 0.2e1
+  # BigDecimal(Complex(2, 0))         # => 0.2e1
+  # BigDecimal(BigDecimal(2))         # => 0.2e1
+  # # Float or Rational value requires ndigits.
+  # BigDecimal(2.0, 0)                # => 0.2e1
+  # BigDecimal(Rational(2, 1), 0)     # => 0.2e1
+  # ```
   #
-  # [`ArgumentError`](https://docs.ruby-lang.org/en/2.7.0/ArgumentError.html)
-  # :   If `initial` is a
-  #     [`Float`](https://docs.ruby-lang.org/en/2.7.0/Float.html), and the
-  #     `digits` is larger than Float::DIG + 1, this exception is raised.
+  # *   String: converted by parsing if it contains an integer or floating-point
+  #     literal; leading and trailing whitespace is ignored:
   #
-  # [`ArgumentError`](https://docs.ruby-lang.org/en/2.7.0/ArgumentError.html)
-  # :   If the `initial` is a
-  #     [`Float`](https://docs.ruby-lang.org/en/2.7.0/Float.html) or
-  #     [`Rational`](https://docs.ruby-lang.org/en/2.7.0/Rational.html), and the
-  #     `digits` value is omitted, this exception is raised.
+  # ```ruby
+  # # String does not require ndigits; ignored if given.
+  # BigDecimal('2')     # => 0.2e1
+  # BigDecimal('2.0')   # => 0.2e1
+  # BigDecimal('0.2e1') # => 0.2e1
+  # BigDecimal(' 2.0 ') # => 0.2e1
+  # ```
+  #
+  # *   Other type that responds to method `:to_str`: first converted to a
+  #     string, then converted to a
+  #     [`BigDecimal`](https://docs.ruby-lang.org/en/2.7.0/BigDecimal.html), as
+  #     above.
+  #
+  # *   Other type:
+  #
+  #     *   Raises an exception if keyword argument `exception` is `true`.
+  #     *   Returns `nil` if keyword argument `exception` is `true`.
+  #
+  #
+  #
+  # Raises an exception if `value` evaluates to a
+  # [`Float`](https://docs.ruby-lang.org/en/2.7.0/Float.html) and `digits` is
+  # larger than Float::DIG + 1.
   sig do
     params(
         initial: T.any(Integer, Float, Rational, BigDecimal, String),
@@ -871,8 +907,10 @@ module Kernel
   # or between 2 and 36) is a base for integer string representation. If *arg*
   # is a [`String`](https://docs.ruby-lang.org/en/2.7.0/String.html), when
   # *base* is omitted or equals zero, radix indicators (`0`, `0b`, and `0x`) are
-  # honored. In any case, strings should be strictly conformed to numeric
-  # representation. This behavior is different from that of
+  # honored. In any case, strings should consist only of one or more digits,
+  # except for that a sign, one underscore between two digits, and
+  # leading/trailing spaces are optional. This behavior is different from that
+  # of
   # [`String#to_i`](https://docs.ruby-lang.org/en/2.7.0/String.html#method-i-to_i).
   # Non string values will be converted by first trying `to_int`, then `to_i`.
   #
@@ -890,6 +928,7 @@ module Kernel
   # Integer(Time.new)   #=> 1204973019
   # Integer("0930", 10) #=> 930
   # Integer("111", 2)   #=> 7
+  # Integer(" +1_0 ")   #=> 10
   # Integer(nil)        #=> TypeError: can't convert nil into Integer
   # Integer("x")        #=> ArgumentError: invalid value for Integer(): "x"
   #
@@ -1176,7 +1215,7 @@ module Kernel
     )
     .returns(T.noreturn)
   end
-  def exit!(status); end
+  def exit!(status=T.unsafe(nil)); end
 
   # With no arguments, raises the exception in `$!` or raises a
   # [`RuntimeError`](https://docs.ruby-lang.org/en/2.7.0/RuntimeError.html) if
@@ -1200,6 +1239,10 @@ module Kernel
   # raise "Failed to create socket"
   # raise ArgumentError, "No parameters", caller
   # ```
+  #
+  #
+  # Alias for:
+  # [`raise`](https://docs.ruby-lang.org/en/2.7.0/Kernel.html#method-i-raise)
   sig {returns(T.noreturn)}
   sig do
     params(
@@ -1210,13 +1253,13 @@ module Kernel
   sig do
     params(
         arg0: Class,
-        arg1: T::Array[String],
+        arg1: T.any(String, T::Array[String]),
     )
     .returns(T.noreturn)
   end
   sig do
     params(
-        arg0: Class,
+        arg0: Exception,
         arg1: String,
         arg2: T::Array[String],
     )
@@ -1490,6 +1533,10 @@ module Kernel
   # sprintf("%{foo}f", { :foo => 1 })
   #   # => "1f"
   # ```
+  #
+  #
+  # Alias for:
+  # [`sprintf`](https://docs.ruby-lang.org/en/2.7.0/Kernel.html#method-i-sprintf)
   sig do
     params(
         format: String,
@@ -1535,7 +1582,9 @@ module Kernel
   end
   def gets(arg0=T.unsafe(nil), arg1=T.unsafe(nil)); end
 
-  # Returns an array of the names of global variables.
+  # Returns an array of the names of global variables. This includes special
+  # regexp global variables such as `$~` and `$+`, but does not include the
+  # numbered regexp global variables (`$1`, `$2`, etc.).
   #
   # ```ruby
   # global_variables.grep /std/   #=> [:$stdin, :$stdout, :$stderr]
@@ -1543,13 +1592,30 @@ module Kernel
   sig {returns(T::Array[Symbol])}
   def global_variables(); end
 
-  # Loads and executes the Ruby program in the file *filename*. If the filename
-  # does not resolve to an absolute path, the file is searched for in the
-  # library directories listed in `$:`. If the optional *wrap* parameter is
-  # `true`, the loaded script will be executed under an anonymous module,
-  # protecting the calling program's global namespace. In no circumstance will
-  # any local variables in the loaded file be propagated to the loading
-  # environment.
+  # Loads and executes the Ruby program in the file *filename*.
+  #
+  # If the filename is an absolute path (e.g. starts with '/'), the file will be
+  # loaded directly using the absolute path.
+  #
+  # If the filename is an explicit relative path (e.g. starts with './' or
+  # '../'), the file will be loaded using the relative path from the current
+  # directory.
+  #
+  # Otherwise, the file will be searched for in the library directories listed
+  # in `$LOAD_PATH` (`$:`). If the file is found in a directory, it will attempt
+  # to load the file relative to that directory. If the file is not found in any
+  # of the directories in `$LOAD_PATH`, the file will be loaded using the
+  # relative path from the current directory.
+  #
+  # If the file doesn't exist when there is an attempt to load it, a
+  # [`LoadError`](https://docs.ruby-lang.org/en/2.7.0/LoadError.html) will be
+  # raised.
+  #
+  # If the optional *wrap* parameter is `true`, the loaded script will be
+  # executed under an anonymous module, protecting the calling program's global
+  # namespace. If the optional *wrap* parameter is a module, the loaded script
+  # will be executed under the given module. In no circumstance will any local
+  # variables in the loaded file be propagated to the loading environment.
   sig do
     params(
         filename: String,
@@ -1625,7 +1691,8 @@ module Kernel
   #
   # If the command following the pipe is a single minus sign (`"|-"`), Ruby
   # forks, and this subprocess is connected to the parent. If the command is not
-  # `"-"`, the subprocess runs the command.
+  # `"-"`, the subprocess runs the command. Note that the command may be
+  # processed by shell if it contains shell metacharacters.
   #
   # When the subprocess is Ruby (opened via `"|-"`), the `open` call returns
   # `nil`. If a block is associated with the open call, that block will run
@@ -1705,11 +1772,6 @@ module Kernel
   # ```
   # Got: in Child
   # ```
-  #
-  #
-  # Also aliased as:
-  # [`open_uri_original_open`](https://docs.ruby-lang.org/en/2.7.0/Kernel.html#method-i-open_uri_original_open),
-  # [`open_uri_original_open`](https://docs.ruby-lang.org/en/2.7.0/Kernel.html#method-i-open_uri_original_open)
   sig do
     params(
       path: String,
@@ -1776,7 +1838,7 @@ module Kernel
   # [`Proc.new`](https://docs.ruby-lang.org/en/2.7.0/Proc.html#method-c-new).
   sig do
     params(
-        blk: BasicObject,
+        blk: T.untyped,
     )
     .returns(Proc)
   end
@@ -1788,7 +1850,7 @@ module Kernel
   # objects check the number of parameters passed when called.
   sig do
     params(
-        blk: BasicObject,
+        blk: T.untyped,
     )
     .returns(Proc)
   end
@@ -2502,6 +2564,10 @@ module Kernel
   # sprintf("%{foo}f", { :foo => 1 })
   #   # => "1f"
   # ```
+  #
+  #
+  # Also aliased as:
+  # [`format`](https://docs.ruby-lang.org/en/2.7.0/Kernel.html#method-i-format)
   sig do
     params(
         format: String,
@@ -2519,7 +2585,7 @@ module Kernel
   # Arguments for the function can follow *num*. They must be either `String`
   # objects or `Integer` objects. A `String` object is passed as a pointer to
   # the byte sequence. An `Integer` object is passed as an integer whose bit
-  # size is same as a pointer. Up to nine parameters may be passed.
+  # size is the same as a pointer. Up to nine parameters may be passed.
   #
   # The function identified by *num* is system dependent. On some Unix systems,
   # the numbers may be obtained from a header file called `syscall.h`.
@@ -2708,6 +2774,16 @@ module Kernel
   #
   #   baz.rb:6: warning: invalid call to foo
   # ```
+  #
+  # If `category` keyword argument is given, passes the category to
+  # `Warning.warn`. The category given must be be one of the following
+  # categories:
+  #
+  # :deprecated
+  # :   Used for warning for deprecated functionality that may be removed in the
+  #     future.
+  # :experimental
+  # :   Used for experimental features that may change in future releases.
   sig do
     params(
         msg: String,
@@ -2738,6 +2814,10 @@ module Kernel
   # raise "Failed to create socket"
   # raise ArgumentError, "No parameters", caller
   # ```
+  #
+  #
+  # Also aliased as:
+  # [`fail`](https://docs.ruby-lang.org/en/2.7.0/Kernel.html#method-i-fail)
   sig {returns(T.noreturn)}
   sig do
     params(
@@ -2777,14 +2857,16 @@ module Kernel
   # In the first form, the string is taken as a command line that is subject to
   # shell expansion before being executed.
   #
-  # The standard shell always means `"/bin/sh"` on Unix-like systems, same as
-  # `ENV["RUBYSHELL"]` (or `ENV["COMSPEC"]` on Windows NT series), and similar.
+  # The standard shell always means `"/bin/sh"` on Unix-like systems, otherwise,
+  # `ENV["RUBYSHELL"]` or `ENV["COMSPEC"]` on Windows and similar. The command
+  # is passed as an argument to the `"-c"` switch to the shell, except in the
+  # case of `COMSPEC`.
   #
   # If the string from the first form (`exec("command")`) follows these simple
   # rules:
   #
   # *   no meta characters
-  # *   no shell reserved word and no special built-in
+  # *   not starting with shell reserved word or special built-in
   # *   Ruby invokes the command directly without shell
   #
   #
@@ -2879,7 +2961,7 @@ module Kernel
   # *
   # ```
   #
-  # [`Error`](https://docs.ruby-lang.org/en/2.7.0/Error.html) handling:
+  # Error handling:
   #
   # ```ruby
   # system("cat nonexistent.txt")
@@ -2905,4 +2987,95 @@ module Kernel
     ).returns(T.nilable(T::Boolean))
   end
   def system(env, argv0 = T.unsafe(nil), *args, **options); end
+
+  # Yields self to the block and returns the result of the block.
+  #
+  # ```ruby
+  # "my string".yield_self {|s| s.upcase }   #=> "MY STRING"
+  # ```
+  #
+  # Good usage for `then` is value piping in method chains:
+  #
+  # ```ruby
+  # require 'open-uri'
+  # require 'json'
+  #
+  # construct_url(arguments).
+  #   then {|url| URI(url).read }.
+  #   then {|response| JSON.parse(response) }
+  # ```
+  sig do
+    type_parameters(:X)
+      .params(blk: T.proc.params(arg: T.untyped).returns(T.type_parameter(:X)))
+      .returns(T.type_parameter(:X))
+  end
+  def yield_self(&blk); end
+
+  ### `then` is just an alias of `yield_self`. Separately def'd here for easier IDE integration
+
+  # Yields self to the block and returns the result of the block.
+  #
+  # ```ruby
+  # 3.next.then {|x| x**x }.to_s             #=> "256"
+  # ```
+  #
+  # Good usage for `then` is value piping in method chains:
+  #
+  # ```ruby
+  # require 'open-uri'
+  # require 'json'
+  #
+  # construct_url(arguments).
+  #   then {|url| URI(url).read }.
+  #   then {|response| JSON.parse(response) }
+  # ```
+  #
+  # When called without block, the method returns `Enumerator`, which can be
+  # used, for example, for conditional circuit-breaking:
+  #
+  # ```ruby
+  # # meets condition, no-op
+  # 1.then.detect(&:odd?)            # => 1
+  # # does not meet condition, drop value
+  # 2.then.detect(&:odd?)            # => nil
+  # ```
+  sig do
+    type_parameters(:X)
+      .params(blk: T.proc.params(arg: T.untyped).returns(T.type_parameter(:X)))
+      .returns(T.type_parameter(:X))
+  end
+  def then(&blk); end
+
+  # Returns an integer identifier for `obj`.
+  #
+  # The same number will be returned on all calls to `object_id` for a given
+  # object, and no two active objects will share an id.
+  #
+  # Note: that some objects of builtin classes are reused for optimization. This
+  # is the case for immediate values and frozen string literals.
+  #
+  # [`BasicObject`](https://docs.ruby-lang.org/en/2.7.0/BasicObject.html)
+  # implements +\_\_id\_\_+,
+  # [`Kernel`](https://docs.ruby-lang.org/en/2.7.0/Kernel.html) implements
+  # `object_id`.
+  #
+  # Immediate values are not passed by reference but are passed by value: `nil`,
+  # `true`, `false`, Fixnums, Symbols, and some Floats.
+  #
+  # ```ruby
+  # Object.new.object_id  == Object.new.object_id  # => false
+  # (21 * 2).object_id    == (21 * 2).object_id    # => true
+  # "hello".object_id     == "hello".object_id     # => false
+  # "hi".freeze.object_id == "hi".freeze.object_id # => true
+  # ```
+  sig {returns(Integer)}
+  def object_id(); end
+
+  # Returns the receiver `obj`.
+  #
+  # ```ruby
+  # obj = Object.new; obj.itself.object_id == o.object_id # => true
+  # ```
+  sig {returns(T.self_type)}
+  def itself(); end
 end

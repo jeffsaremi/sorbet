@@ -4,15 +4,15 @@
 #include "absl/strings/str_split.h"
 #include "common/FileOps.h"
 #include "common/sort.h"
+#include "main/lsp/LSPLoop.h"
 #include "main/lsp/json_types.h"
-#include "main/lsp/lsp.h"
 
 using namespace std;
 
 namespace sorbet::realmain::lsp {
 
 bool hideSymbol(const core::GlobalState &gs, core::SymbolRef sym) {
-    if (!sym.exists() || sym == core::Symbols::root() || sym == core::Symbols::PackageRegistry()) {
+    if (!sym.exists() || sym == core::Symbols::root()) {
         return true;
     }
     if (!sym.owner(gs).exists()) {
@@ -213,6 +213,10 @@ string prettyTypeForConstant(const core::GlobalState &gs, core::SymbolRef consta
     // We should understand where dealias calls go.
     ENFORCE(constant == constant.dealias(gs));
 
+    if (constant == core::Symbols::StubModule()) {
+        return "This constant is not defined";
+    }
+
     core::TypePtr result;
     if (constant.isClassOrModule()) {
         auto targetClass = constant.asClassOrModuleRef();
@@ -226,10 +230,10 @@ string prettyTypeForConstant(const core::GlobalState &gs, core::SymbolRef consta
     }
 
     if (constant.isTypeAlias(gs)) {
-        // By wrapping the type in `MetaType`, it displays as `<Type: Foo>` rather than `Foo`.
-        result = core::make_type<core::MetaType>(result);
+        return fmt::format("T.type_alias {{{}}}", result.show(gs));
+    } else {
+        return result.showWithMoreInfo(gs);
     }
-    return result.showWithMoreInfo(gs);
 }
 
 core::TypePtr getResultType(const core::GlobalState &gs, const core::TypePtr &type, core::SymbolRef inWhat,
@@ -258,10 +262,10 @@ core::TypePtr getResultType(const core::GlobalState &gs, const core::TypePtr &ty
 SymbolKind symbolRef2SymbolKind(const core::GlobalState &gs, core::SymbolRef symbol) {
     if (symbol.isClassOrModule()) {
         auto klass = symbol.asClassOrModuleRef();
-        if (klass.data(gs)->isClassOrModuleModule()) {
+        if (klass.data(gs)->isModule()) {
             return SymbolKind::Module;
         }
-        if (klass.data(gs)->isClassOrModuleClass()) {
+        if (klass.data(gs)->isClass()) {
             return SymbolKind::Class;
         }
     } else if (symbol.isMethod()) {
@@ -428,7 +432,10 @@ optional<string> findDocumentation(string_view sourceCode, int beginIndex) {
     }
 
     string documentation = absl::StrJoin(documentation_lines.rbegin(), documentation_lines.rend(), "\n");
-    documentation = string(absl::StripTrailingAsciiWhitespace(documentation));
+    string_view stripped = absl::StripTrailingAsciiWhitespace(documentation);
+    if (stripped.size() != documentation.size()) {
+        documentation.resize(stripped.size());
+    }
 
     if (documentation.empty()) {
         return nullopt;

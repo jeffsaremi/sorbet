@@ -56,7 +56,7 @@ public:
                         "Emitting intrinsic that should have been deleted!");
     }
     virtual InlinedVector<core::NameRef, 2> applicableMethods(CompilerState &cs) const override {
-        return {core::Names::keepForIde(), core::Names::keepForTypechecking()};
+        return {core::Names::keepForIde()};
     }
 } ShouldNeverSeeIntrinsic;
 
@@ -124,7 +124,7 @@ public:
         return Payload::varGet(mcctx.cs, mcctx.send->args[0].variable, mcctx.builder, mcctx.irctx, mcctx.rubyRegionId);
     }
     virtual InlinedVector<core::NameRef, 2> applicableMethods(CompilerState &cs) const override {
-        return {core::Names::suggestType()};
+        return {core::Names::suggestConstantType(), core::Names::suggestFieldType()};
     }
 } IdentityIntrinsic;
 
@@ -163,9 +163,9 @@ public:
         // TODO: this implementation generates code that is stupidly slow, we should be able to reuse instrinsics here
         // one day
         auto recv = send->args[0].variable;
-        auto lit = core::cast_type_nonnull<core::LiteralType>(send->args[1].type);
-        ENFORCE(lit.literalKind == core::LiteralType::LiteralTypeKind::Symbol);
-        auto methodName = lit.asName(cs);
+        auto lit = core::cast_type_nonnull<core::NamedLiteralType>(send->args[1].type);
+        ENFORCE(lit.literalKind == core::NamedLiteralType::LiteralTypeKind::Symbol);
+        auto methodName = lit.asName();
 
         llvm::Value *blockHandler = prepareBlockHandler(mcctx, send->args[2]);
 
@@ -275,7 +275,15 @@ public:
 
     bool isLiteralish(CompilerState &cs, const core::TypePtr &t) const {
         // See IREmitterHelpers::emitLiteralish; we put the expected fast test first.
-        if (core::isa_type<core::LiteralType>(t)) {
+        if (core::isa_type<core::NamedLiteralType>(t)) {
+            return true;
+        }
+
+        if (core::isa_type<core::IntegerLiteralType>(t)) {
+            return true;
+        }
+
+        if (core::isa_type<core::FloatLiteralType>(t)) {
             return true;
         }
 
@@ -307,7 +315,6 @@ public:
         string rawName = fmt::format("ruby_hashLiteral{}", ++counter);
         auto tp = llvm::Type::getInt64Ty(mcctx.cs);
         auto zero = llvm::ConstantInt::get(mcctx.cs, llvm::APInt(64, 0));
-        llvm::Constant *indices[] = {zero};
 
         auto oldInsertPoint = builder.saveIP();
         auto globalDeclaration =
@@ -332,23 +339,18 @@ public:
                 int i = -1;
                 for (auto &v : mcctx.send->args) {
                     i++;
-                    llvm::Value *argIndices[] = {llvm::ConstantInt::get(mcctx.cs, llvm::APInt(32, 0, true)),
-                                                 llvm::ConstantInt::get(mcctx.cs, llvm::APInt(64, i, true))};
                     llvm::Value *val = IREmitterHelpers::emitLiteralish(mcctx.cs, globalInitBuilder, v.type);
                     globalInitBuilder.CreateStore(
-                        val, globalInitBuilder.CreateGEP(argArray, argIndices, fmt::format("hashArgs{}Addr", i)));
+                        val, globalInitBuilder.CreateConstGEP2_64(argArray, 0, i, fmt::format("hashArgs{}Addr", i)));
                 }
 
-                llvm::Value *argIndices[] = {llvm::ConstantInt::get(mcctx.cs, llvm::APInt(64, 0, true)),
-                                             llvm::ConstantInt::get(mcctx.cs, llvm::APInt(64, 0, true))};
                 auto hashValue = globalInitBuilder.CreateCall(
                     mcctx.cs.getFunction("sorbet_literalHashBuild"),
                     {llvm::ConstantInt::get(mcctx.cs, llvm::APInt(32, mcctx.send->args.size(), true)),
-                     globalInitBuilder.CreateGEP(argArray, argIndices)},
+                     globalInitBuilder.CreateConstGEP2_64(argArray, 0, 0)},
                     "builtHash");
 
-                globalInitBuilder.CreateStore(
-                    hashValue, llvm::ConstantExpr::getInBoundsGetElementPtr(ret->getValueType(), ret, indices));
+                globalInitBuilder.CreateStore(hashValue, ret);
                 globalInitBuilder.CreateRetVoid();
                 globalInitBuilder.SetInsertPoint(mcctx.cs.globalConstructorsEntry);
                 globalInitBuilder.CreateCall(constr, {});
@@ -357,9 +359,7 @@ public:
             }));
         builder.restoreIP(oldInsertPoint);
 
-        auto *index = builder.CreateLoad(
-            llvm::ConstantExpr::getInBoundsGetElementPtr(globalDeclaration->getValueType(), globalDeclaration, indices),
-            "hashLiteral");
+        auto *index = builder.CreateLoad(globalDeclaration, "hashLiteral");
         auto *copy = builder.CreateCall(mcctx.cs.getFunction("sorbet_globalConstDupHash"), {index}, "duplicatedHash");
         Payload::assumeType(mcctx.cs, builder, copy, core::Symbols::Hash());
         return copy;
@@ -430,7 +430,7 @@ std::tuple<CallCacheFlags, llvm::Value *> prepareSplatArgs(MethodCallContext &mc
                 // Failing compilation because as of this writing, this case is not produced by the desugarer, so
                 // the above code is untested. In theory, once the case is implemented in the desugarer, it should
                 // be okay to remove this.
-                failCompilation(cs, core::Loc(irctx.cfg.file, send->receiverLoc),
+                failCompilation(cs, core::Loc(cs.file, send->receiverLoc),
                                 "internal error: arg 3 to call-with-splat has odd length > 1");
             } else {
                 kwHash = builder.CreateCall(cs.getFunction("sorbet_hashDup"), {kwHash1}, "kwHash");
@@ -444,7 +444,7 @@ std::tuple<CallCacheFlags, llvm::Value *> prepareSplatArgs(MethodCallContext &mc
         builder.CreateCall(cs.getFunction("sorbet_arrayPush"), {splatArray, kwHash});
     } else {
         // This should not be possible (desugarer will only pass nil or a tuple).
-        failCompilation(cs, core::Loc(irctx.cfg.file, send->receiverLoc),
+        failCompilation(cs, core::Loc(cs.file, send->receiverLoc),
                         "internal error: arg 3 to call-with-splat has neither nil nor tuple type");
     }
 
@@ -473,9 +473,9 @@ public:
 
         auto [flags, splatArray] = prepareSplatArgs(mcctx, send->args[2], send->args[3]);
 
-        auto lit = core::cast_type_nonnull<core::LiteralType>(send->args[1].type);
-        ENFORCE(lit.literalKind == core::LiteralType::LiteralTypeKind::Symbol);
-        auto methodName = lit.asName(cs);
+        auto lit = core::cast_type_nonnull<core::NamedLiteralType>(send->args[1].type);
+        ENFORCE(lit.literalKind == core::NamedLiteralType::LiteralTypeKind::Symbol);
+        auto methodName = lit.asName();
 
         // setup the inline cache
         // Note that in the case of calling `super`, the VM's search mechanism will
@@ -534,9 +534,9 @@ public:
         flags.blockarg = true;
         auto *blockHandler = prepareBlockHandler(mcctx, send->args[4]);
 
-        auto lit = core::cast_type_nonnull<core::LiteralType>(send->args[1].type);
-        ENFORCE(lit.literalKind == core::LiteralType::LiteralTypeKind::Symbol);
-        auto methodName = lit.asName(cs);
+        auto lit = core::cast_type_nonnull<core::NamedLiteralType>(send->args[1].type);
+        ENFORCE(lit.literalKind == core::NamedLiteralType::LiteralTypeKind::Symbol);
+        auto methodName = lit.asName();
 
         // setup the inline cache
         // Note that in the case of calling `super`, the VM's search mechanism will
@@ -677,15 +677,15 @@ public:
         auto &cs = mcctx.cs;
         auto &builder = mcctx.builder;
         auto &var = mcctx.send->args[0].type;
-        if (!core::isa_type<core::LiteralType>(var)) {
+        if (!core::isa_type<core::NamedLiteralType>(var)) {
             return IREmitterHelpers::emitMethodCallViaRubyVM(mcctx);
         }
-        auto lit = core::cast_type_nonnull<core::LiteralType>(var);
-        if (lit.literalKind != core::LiteralType::LiteralTypeKind::Symbol) {
+        auto lit = core::cast_type_nonnull<core::NamedLiteralType>(var);
+        if (lit.literalKind != core::NamedLiteralType::LiteralTypeKind::Symbol) {
             return IREmitterHelpers::emitMethodCallViaRubyVM(mcctx);
         }
 
-        auto varName = lit.asName(cs);
+        auto varName = lit.asName();
         auto varNameStr = varName.shortName(cs);
 
         auto *callCache = mcctx.getInlineCache();
@@ -715,15 +715,15 @@ public:
         auto &cs = mcctx.cs;
         auto &builder = mcctx.builder;
         auto &var = mcctx.send->args[0].type;
-        if (!core::isa_type<core::LiteralType>(var)) {
+        if (!core::isa_type<core::NamedLiteralType>(var)) {
             return IREmitterHelpers::emitMethodCallViaRubyVM(mcctx);
         }
-        auto lit = core::cast_type_nonnull<core::LiteralType>(var);
-        if (lit.literalKind != core::LiteralType::LiteralTypeKind::Symbol) {
+        auto lit = core::cast_type_nonnull<core::NamedLiteralType>(var);
+        if (lit.literalKind != core::NamedLiteralType::LiteralTypeKind::Symbol) {
             return IREmitterHelpers::emitMethodCallViaRubyVM(mcctx);
         }
 
-        auto varName = lit.asName(cs);
+        auto varName = lit.asName();
         auto varNameStr = varName.shortName(cs);
 
         auto *callCache = mcctx.getInlineCache();

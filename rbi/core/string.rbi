@@ -587,7 +587,7 @@ class String < Object
   sig {returns(T::Array[Integer])}
   sig do
     params(
-        blk: BasicObject,
+        blk: T.untyped,
     )
     .returns(T::Array[Integer])
   end
@@ -975,6 +975,7 @@ class String < Object
   sig do
     params(
         arg0: String,
+        chomp: T::Boolean,
         blk: T.proc.params(arg0: String).returns(BasicObject),
     )
     .returns(String)
@@ -982,10 +983,11 @@ class String < Object
   sig do
     params(
         arg0: String,
+        chomp: T::Boolean,
     )
     .returns(T::Enumerator[String])
   end
-  def each_line(arg0=T.unsafe(nil), &blk); end
+  def each_line(arg0=T.unsafe(nil), chomp: false, &blk); end
 
   # Returns `true` if *str* has a length of zero.
   #
@@ -1729,7 +1731,7 @@ class String < Object
   # "  hello".rstrip!    #=> nil
   # "hello".rstrip!      #=> nil
   # ```
-  sig {returns(String)}
+  sig {returns(T.nilable(String))}
   def rstrip!(); end
 
   # Both forms iterate through *str*, matching the pattern (which may be a
@@ -1772,7 +1774,7 @@ class String < Object
   sig do
     params(
         arg0: T.any(Regexp, String),
-        blk: BasicObject,
+        blk: T.untyped,
     )
     .returns(T::Array[T.any(String, T::Array[String])])
   end
@@ -2028,7 +2030,7 @@ class String < Object
   # "  hello  ".strip!  #=> "hello"
   # "hello".strip!      #=> nil
   # ```
-  sig {returns(String)}
+  sig {returns(T.nilable(String))}
   def strip!(); end
 
   # Returns a copy of `str` with the *first* occurrence of `pattern` replaced by

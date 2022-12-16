@@ -176,8 +176,13 @@ public:
         return cond;
     }
 
-    void error(ruby_parser::dclass err, core::LocOffsets loc, std::string data = "") {
+    void error_without_recovery(ruby_parser::dclass err, core::LocOffsets loc, std::string data = "") {
         driver_->external_diagnostic(ruby_parser::dlevel::ERROR, err, loc.beginPos(), loc.endPos(), data);
+    }
+
+    void error(ruby_parser::dclass err, core::LocOffsets loc, std::string data = "") {
+        auto range = ruby_parser::diagnostic::range(loc.beginPos(), loc.endPos());
+        driver_->diagnostics.emplace_back(ruby_parser::dlevel::ERROR, err, std::move(range), data);
     }
 
     /* Begin callback methods */
@@ -187,34 +192,32 @@ public:
             ENFORCE(id->name.kind() == core::NameKind::UTF8);
             // Because of the above enforce, we can use shortName here instead of show.
             auto name_str = id->name.shortName(gs_);
-            if (isNumberedParameterName(name_str) && driver_->lex.context.inDynamicBlock()) {
+            if (isNumberedParameterName(name_str) && driver_->lex.context.allowNumparams) {
                 if (driver_->numparam_stack.seen_ordinary_params()) {
-                    error(ruby_parser::dclass::OrdinaryParamDefined, id->loc);
+                    error_without_recovery(ruby_parser::dclass::OrdinaryParamDefined, id->loc);
                 }
 
-                auto raw_context = driver_->lex.context.stackCopy();
                 auto raw_numparam_stack = driver_->numparam_stack.stackCopy();
 
                 // ignore current block scope
-                raw_context.pop_back();
                 raw_numparam_stack.pop_back();
 
-                for (auto outer_scope : raw_context) {
-                    if (outer_scope == ruby_parser::Context::State::BLOCK ||
-                        outer_scope == ruby_parser::Context::State::LAMBDA) {
-                        auto outer_scope_has_numparams = raw_numparam_stack.back().max > 0;
-                        raw_numparam_stack.pop_back();
+                std::reverse(raw_numparam_stack.begin(), raw_numparam_stack.end());
+                for (auto outer_scope : raw_numparam_stack) {
+                    if (outer_scope.staticContext) {
+                        // Found an outer scope that can't have numparams
+                        // like def, class, etc.
+                        break;
+                    } else {
+                        auto outer_scope_has_numparams = outer_scope.max > 0;
 
                         if (outer_scope_has_numparams) {
-                            error(ruby_parser::dclass::NumparamUsedInOuterScope, node->loc);
+                            error_without_recovery(ruby_parser::dclass::NumparamUsedInOuterScope, node->loc);
                         } else {
                             // for now it's ok, but an outer scope can also be a block
+                            // like proc { _1; proc { proc { proc { _2}}}}
                             // with numparams, so we need to continue
                         }
-                    } else {
-                        // found an outer scope that can't have numparams
-                        // like def/class/etc
-                        break;
                     }
                 }
 
@@ -225,9 +228,17 @@ public:
                 driver_->numparam_stack.regis(name_str[1] - 48, std::move(decls));
             }
 
+            auto last_char = name_str.back();
+            if (last_char == '?' || last_char == '!') {
+                error_without_recovery(ruby_parser::dclass::InvalidIdToGet, id->loc, std::string(name_str));
+            }
+
             if (driver_->lex.is_declared(name_str)) {
-                checkCircularArgumentReferences(node.get(), name_str);
-                return make_unique<LVar>(node->loc, id->name);
+                if (!hasCircularArgumentReferences(node.get(), name_str)) {
+                    return make_unique<LVar>(node->loc, id->name);
+                } else {
+                    return error_node(node->loc.beginPos(), node->loc.endPos());
+                }
             } else {
                 return make_unique<Send>(node->loc, nullptr, id->name, node->loc, sorbet::parser::NodeVec());
             }
@@ -255,7 +266,24 @@ public:
         if (begin == nullptr && args.empty() && end == nullptr) {
             return nullptr;
         }
+        validateNoForwardArgAfterRestArg(args);
+
         return make_unique<Args>(collectionLoc(begin, args, end), std::move(args));
+    }
+
+    void validateNoForwardArgAfterRestArg(const sorbet::parser::NodeVec &args) {
+        bool restArg = false;
+        bool forwardArg = false;
+        for (auto &arg : args) {
+            if (parser::isa_node<Restarg>(arg.get())) {
+                restArg = true;
+            } else if (parser::isa_node<ForwardArg>(arg.get())) {
+                forwardArg = true;
+            }
+        }
+        if (forwardArg && restArg) {
+            error_without_recovery(ruby_parser::dclass::ForwardArgAfterRestArg, args[0].get()->loc);
+        }
     }
 
     unique_ptr<Node> array(const token *begin, sorbet::parser::NodeVec elements, const token *end) {
@@ -311,26 +339,35 @@ public:
     unique_ptr<Node> assignable(unique_ptr<Node> node) {
         if (auto *id = parser::cast_node<Ident>(node.get())) {
             auto name = id->name.shortName(gs_);
-            checkReservedForNumberedParameters(name, id->loc);
+            checkAssignmentToNumberedParameters(name, id->loc);
 
             driver_->lex.declare(name);
             return make_unique<LVarLhs>(id->loc, id->name);
         } else if (auto *iv = parser::cast_node<IVar>(node.get())) {
             return make_unique<IVarLhs>(iv->loc, iv->name);
         } else if (auto *c = parser::cast_node<Const>(node.get())) {
-            if (!driver_->lex.context.dynamicConstDefintinionAllowed()) {
+            if (driver_->lex.context.inDef) {
                 error(ruby_parser::dclass::DynamicConst, node->loc);
+                // Error recovery: lie and say it was an assign to something else so that the parse can continue
+                auto name = core::Names::dynamicConstAssign();
+                driver_->lex.declare(name.shortName(gs_));
+                return make_unique<LVarLhs>(c->loc, name);
+            } else {
+                return make_unique<ConstLhs>(c->loc, std::move(c->scope), c->name);
             }
-            return make_unique<ConstLhs>(c->loc, std::move(c->scope), c->name);
         } else if (auto *cv = parser::cast_node<CVar>(node.get())) {
             return make_unique<CVarLhs>(cv->loc, cv->name);
         } else if (auto *gv = parser::cast_node<GVar>(node.get())) {
             return make_unique<GVarLhs>(gv->loc, gv->name);
+        } else if (auto *mv = parser::cast_node<MatchVar>(node.get())) {
+            auto name = mv->name.shortName(gs_);
+            checkAssignmentToNumberedParameters(name, mv->loc);
+            return node;
         } else if (parser::isa_node<Backref>(node.get()) || parser::isa_node<NthRef>(node.get())) {
-            error(ruby_parser::dclass::BackrefAssignment, node->loc);
+            error_without_recovery(ruby_parser::dclass::BackrefAssignment, node->loc);
             return make_unique<Nil>(node->loc);
         } else {
-            error(ruby_parser::dclass::InvalidAssignment, node->loc);
+            error_without_recovery(ruby_parser::dclass::InvalidAssignment, node->loc);
             return make_unique<Nil>(node->loc);
         }
     }
@@ -367,7 +404,7 @@ public:
         core::LocOffsets loc = receiver->loc.join(selectorLoc);
         if ((dot != nullptr) && dot->view() == "&.") {
             if (masgn) {
-                error(ruby_parser::dclass::CSendInLHSOfMAsgn, tokLoc(dot));
+                error_without_recovery(ruby_parser::dclass::CSendInLHSOfMAsgn, tokLoc(dot));
             }
             return make_unique<CSend>(loc, std::move(receiver), method, selectorLoc, sorbet::parser::NodeVec());
         }
@@ -472,7 +509,7 @@ public:
     unique_ptr<Node> block(unique_ptr<Node> methodCall, const token *begin, unique_ptr<Node> args,
                            unique_ptr<Node> body, const token *end) {
         if (auto *y = parser::cast_node<Yield>(methodCall.get())) {
-            error(ruby_parser::dclass::BlockGivenToYield, y->loc);
+            error_without_recovery(ruby_parser::dclass::BlockGivenToYield, y->loc);
             return make_unique<Yield>(y->loc, sorbet::parser::NodeVec());
         }
 
@@ -488,9 +525,9 @@ public:
         }
         if (callargs != nullptr && !callargs->empty()) {
             if (auto *bp = parser::cast_node<BlockPass>(callargs->back().get())) {
-                error(ruby_parser::dclass::BlockAndBlockarg, bp->loc);
+                error_without_recovery(ruby_parser::dclass::BlockAndBlockarg, bp->loc);
             } else if (auto *fa = parser::cast_node<ForwardedArgs>(callargs->back().get())) {
-                error(ruby_parser::dclass::BlockAndBlockarg, fa->loc);
+                error_without_recovery(ruby_parser::dclass::BlockAndBlockarg, fa->loc);
             }
         }
 
@@ -533,6 +570,10 @@ public:
     }
 
     unique_ptr<Node> blockPass(const token *amper, unique_ptr<Node> arg) {
+        if (arg == nullptr) {
+            return make_unique<BlockPass>(tokLoc(amper), nullptr);
+        }
+
         return make_unique<BlockPass>(tokLoc(amper).join(arg->loc), std::move(arg));
     }
 
@@ -602,7 +643,7 @@ public:
             loc = loc.join(tokLoc(dot));
         }
 
-        auto methodLoc = locOffset(loc.endPos(), loc.endPos());
+        auto methodLoc = loc.copyEndWithZeroLength();
 
         auto method = core::Names::methodNameMissing();
         if ((dot != nullptr) && dot->view() == "&.") {
@@ -616,6 +657,19 @@ public:
                            const token *elseTok, unique_ptr<Node> elseBody, const token *end) {
         return make_unique<Case>(tokLoc(case_).join(tokLoc(end)), std::move(expr), std::move(whenBodies),
                                  std::move(elseBody));
+    }
+
+    unique_ptr<Node> case_error(const token *case_, unique_ptr<Node> cond, const token *end) {
+        auto loc = tokLoc(case_);
+        if (end != nullptr) {
+            loc = loc.join(tokLoc(end));
+        }
+        auto zloc = loc.copyWithZeroLength();
+        auto whenPatterns = NodeVec{};
+        whenPatterns.emplace_back(error_node(loc.beginPos(), loc.beginPos()));
+        auto whens = NodeVec{};
+        whens.emplace_back(make_unique<When>(zloc, std::move(whenPatterns), nullptr));
+        return make_unique<Case>(loc, std::move(cond), std::move(whens), nullptr);
     }
 
     unique_ptr<Node> case_match(const token *case_, unique_ptr<Node> expr, sorbet::parser::NodeVec inBodies,
@@ -709,7 +763,9 @@ public:
     }
 
     unique_ptr<Node> cvar(const token *tok) {
-        return make_unique<CVar>(tokLoc(tok), gs_.enterNameUTF8(tok->view()));
+        auto view = tok->view();
+        auto name = view == "@@" ? core::Names::cvarNameMissing() : gs_.enterNameUTF8(view);
+        return make_unique<CVar>(tokLoc(tok), name);
     }
 
     unique_ptr<Node> dedentString(unique_ptr<Node> node, size_t dedentLevel) {
@@ -784,11 +840,12 @@ public:
         return make_unique<Class>(loc, declLoc, std::move(name), std::move(superclass), std::move(body));
     }
 
-    unique_ptr<Node> defEndlessMethod(const token *def, const token *tname, unique_ptr<Node> args, const token *equal,
+    unique_ptr<Node> defEndlessMethod(unique_ptr<Node> defHead, unique_ptr<Node> args, const token *equal,
                                       unique_ptr<Node> body) {
-        core::LocOffsets declLoc = tokLoc(def, tname).join(maybe_loc(args));
-        core::LocOffsets loc = tokLoc(def).join(body->loc);
-        std::string name{tname->view()};
+        auto *head = parser::cast_node<DefnHead>(defHead.get());
+        core::LocOffsets declLoc = head->loc.join(maybe_loc(args));
+        core::LocOffsets loc = head->loc.join(body->loc);
+        std::string name = head->name.toString(gs_);
 
         checkEndlessSetter(name, declLoc);
         checkReservedForNumberedParameters(name, declLoc);
@@ -809,20 +866,28 @@ public:
         return make_unique<DefS>(loc, declLoc, std::move(head->definee), head->name, std::move(args), std::move(body));
     }
 
-    unique_ptr<Node> defMethod(const token *def, const token *name, unique_ptr<Node> args, unique_ptr<Node> body,
+    unique_ptr<Node> defMethod(unique_ptr<Node> defHead, unique_ptr<Node> args, unique_ptr<Node> body,
                                const token *end) {
-        core::LocOffsets declLoc = tokLoc(def, name).join(maybe_loc(args));
-        core::LocOffsets loc = tokLoc(def, end);
+        auto *head = parser::cast_node<DefnHead>(defHead.get());
+        core::LocOffsets declLoc = head->loc.join(maybe_loc(args));
+        core::LocOffsets loc = head->loc.join(tokLoc(end));
+        std::string name = head->name.toString(gs_);
 
-        checkReservedForNumberedParameters(name->view(), declLoc);
+        checkReservedForNumberedParameters(name, declLoc);
 
-        return make_unique<DefMethod>(loc, declLoc, gs_.enterNameUTF8(name->view()), std::move(args), std::move(body));
+        return make_unique<DefMethod>(loc, declLoc, gs_.enterNameUTF8(name), std::move(args), std::move(body));
     }
 
     unique_ptr<Node> defModule(const token *module, unique_ptr<Node> name, unique_ptr<Node> body, const token *end_) {
         core::LocOffsets declLoc = tokLoc(module).join(maybe_loc(name));
         core::LocOffsets loc = tokLoc(module, end_);
         return make_unique<Module>(loc, declLoc, std::move(name), std::move(body));
+    }
+
+    unique_ptr<Node> defnHead(const token *def, const token *name) {
+        core::LocOffsets declLoc = tokLoc(def, name);
+
+        return make_unique<DefnHead>(declLoc, gs_.enterNameUTF8(name->view()));
     }
 
     unique_ptr<Node> def_sclass(const token *class_, const token *lshft_, unique_ptr<Node> expr, unique_ptr<Node> body,
@@ -832,10 +897,20 @@ public:
         return make_unique<SClass>(loc, declLoc, std::move(expr), std::move(body));
     }
 
+    unique_ptr<Node> defnHeadError(const token *def) {
+        return make_unique<DefnHead>(tokLoc(def), core::Names::methodDefNameMissing());
+    }
+
     unique_ptr<Node> defsHead(const token *def, unique_ptr<Node> definee, const token *dot, const token *name) {
         core::LocOffsets declLoc = tokLoc(def, name);
 
         return make_unique<DefsHead>(declLoc, std::move(definee), gs_.enterNameUTF8(name->view()));
+    }
+
+    unique_ptr<Node> defsHeadError(const token *def, unique_ptr<Node> definee, const token *dot) {
+        core::LocOffsets declLoc = tokLoc(def, dot);
+
+        return make_unique<DefsHead>(declLoc, std::move(definee), core::Names::methodDefNameMissing());
     }
 
     unique_ptr<Node> defSingleton(unique_ptr<Node> defHead, unique_ptr<Node> args, unique_ptr<Node> body,
@@ -845,7 +920,7 @@ public:
         core::LocOffsets loc = head->loc.join(tokLoc(end));
 
         if (isLiteralNode(*(head->definee.get()))) {
-            error(ruby_parser::dclass::SingletonLiteral, head->definee->loc);
+            error_without_recovery(ruby_parser::dclass::SingletonLiteral, head->definee->loc);
         }
         checkReservedForNumberedParameters(head->name.toString(gs_), declLoc);
 
@@ -906,7 +981,7 @@ public:
 
     unique_ptr<Node> forwarded_args(const token *dots) {
         if (!driver_->lex.is_declared_forward_args()) {
-            error(ruby_parser::dclass::UnexpectedToken, tokLoc(dots), "\"...\"");
+            error_without_recovery(ruby_parser::dclass::UnexpectedToken, tokLoc(dots), "\"...\"");
         }
         return make_unique<ForwardedArgs>(tokLoc(dots));
     }
@@ -960,7 +1035,9 @@ public:
     }
 
     unique_ptr<Node> ivar(const token *tok) {
-        return make_unique<IVar>(tokLoc(tok), gs_.enterNameUTF8(tok->view()));
+        auto view = tok->view();
+        auto name = view == "@" ? core::Names::ivarNameMissing() : gs_.enterNameUTF8(view);
+        return make_unique<IVar>(tokLoc(tok), name);
     }
 
     unique_ptr<Node> keywordBreak(const token *keyword, const token *lparen, sorbet::parser::NodeVec args,
@@ -1006,7 +1083,7 @@ public:
                                   const token *rparen) {
         core::LocOffsets loc = tokLoc(keyword).join(collectionLoc(lparen, args, rparen));
         if (!args.empty() && parser::isa_node<BlockPass>(args.back().get())) {
-            error(ruby_parser::dclass::BlockGivenToYield, loc);
+            error_without_recovery(ruby_parser::dclass::BlockGivenToYield, loc);
         }
         return make_unique<Yield>(loc, std::move(args));
     }
@@ -1035,14 +1112,15 @@ public:
     }
 
     unique_ptr<Node> kwrestarg(const token *dstar, const token *name) {
-        core::LocOffsets loc = tokLoc(dstar);
+        core::LocOffsets loc;
         core::NameRef nm;
 
         if (name != nullptr) {
-            loc = loc.join(tokLoc(name));
+            loc = tokLoc(name);
             nm = gs_.enterNameUTF8(name->view());
             checkReservedForNumberedParameters(name->view(), loc);
         } else {
+            loc = tokLoc(dstar);
             nm = gs_.freshNameUnique(core::UniqueNameKind::Parser, core::Names::starStar(), ++uniqueCounter_);
         }
 
@@ -1177,7 +1255,7 @@ public:
     unique_ptr<Node> match_var_hash_from_str(sorbet::parser::NodeVec strings) {
         auto loc = collectionLoc(strings);
         if (strings.size() > 1) {
-            error(ruby_parser::dclass::PatternInterpInVarName, loc);
+            error_without_recovery(ruby_parser::dclass::PatternInterpInVarName, loc);
         }
         auto &node = strings.at(0);
         if (auto *str = parser::cast_node<String>(node.get())) {
@@ -1254,7 +1332,7 @@ public:
 
     unique_ptr<Node> op_assign(unique_ptr<Node> lhs, const token *op, unique_ptr<Node> rhs) {
         if (parser::isa_node<Backref>(lhs.get()) || parser::isa_node<NthRef>(lhs.get())) {
-            error(ruby_parser::dclass::BackrefAssignment, lhs->loc);
+            error_without_recovery(ruby_parser::dclass::BackrefAssignment, lhs->loc);
         }
 
         if (op->view() == "&&") {
@@ -1263,7 +1341,7 @@ public:
         if (op->view() == "||") {
             return make_unique<OrAsgn>(lhs->loc.join(rhs->loc), std::move(lhs), std::move(rhs));
         }
-        return make_unique<OpAsgn>(lhs->loc.join(rhs->loc), std::move(lhs), gs_.enterNameUTF8(op->view()),
+        return make_unique<OpAsgn>(lhs->loc.join(rhs->loc), std::move(lhs), gs_.enterNameUTF8(op->view()), tokLoc(op),
                                    std::move(rhs));
     }
 
@@ -1278,7 +1356,7 @@ public:
     unique_ptr<Node> p_ident(const token *tok) {
         auto name_str = tok->asString();
         if (!driver_->lex.is_declared(name_str)) {
-            error(ruby_parser::dclass::PatternLVarUndefined, tokLoc(tok), name_str);
+            error_without_recovery(ruby_parser::dclass::PatternLVarUndefined, tokLoc(tok), name_str);
         }
         return ident(tok);
     }
@@ -1288,11 +1366,34 @@ public:
     }
 
     unique_ptr<Node> pair_keyword(const token *key, unique_ptr<Node> value) {
-        auto keyLoc =
-            core::LocOffsets{clamp((uint32_t)key->start()), clamp((uint32_t)key->end() - 1)}; // drop the trailing :
+        auto start = clamp((uint32_t)key->start());
+        auto end = clamp((uint32_t)key->end());
+        if (key->type() == ruby_parser::token_type::tLABEL) {
+            // drop the trailing :
+            end = clamp(end - 1);
+        } else {
+            ENFORCE(key->type() == ruby_parser::token_type::tIDENTIFIER);
+        }
+        auto keyLoc = core::LocOffsets{start, end};
 
         return make_unique<Pair>(tokLoc(key).join(maybe_loc(value)),
                                  make_unique<Symbol>(keyLoc, gs_.enterNameUTF8(key->view())), std::move(value));
+    }
+
+    unique_ptr<Node> pair_label(const token *key) {
+        unique_ptr<Node> value;
+        if (islower(key->view().at(0))) {
+            value = ident(key);
+        } else {
+            value = const_(key);
+        }
+
+        auto keyLoc =
+            core::LocOffsets{clamp((uint32_t)key->start()), clamp((uint32_t)key->end() - 1)}; // drop the trailing :
+        auto accessible_value = accessible(std::move(value));
+        return make_unique<Pair>(tokLoc(key).join(maybe_loc(accessible_value)),
+                                 make_unique<Symbol>(keyLoc, gs_.enterNameUTF8(key->view())),
+                                 std::move(accessible_value));
     }
 
     unique_ptr<Node> pair_quoted(const token *begin, sorbet::parser::NodeVec parts, const token *end,
@@ -1480,6 +1581,23 @@ public:
         return make_unique<True>(tokLoc(tok));
     }
 
+    // A helper for use with indentation-aware error recovery. Mutates `body` by dropping all
+    // expressions from it that begin after the end of `truncateToken`.
+    unique_ptr<Node> truncateBodyStmt(unique_ptr<Node> body, const token *truncateToken) {
+        auto begin = parser::cast_node<Begin>(body.get());
+        if (begin == nullptr) {
+            // There can also be rescue/else nodes in a bodystmt, but we don't attempt to handle
+            // those right now.
+            return nullptr;
+        }
+
+        auto firstToTruncate = absl::c_find_if(
+            begin->stmts, [&](const auto &stmt) { return stmt->loc.beginPos() >= truncateToken->end(); });
+        begin->stmts.erase(firstToTruncate, begin->stmts.end());
+
+        return body;
+    }
+
     unique_ptr<Node> unary_op(const token *oper, unique_ptr<Node> receiver) {
         core::LocOffsets loc = tokLoc(oper).join(receiver->loc);
 
@@ -1603,10 +1721,12 @@ public:
         return parser::isa_node<String>(firstPart) || parser::isa_node<DString>(firstPart);
     }
 
-    void checkCircularArgumentReferences(const Node *node, std::string_view name) {
+    bool hasCircularArgumentReferences(const Node *node, std::string_view name) {
         if (name == driver_->current_arg_stack.top()) {
-            error(ruby_parser::dclass::CircularArgumentReference, node->loc, std::string(name));
+            error_without_recovery(ruby_parser::dclass::CircularArgumentReference, node->loc, std::string(name));
+            return true;
         }
+        return false;
     }
 
     void checkDuplicateArgs(sorbet::parser::NodeVec &args, UnorderedMap<std::string, core::LocOffsets> &map) {
@@ -1640,7 +1760,7 @@ public:
         if (that_arg_loc_it == map.end()) {
             map[this_name] = this_loc;
         } else if (argNameCollides(this_name)) {
-            error(ruby_parser::dclass::DuplicateArgument, this_loc, this_name);
+            error_without_recovery(ruby_parser::dclass::DuplicateArgument, this_loc, this_name);
         }
     }
 
@@ -1651,7 +1771,7 @@ public:
         }
 
         if (driver_->pattern_variables.declared(name)) {
-            error(ruby_parser::dclass::PatternDuplicateVariable, loc, name);
+            error_without_recovery(ruby_parser::dclass::PatternDuplicateVariable, loc, name);
         }
 
         driver_->pattern_variables.declare(name);
@@ -1659,7 +1779,7 @@ public:
 
     void checkDuplicatePatternKey(std::string name, core::LocOffsets loc) {
         if (driver_->pattern_hash_keys.declared(name)) {
-            error(ruby_parser::dclass::PatternDuplicateKey, loc, name);
+            error_without_recovery(ruby_parser::dclass::PatternDuplicateKey, loc, name);
         }
 
         driver_->pattern_hash_keys.declare(name);
@@ -1668,14 +1788,14 @@ public:
     void checkEndlessSetter(std::string name, core::LocOffsets loc) {
         if (name != "===" && name != "==" && name != "!=" && name != "<=" && name != ">=" &&
             name[name.length() - 1] == '=') {
-            error(ruby_parser::dclass::EndlessSetter, loc);
+            error_without_recovery(ruby_parser::dclass::EndlessSetter, loc);
         }
     }
 
     void checkLVarName(std::string name, core::LocOffsets loc) {
         std::regex lvar_regex("^[a-z_][a-zA-Z0-9_]*$");
         if (!std::regex_match(name, lvar_regex)) {
-            error(ruby_parser::dclass::PatternLVarName, loc, name);
+            error_without_recovery(ruby_parser::dclass::PatternLVarName, loc, name);
         }
     }
 
@@ -1691,7 +1811,7 @@ public:
             } else if (auto *b = parser::cast_node<Begin>(p.get())) {
                 res += collapseSymbolStrings(&b->stmts, loc);
             } else {
-                error(ruby_parser::dclass::PatternInterpInVarName, loc);
+                error_without_recovery(ruby_parser::dclass::PatternInterpInVarName, loc);
             }
         }
         return res;
@@ -1707,6 +1827,22 @@ public:
                parser::isa_node<DString>(&node) || parser::isa_node<Symbol>(&node) ||
                parser::isa_node<DSymbol>(&node) || parser::isa_node<Regexp>(&node) || parser::isa_node<Array>(&node) ||
                parser::isa_node<Hash>(&node);
+    }
+
+    void checkAssignmentToNumberedParameters(std::string_view name, core::LocOffsets loc) {
+        if (driver_->lex.context.allowNumparams && isNumberedParameterName(name) &&
+            driver_->numparam_stack.seen_numparams()) {
+            std::cout << "Assignment error" << std::endl;
+            core::Loc location = core::Loc(file_, loc);
+            if (auto e = gs_.beginError(location, core::errors::Parser::AssignmentToNumparamError)) {
+                e.setHeader("cannot assign to numbered parameter `{}`", name);
+                e.addErrorNote("Reserved numbered parameter names are not allowed starting with Ruby 3.0. Use `{}` to "
+                               "disable this check",
+                               "--suppress-error-code=2004");
+            }
+        } else {
+            checkReservedForNumberedParameters(name, loc);
+        }
     }
 
     void checkReservedForNumberedParameters(std::string_view name, core::LocOffsets loc) {
@@ -1869,6 +2005,11 @@ ForeignPtr case_(SelfPtr builder, const token *case_, ForeignPtr expr, const nod
                                          build->cast_node(elseBody), end));
 }
 
+ForeignPtr case_error(SelfPtr builder, const token *case_, ForeignPtr cond, const token *end) {
+    auto build = cast_builder(builder);
+    return build->toForeign(build->case_error(case_, build->cast_node(cond), end));
+}
+
 ForeignPtr case_match(SelfPtr builder, const token *case_, ForeignPtr expr, const node_list *inBodies,
                       const token *elseTok, ForeignPtr elseBody, const token *end) {
     auto build = cast_builder(builder);
@@ -1951,15 +2092,25 @@ ForeignPtr def_class(SelfPtr builder, const token *class_, ForeignPtr name, cons
                                              build->cast_node(body), end_));
 }
 
-ForeignPtr defMethod(SelfPtr builder, const token *def, const token *name, ForeignPtr args, ForeignPtr body,
-                     const token *end) {
+ForeignPtr defMethod(SelfPtr builder, ForeignPtr defHead, ForeignPtr args, ForeignPtr body, const token *end) {
     auto build = cast_builder(builder);
-    return build->toForeign(build->defMethod(def, name, build->cast_node(args), build->cast_node(body), end));
+    return build->toForeign(
+        build->defMethod(build->cast_node(defHead), build->cast_node(args), build->cast_node(body), end));
 }
 
 ForeignPtr defModule(SelfPtr builder, const token *module, ForeignPtr name, ForeignPtr body, const token *end_) {
     auto build = cast_builder(builder);
     return build->toForeign(build->defModule(module, build->cast_node(name), build->cast_node(body), end_));
+}
+
+ForeignPtr defnHead(SelfPtr builder, const token *def, const token *name) {
+    auto build = cast_builder(builder);
+    return build->toForeign(build->defnHead(def, name));
+}
+
+ForeignPtr defnHeadError(SelfPtr builder, const token *def) {
+    auto build = cast_builder(builder);
+    return build->toForeign(build->defnHeadError(def));
 }
 
 ForeignPtr def_sclass(SelfPtr builder, const token *class_, const token *lshft_, ForeignPtr expr, ForeignPtr body,
@@ -1973,10 +2124,15 @@ ForeignPtr defsHead(SelfPtr builder, const token *def, ForeignPtr definee, const
     return build->toForeign(build->defsHead(def, build->cast_node(definee), dot, name));
 }
 
-ForeignPtr defEndlessMethod(SelfPtr builder, const token *def, const token *name, ForeignPtr args, const token *equal,
-                            ForeignPtr body) {
+ForeignPtr defsHeadError(SelfPtr builder, const token *def, ForeignPtr definee, const token *dot) {
     auto build = cast_builder(builder);
-    return build->toForeign(build->defEndlessMethod(def, name, build->cast_node(args), equal, build->cast_node(body)));
+    return build->toForeign(build->defsHeadError(def, build->cast_node(definee), dot));
+}
+
+ForeignPtr defEndlessMethod(SelfPtr builder, ForeignPtr defHead, ForeignPtr args, const token *equal, ForeignPtr body) {
+    auto build = cast_builder(builder);
+    return build->toForeign(
+        build->defEndlessMethod(build->cast_node(defHead), build->cast_node(args), equal, build->cast_node(body)));
 }
 
 ForeignPtr defEndlessSingleton(SelfPtr builder, ForeignPtr defHead, ForeignPtr args, const token *equal,
@@ -2328,6 +2484,11 @@ ForeignPtr pair_keyword(SelfPtr builder, const token *key, ForeignPtr value) {
     return build->toForeign(build->pair_keyword(key, build->cast_node(value)));
 }
 
+ForeignPtr pair_label(SelfPtr builder, const token *key) {
+    auto build = cast_builder(builder);
+    return build->toForeign(build->pair_label(key));
+}
+
 ForeignPtr pair_quoted(SelfPtr builder, const token *begin, const node_list *parts, const token *end,
                        ForeignPtr value) {
     auto build = cast_builder(builder);
@@ -2465,6 +2626,11 @@ ForeignPtr true_(SelfPtr builder, const token *tok) {
     return build->toForeign(build->true_(tok));
 }
 
+ForeignPtr truncateBodyStmt(SelfPtr builder, ForeignPtr body, const token *truncateToken) {
+    auto build = cast_builder(builder);
+    return build->toForeign(build->truncateBodyStmt(build->cast_node(body), truncateToken));
+}
+
 ForeignPtr unary_op(SelfPtr builder, const token *oper, ForeignPtr receiver) {
     auto build = cast_builder(builder);
     return build->toForeign(build->unary_op(oper, build->cast_node(receiver)));
@@ -2503,7 +2669,7 @@ ForeignPtr xstring_compose(SelfPtr builder, const token *begin, const node_list 
 
 namespace sorbet::parser {
 
-unique_ptr<Node> Builder::build(ruby_parser::base_driver *driver, bool trace) {
+unique_ptr<Node> Builder::build(ruby_parser::base_driver *driver, bool trace) const {
     impl_->driver_ = driver;
     return impl_->cast_node(driver->parse(impl_.get(), trace));
 }
@@ -2532,6 +2698,7 @@ struct ruby_parser::builder Builder::interface = {
     call_method,
     call_method_error,
     case_,
+    case_error,
     case_match,
     character,
     complex,
@@ -2551,8 +2718,11 @@ struct ruby_parser::builder Builder::interface = {
     defEndlessSingleton,
     defMethod,
     defModule,
+    defnHead,
+    defnHeadError,
     def_sclass,
     defsHead,
+    defsHeadError,
     defSingleton,
     encodingLiteral,
     error_node,
@@ -2618,6 +2788,7 @@ struct ruby_parser::builder Builder::interface = {
     p_ident,
     pair,
     pair_keyword,
+    pair_label,
     pair_quoted,
     pin,
     postexe,
@@ -2644,6 +2815,7 @@ struct ruby_parser::builder Builder::interface = {
     symbols_compose,
     ternary,
     true_,
+    truncateBodyStmt,
     unary_op,
     undefMethod,
     unless_guard,

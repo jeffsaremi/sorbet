@@ -98,7 +98,7 @@ mkdir -p "$BUILD_DIR"
     echo >&2 "Installer checksum mismatch:"
     echo >&2 "  Expected: $expected_sha"
     echo >&2 "  Actual:   $actual_sha"
-    echo >&2 "To accept this mismatch, update the SHA in the WORKSPACE file and re-run."
+    echo >&2 "To accept this mismatch, update $bazel_installer_sha_variable in the WORKSPACE file and re-run."
     exit 1
   fi
 

@@ -72,17 +72,21 @@ module SorbetBenchmarks
       end
 
       type = T::Utils.coerce(T.nilable(Integer))
-      time_block("T::Types::Union#valid?", iterations_in_block: 10) do
+      time_block("T.nilable(Integer).valid?", iterations_in_block: 5) do
         type.valid?(0)
         type.valid?(1)
         type.valid?(2)
         type.valid?(nil)
         type.valid?(false)
+      end
+
+      type = T::Utils.coerce(T.any(Integer, Float, T::Boolean))
+      time_block("T.any(Integer, Float, T::Boolean).valid?", iterations_in_block: 5) do
         type.valid?(0)
         type.valid?(1)
         type.valid?(2)
         type.valid?(nil)
-        type.valid?(false)
+        type.valid?('hi')
       end
 
       time_block("T.let(..., Integer)") do
@@ -93,6 +97,27 @@ module SorbetBenchmarks
       time_block("sig {params(x: Integer).void}") do
         integer_param(0)
         integer_param(1)
+      end
+
+      my_proc = proc {}
+      time_block("sig {params(x: Integer, blk: T.proc.void)} -- block literal") do
+        integer_param_and_block(0) {}
+        integer_param_and_block(0) {}
+      end
+
+      time_block("sig {params(x: Integer, blk: T.proc.void)} -- block pass") do
+        integer_param_and_block(0, &my_proc)
+        integer_param_and_block(0, &my_proc)
+      end
+
+      time_block("sig {params(x: Integer, blk: T.nilable(T.proc.void))} -- block literal") do
+        integer_param_and_nilable_block(0) {}
+        integer_param_and_nilable_block(0) {}
+      end
+
+      time_block("sig {params(x: Integer, blk: T.nilable(T.proc.void))} -- block pass") do
+        integer_param_and_nilable_block(0, &my_proc)
+        integer_param_and_nilable_block(0, &my_proc)
       end
 
       time_block("T.let(..., T.nilable(Integer))") do
@@ -130,21 +155,21 @@ module SorbetBenchmarks
         arg_plus_kwargs(:bar, x: 1)
       end
 
-      time_block(".bind(example).call") do
-        Object.instance_method(:class).bind(example).call
+      time_block("direct call Object#class") do
+        example.class
+        example.class
+      end
+
+      class_method = Object.instance_method(:class)
+      time_block(".bind(example).call Object#class") do
+        class_method.bind(example).call
+        class_method.bind(example).call
       end
 
       if T::Configuration::AT_LEAST_RUBY_2_7
-        time_block(".bind_call(example)") do
-          Object.instance_method(:class).bind_call(example)
-        end
-
-        time_block("if AT_LEAST_RUBY_2_7; .bind_call(example); end") do
-          if T::Configuration::AT_LEAST_RUBY_2_7
-            Object.instance_method(:class).bind_call(example)
-          else
-            raise "must be run on 2.7"
-          end
+        time_block(".bind_call(example) Object#class") do
+          class_method.bind_call(example)
+          class_method.bind_call(example)
         end
       else
         puts 'skipping UnboundMethod#bind_call tests (re-run on Ruby 2.7+)'
@@ -156,6 +181,12 @@ module SorbetBenchmarks
 
     sig {params(x: Integer).void}
     def self.integer_param(x); end
+
+    sig {params(x: Integer, blk: T.proc.void).void}
+    def self.integer_param_and_block(x, &blk); end
+
+    sig {params(x: Integer, blk: T.nilable(T.proc.void)).void}
+    def self.integer_param_and_nilable_block(x, &blk); end
 
     sig {params(x: T.nilable(Integer)).void}
     def self.nilable_integer_param(x); end

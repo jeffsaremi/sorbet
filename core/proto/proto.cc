@@ -3,6 +3,7 @@
 #include <google/protobuf/io/zero_copy_stream_impl.h>
 #include <google/protobuf/util/type_resolver_util.h>
 
+#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "common/Counters_impl.h"
 #include "common/Random.h"
@@ -36,6 +37,9 @@ com::stripe::rubytyper::Name Proto::toProto(const GlobalState &gs, NameRef name)
                 case UniqueNameKind::MangleRename:
                     protoName.set_unique(com::stripe::rubytyper::Name::MANGLE_RENAME);
                     break;
+                case UniqueNameKind::MangleRenameOverload:
+                    protoName.set_unique(com::stripe::rubytyper::Name::MANGLE_RENAME_OVERLOAD);
+                    break;
                 case UniqueNameKind::Singleton:
                     protoName.set_unique(com::stripe::rubytyper::Name::SINGLETON);
                     break;
@@ -59,9 +63,6 @@ com::stripe::rubytyper::Name Proto::toProto(const GlobalState &gs, NameRef name)
                     break;
                 case UniqueNameKind::Packager:
                     protoName.set_unique(com::stripe::rubytyper::Name::PACKAGER);
-                    break;
-                case UniqueNameKind::PackagerPrivate:
-                    protoName.set_unique(com::stripe::rubytyper::Name::PACKAGER_PRIVATE);
                     break;
             }
             break;
@@ -147,7 +148,7 @@ com::stripe::rubytyper::Symbol Proto::toProto(const GlobalState &gs, SymbolRef s
             *symbolProto.add_children() = toProto(gs, pair.second, showFull);
         }
     } else if (sym.isMethod()) {
-        for (auto typeArg : sym.asMethodRef().data(gs)->typeArguments) {
+        for (auto typeArg : sym.asMethodRef().data(gs)->typeArguments()) {
             if (!typeArg.exists()) {
                 continue;
             }
@@ -162,27 +163,31 @@ com::stripe::rubytyper::Symbol Proto::toProto(const GlobalState &gs, SymbolRef s
     return symbolProto;
 }
 
-com::stripe::rubytyper::Type::Literal Proto::toProto(const GlobalState &gs, const LiteralType &lit) {
+com::stripe::rubytyper::Type::Literal Proto::toProto(const GlobalState &gs, const NamedLiteralType &lit) {
     com::stripe::rubytyper::Type::Literal proto;
 
     switch (lit.literalKind) {
-        case LiteralType::LiteralTypeKind::Integer:
-            proto.set_kind(com::stripe::rubytyper::Type::Literal::INTEGER);
-            proto.set_integer(lit.asInteger());
-            break;
-        case LiteralType::LiteralTypeKind::String:
+        case NamedLiteralType::LiteralTypeKind::String:
             proto.set_kind(com::stripe::rubytyper::Type::Literal::STRING);
-            proto.set_string(lit.asName(gs).show(gs));
+            proto.set_string(lit.asName().show(gs));
             break;
-        case LiteralType::LiteralTypeKind::Symbol:
+        case NamedLiteralType::LiteralTypeKind::Symbol:
             proto.set_kind(com::stripe::rubytyper::Type::Literal::SYMBOL);
-            proto.set_symbol(lit.asName(gs).show(gs));
-            break;
-        case LiteralType::LiteralTypeKind::Float:
-            proto.set_kind(com::stripe::rubytyper::Type::Literal::FLOAT);
-            proto.set_float_(lit.asFloat());
+            proto.set_symbol(lit.asName().show(gs));
             break;
     }
+    return proto;
+}
+
+com::stripe::rubytyper::Type::LiteralInteger Proto::toProto(const GlobalState &gs, const IntegerLiteralType &lit) {
+    com::stripe::rubytyper::Type::LiteralInteger proto;
+    proto.set_integer(lit.value);
+    return proto;
+}
+
+com::stripe::rubytyper::Type::LiteralFloat Proto::toProto(const GlobalState &gs, const FloatLiteralType &lit) {
+    com::stripe::rubytyper::Type::LiteralFloat proto;
+    proto.set_float_(lit.value);
     return proto;
 }
 
@@ -220,9 +225,17 @@ com::stripe::rubytyper::Type Proto::toProto(const GlobalState &gs, const TypePtr
                 *proto.mutable_shape()->add_values() = toProto(gs, v);
             }
         },
-        [&](const LiteralType &t) {
+        [&](const NamedLiteralType &t) {
             proto.set_kind(com::stripe::rubytyper::Type::LITERAL);
             *proto.mutable_literal() = toProto(gs, t);
+        },
+        [&](const IntegerLiteralType &t) {
+            proto.set_kind(com::stripe::rubytyper::Type::LITERALINTEGER);
+            *proto.mutable_literalinteger() = toProto(gs, t);
+        },
+        [&](const FloatLiteralType &t) {
+            proto.set_kind(com::stripe::rubytyper::Type::LITERALINTEGER);
+            *proto.mutable_literalfloat() = toProto(gs, t);
         },
         [&](const TupleType &t) {
             proto.set_kind(com::stripe::rubytyper::Type::TUPLE);
@@ -343,7 +356,7 @@ com::stripe::rubytyper::File::StrictLevel strictToProto(core::StrictLevel strict
             return com::stripe::rubytyper::File::StrictLevel::File_StrictLevel_None;
         case core::StrictLevel::Internal:
             // we should never attempt to serialize any state that had internal errors
-            Exception::raise("Should never happen");
+            Exception::raise("Should never attempt to serialize StrictLevel::Internal to a proto");
         case core::StrictLevel::Ignore:
             return com::stripe::rubytyper::File::StrictLevel::File_StrictLevel_Ignore;
         case core::StrictLevel::False:
@@ -378,8 +391,14 @@ com::stripe::rubytyper::FileTable Proto::filesToProto(const GlobalState &gs, boo
     com::stripe::rubytyper::FileTable files;
     for (int i = 1; i < gs.filesUsed(); ++i) {
         core::FileRef file(i);
-        if (!showFull && file.data(gs).isPayload()) {
-            continue;
+        if (file.data(gs).isPayload()) {
+            if (!showFull) {
+                continue;
+            } else if (gs.censorForSnapshotTests && i > 10) {
+                // Only show the first 10 payload files for the sake of snapshot tests, so that
+                // adding a new RBI file to the payload doesn't require updating snapshot tests.
+                continue;
+            }
         }
         auto *entry = files.add_files();
         auto path_view = file.data(gs).path();

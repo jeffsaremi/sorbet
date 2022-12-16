@@ -2,6 +2,7 @@
 #define RUBY_TYPER_LSP_REQUESTS_CODE_ACTION_H
 
 #include "main/lsp/LSPTask.h"
+#include "main/lsp/json_types.h"
 
 namespace sorbet::realmain::lsp {
 class CodeActionParams;

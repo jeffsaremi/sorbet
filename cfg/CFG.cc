@@ -130,6 +130,8 @@ CFG::ReadsAndWrites CFG::findAllReadsAndWrites(core::Context ctx) {
                 blockReads.add(v->send.id());
             } else if (auto *v = cast_instruction<YieldLoadArg>(bind.value)) {
                 blockReads.add(v->yieldParam.variable.id());
+            } else if (auto *v = cast_instruction<KeepAlive>(bind.value)) {
+                blockReads.add(v->what.id());
             }
 
             if (!blockReads.contains(bind.bind.variable.id())) {
@@ -147,9 +149,9 @@ CFG::ReadsAndWrites CFG::findAllReadsAndWrites(core::Context ctx) {
     {
         Timer timeit(ctx.state.tracer(), "privates1");
 
+        UIntSet blockReadsAndWrites(this->numLocalVariables());
         for (auto blockId = 0; blockId < maxBasicBlockId; blockId++) {
-            UIntSet blockReadsAndWrites = target.reads[blockId];
-            blockReadsAndWrites.add(target.writes[blockId]);
+            blockReadsAndWrites.overwriteWithUnion(target.reads[blockId], target.writes[blockId]);
             blockReadsAndWrites.forEach([&usageCounts, blockId](uint32_t local) -> void {
                 if (usageCounts[local].first == 0) {
                     usageCounts[local].second = blockId;
@@ -218,17 +220,16 @@ string CFG::toString(const core::GlobalState &gs) const {
         auto shape = basicBlock->id == 0 ? "invhouse" : basicBlock->id == 1 ? "parallelogram" : "rectangle";
         // whole block red if whole block is dead
         auto color = basicBlock->firstDeadInstructionIdx == 0 ? "red" : "black";
-        fmt::format_to(
-            std::back_inserter(buf),
-            "    \"bb{}_{}\" [\n"
-            "        shape = {};\n"
-            "        color = {};\n"
-            "        label = \"{}\\l\"\n"
-            "    ];\n\n"
-            "    \"bb{}_{}\" -> \"bb{}_{}\" [style=\"bold\"];\n",
-            symbolName, basicBlock->id, shape, color,
-            fmt::map_join(lines.begin(), lines.end(), "\\l", [](auto line) -> string { return absl::CEscape(line); }),
-            symbolName, basicBlock->id, symbolName, basicBlock->bexit.thenb->id);
+        fmt::format_to(std::back_inserter(buf),
+                       "    \"bb{}_{}\" [\n"
+                       "        shape = {};\n"
+                       "        color = {};\n"
+                       "        label = \"{}\\l\"\n"
+                       "    ];\n\n"
+                       "    \"bb{}_{}\" -> \"bb{}_{}\" [style=\"bold\"];\n",
+                       symbolName, basicBlock->id, shape, color,
+                       fmt::map_join(lines, "\\l", [](auto line) -> string { return absl::CEscape(line); }), symbolName,
+                       basicBlock->id, symbolName, basicBlock->bexit.thenb->id);
 
         if (basicBlock->bexit.thenb != basicBlock->bexit.elseb) {
             fmt::format_to(std::back_inserter(buf), "    \"bb{}_{}\" -> \"bb{}_{}\" [style=\"tapered\"];\n\n",
@@ -273,17 +274,16 @@ string CFG::showRaw(core::Context ctx) const {
         auto shape = basicBlock->id == 0 ? "invhouse" : basicBlock->id == 1 ? "parallelogram" : "rectangle";
         // whole block red if whole block is dead
         auto color = basicBlock->firstDeadInstructionIdx == 0 ? "red" : "black";
-        fmt::format_to(
-            std::back_inserter(buf),
-            "    \"bb{}_{}\" [\n"
-            "        shape = {};\n"
-            "        color = {};\n"
-            "        label = \"{}\\l\"\n"
-            "    ];\n\n"
-            "    \"bb{}_{}\" -> \"bb{}_{}\" [style=\"bold\"];\n",
-            symbolName, basicBlock->id, shape, color,
-            fmt::map_join(lines.begin(), lines.end(), "\\l", [](auto line) -> string { return absl::CEscape(line); }),
-            symbolName, basicBlock->id, symbolName, basicBlock->bexit.thenb->id);
+        fmt::format_to(std::back_inserter(buf),
+                       "    \"bb{}_{}\" [\n"
+                       "        shape = {};\n"
+                       "        color = {};\n"
+                       "        label = \"{}\\l\"\n"
+                       "    ];\n\n"
+                       "    \"bb{}_{}\" -> \"bb{}_{}\" [style=\"bold\"];\n",
+                       symbolName, basicBlock->id, shape, color,
+                       fmt::map_join(lines, "\\l", [](auto line) -> string { return absl::CEscape(line); }), symbolName,
+                       basicBlock->id, symbolName, basicBlock->bexit.thenb->id);
 
         if (basicBlock->bexit.thenb != basicBlock->bexit.elseb) {
             fmt::format_to(std::back_inserter(buf), "    \"bb{}_{}\" -> \"bb{}_{}\" [style=\"tapered\"];\n\n",
@@ -294,12 +294,69 @@ string CFG::showRaw(core::Context ctx) const {
     return to_string(buf);
 }
 
+namespace {
+const cfg::Send *looksLikeUpdateKnowledgeSend(const cfg::CFG &inWhat, const cfg::Binding &bind, LocalRef expectedRecv) {
+    if (bind.bind.variable != expectedRecv) {
+        return nullptr;
+    }
+
+    auto send = cfg::cast_instruction<cfg::Send>(bind.value);
+    if (send == nullptr) {
+        return nullptr;
+    }
+
+    if (!send->recv.variable.isSyntheticTemporary(inWhat)) {
+        // Conservative heuristic. If the receiver is not synthetic, then the update knowledge
+        // method was not computed by some sub expression but instead called directly on a
+        // Ruby-level variable. Therefore it wouldn't be useful to report a "maybe factor this to a
+        // variable" error for this call site.
+        return nullptr;
+    }
+
+    if (!send->fun.isUpdateKnowledgeName()) {
+        return nullptr;
+    }
+
+    return send;
+}
+
+} // namespace
+
+optional<BasicBlock::BlockExitCondInfo> BasicBlock::maybeGetUpdateKnowledgeReceiver(const cfg::CFG &inWhat) const {
+    if (this->exprs.empty()) {
+        return nullopt;
+    }
+
+    // Conservative heuristic, maybe we can make this smarter
+    // (Currently, only detect cases where the branch condition was the last thing computed)
+    auto &lastBinding = this->exprs.back();
+    auto send = looksLikeUpdateKnowledgeSend(inWhat, lastBinding, this->bexit.cond.variable);
+    if (send == nullptr) {
+        return nullopt;
+    }
+
+    if (send->fun == core::Names::bang() && this->exprs.size() >= 2) {
+        // Heuristic, because it's overwhelmingly common to see `!x.foo.nil?`, in which case the
+        // relevent receiver is the second-last, not the last, send binding.
+        auto bangRecv = send->recv.variable;
+        auto &secondLastBinding = this->exprs[this->exprs.size() - 2];
+        auto secondLastSend = looksLikeUpdateKnowledgeSend(inWhat, secondLastBinding, bangRecv);
+
+        if (secondLastSend != nullptr) {
+            send = secondLastSend;
+        }
+    }
+
+    // VariableUseSite copy constructor is deleted, have to manually make a shallow copy
+    auto recv = VariableUseSite{send->recv.variable, send->recv.type};
+    return make_optional<BlockExitCondInfo>(move(recv), send->receiverLoc, send->fun);
+}
+
 string BasicBlock::toString(const core::GlobalState &gs, const CFG &cfg) const {
     fmt::memory_buffer buf;
     fmt::format_to(std::back_inserter(buf), "block[id={}, rubyRegionId={}]({})\n", this->id, this->rubyRegionId,
                    fmt::map_join(
-                       this->args.begin(), this->args.end(),
-                       ", ", [&](const auto &arg) -> auto { return arg.toString(gs, cfg); }));
+                       this->args, ", ", [&](const auto &arg) -> auto { return arg.toString(gs, cfg); }));
 
     if (this->outerLoops > 0) {
         fmt::format_to(std::back_inserter(buf), "outerLoops: {}\n", this->outerLoops);
@@ -316,8 +373,7 @@ string BasicBlock::toTextualString(const core::GlobalState &gs, const CFG &cfg) 
     fmt::format_to(std::back_inserter(buf), "bb{}[rubyRegionId={}, firstDead={}]({}):\n", this->id, this->rubyRegionId,
                    this->firstDeadInstructionIdx,
                    fmt::map_join(
-                       this->args.begin(), this->args.end(),
-                       ", ", [&](const auto &arg) -> auto { return arg.toString(gs, cfg); }));
+                       this->args, ", ", [&](const auto &arg) -> auto { return arg.toString(gs, cfg); }));
 
     if (this->outerLoops > 0) {
         fmt::format_to(std::back_inserter(buf), "    # outerLoops: {}\n", this->outerLoops);
@@ -347,10 +403,9 @@ string BasicBlock::toTextualString(const core::GlobalState &gs, const CFG &cfg) 
 
 string BasicBlock::showRaw(const core::GlobalState &gs, const CFG &cfg) const {
     fmt::memory_buffer buf;
-    fmt::format_to(
-        std::back_inserter(buf), "block[id={}]({})\n", this->id,
-        fmt::map_join(
-            this->args.begin(), this->args.end(), ", ", [&](const auto &arg) -> auto { return arg.showRaw(gs, cfg); }));
+    fmt::format_to(std::back_inserter(buf), "block[id={}]({})\n", this->id,
+                   fmt::map_join(
+                       this->args, ", ", [&](const auto &arg) -> auto { return arg.showRaw(gs, cfg); }));
 
     if (this->outerLoops > 0) {
         fmt::format_to(std::back_inserter(buf), "outerLoops: {}\n", this->outerLoops);

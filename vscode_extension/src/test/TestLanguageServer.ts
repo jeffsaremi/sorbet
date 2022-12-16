@@ -2,8 +2,8 @@ import {
   createConnection,
   ProposedFeatures,
   InitializeParams,
-  TextDocumentSyncKind
-} from "vscode-languageserver";
+  TextDocumentSyncKind,
+} from "vscode-languageserver/node";
 import TestLanguageServerSpecialURIs from "./TestLanguageServerSpecialURIs";
 
 // Create a connection for the server. The connection uses Node's IPC as a transport.
@@ -16,15 +16,15 @@ connection.onInitialize((_: InitializeParams) => {
       textDocumentSync: TextDocumentSyncKind.Full,
       // Tell the client that the server supports code completion
       completionProvider: {
-        resolveProvider: true
-      }
-    }
+        resolveProvider: true,
+      },
+    },
   };
 });
 
 connection.onInitialized(() => {});
 
-connection.onHover(e => {
+connection.onHover((e) => {
   switch (e.textDocument.uri) {
     case TestLanguageServerSpecialURIs.SUCCESS:
       return { contents: TestLanguageServerSpecialURIs.SUCCESS };

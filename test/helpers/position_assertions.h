@@ -115,7 +115,7 @@ public:
 };
 
 // # ^^^ usage: symbol
-class UsageAssertion final : public RangeAssertion {
+class UsageAssertion : public RangeAssertion {
 public:
     static std::shared_ptr<UsageAssertion> make(std::string_view filename, std::unique_ptr<Range> &range,
                                                 int assertionLine, std::string_view assertionContents,
@@ -138,6 +138,28 @@ public:
                    std::vector<int> versions);
 
     std::string toString() const override;
+};
+
+// # ^^^ import: symbol
+class ImportAssertion final : public UsageAssertion {
+public:
+    static std::shared_ptr<ImportAssertion> make(std::string_view filename, std::unique_ptr<Range> &range,
+                                                 int assertionLine, std::string_view assertionContents,
+                                                 std::string_view assertionType);
+
+    ImportAssertion(std::string_view filename, std::unique_ptr<Range> &range, int assertionLine,
+                    std::string_view symbol, std::vector<int> versions);
+};
+
+// # ^^^ importusage: symbol
+class ImportUsageAssertion final : public UsageAssertion {
+public:
+    static std::shared_ptr<ImportUsageAssertion> make(std::string_view filename, std::unique_ptr<Range> &range,
+                                                      int assertionLine, std::string_view assertionContents,
+                                                      std::string_view assertionType);
+
+    ImportUsageAssertion(std::string_view filename, std::unique_ptr<Range> &range, int assertionLine,
+                         std::string_view symbol, std::vector<int> versions);
 };
 
 // # some-property: foo
@@ -312,13 +334,24 @@ public:
     ApplyCodeActionAssertion(std::string_view filename, std::unique_ptr<Range> &range, int assertionLine,
                              std::string_view version, std::string_view title);
 
+    // method applies an edit and asserts results after each edit
     void check(const UnorderedMap<std::string, std::shared_ptr<core::File>> &sourceFileContents, LSPWrapper &wrapper,
                const CodeAction &codeAction);
 
+    // method applies all edits and asserts results after every edit is applied
+    void checkAll(const UnorderedMap<std::string, std::shared_ptr<core::File>> &sourceFileContents, LSPWrapper &wrapper,
+                  const CodeAction &codeAction);
+
     const std::string title;
     const std::string version;
+    std::optional<CodeActionKind> kind;
 
     std::string toString() const override;
+
+private:
+    std::optional<std::pair<std::string, std::string>> expectedFile();
+    void assertResults(std::string expectedPath, std::string expectedContents, std::string actualContents);
+    std::unique_ptr<TextDocumentEdit> sortEdits(std::unique_ptr<TextDocumentEdit> changes);
 };
 
 // ^ apply-rename: [version] newName
@@ -334,12 +367,15 @@ public:
                          LSPWrapper &wrapper, int &nextId, std::string errorPrefix = "");
 
     ApplyRenameAssertion(std::string_view filename, std::unique_ptr<Range> &range, int assertionLine,
-                         std::string_view version, std::string newName, bool invalid, std::string expectedErrorMessage);
+                         std::string_view version, std::string newName, std::string placeholderText, bool invalid,
+                         std::string expectedErrorMessage);
 
     // The part between [..] in the assertion which specifies which `.[..].rbedited` file to compare against
     const std::string version;
     // New name for constant
     const std::string newName;
+    // The name of the thing being renamed
+    const std::string placeholderText;
     const bool invalid;
     const std::string expectedErrorMessage;
 
@@ -442,5 +478,22 @@ public:
     std::string toString() const override;
 };
 
+// # selective-apply-code-action: quickfix
+class StringPropertyAssertions final : public RangeAssertion {
+public:
+    static std::shared_ptr<StringPropertyAssertions> make(std::string_view filename, std::unique_ptr<Range> &range,
+                                                          int assertionLine, std::string_view assertionContents,
+                                                          std::string_view assertionType);
+
+    const std::string assertionType;
+    const std::vector<std::string> values;
+
+    static std::optional<std::vector<std::string>>
+    getValues(std::string_view type, const std::vector<std::shared_ptr<RangeAssertion>> &assertions);
+    StringPropertyAssertions(std::string_view filename, std::unique_ptr<Range> &range, int assertionLine,
+                             std::vector<std::string> values, std::string_view assertionType);
+
+    std::string toString() const override;
+};
 } // namespace sorbet::test
 #endif // TEST_HELPERS_POSITION_ASSERTIONS_H

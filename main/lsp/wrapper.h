@@ -9,8 +9,6 @@
 #include "spdlog/sinks/stdout_color_sinks.h"
 #include <string_view>
 
-namespace spd = spdlog;
-
 namespace sorbet {
 class WorkerPool;
 class KeyValueStore;
@@ -25,13 +23,13 @@ class LSPConfiguration;
 
 class LSPWrapper {
     // Bugfix: WorkerPool destructor assumes that logger is alive when it runs, so keep around logger until it finishes.
-    const std::shared_ptr<spd::logger> logger;
+    const std::shared_ptr<spdlog::logger> logger;
     /**
      * Sorbet assumes we 'own' the following three objects; keep them alive to avoid memory errors.
      */
     const std::unique_ptr<WorkerPool> workers;
-    const std::shared_ptr<spd::sinks::ansicolor_stderr_sink_mt> stderrColorSink;
-    const std::shared_ptr<spd::logger> typeErrorsConsole;
+    const std::shared_ptr<spdlog::sinks::ansicolor_stderr_sink_mt> stderrColorSink;
+    const std::shared_ptr<spdlog::logger> typeErrorsConsole;
 
 protected:
     const std::shared_ptr<LSPOutputToVector> output;
@@ -41,9 +39,9 @@ protected:
 
     /** Raw constructor. Note: Constructor is unwieldy so we can make class fields `const`. */
     LSPWrapper(std::unique_ptr<core::GlobalState> gs, std::shared_ptr<options::Options> opts,
-               std::shared_ptr<spd::logger> logger,
-               std::shared_ptr<spd::sinks::ansicolor_stderr_sink_mt> stderrColorSink,
-               std::shared_ptr<spd::logger> typeErrorsConsole, std::unique_ptr<KeyValueStore> kvstore,
+               std::shared_ptr<spdlog::logger> logger,
+               std::shared_ptr<spdlog::sinks::ansicolor_stderr_sink_mt> stderrColorSink,
+               std::shared_ptr<spdlog::logger> typeErrorsConsole, std::unique_ptr<KeyValueStore> kvstore,
                bool disableFastPath);
 
 public:
@@ -52,6 +50,7 @@ public:
         SignatureHelp = 7,
         DocumentHighlight = 9,
         DocumentFormat = 10,
+        ExperimentalFastPath = 11,
     };
 
     // N.B.: Sorbet assumes we 'own' this object; keep it alive to avoid memory errors.
@@ -77,14 +76,20 @@ public:
      * (For tests only) Retrieve the number of times typechecking has run.
      */
     int getTypecheckCount();
+
+    /**
+     * (For tests only) Set a flag that forces the slow path to block indefinitely after saving undo state. Setting
+     * this flag to `false` will immediately unblock any currently blocked slow paths.
+     */
+    void setSlowPathBlocked(bool blocked);
 };
 
 class SingleThreadedLSPWrapper final : public LSPWrapper {
     /** Raw constructor. Note: Constructor is unwieldy so we can make class fields `const`. */
     SingleThreadedLSPWrapper(std::unique_ptr<core::GlobalState> gs, std::shared_ptr<options::Options> opts,
-                             std::shared_ptr<spd::logger> logger,
-                             std::shared_ptr<spd::sinks::ansicolor_stderr_sink_mt> stderrColorSink,
-                             std::shared_ptr<spd::logger> typeErrorsConsole, std::unique_ptr<KeyValueStore> kvstore,
+                             std::shared_ptr<spdlog::logger> logger,
+                             std::shared_ptr<spdlog::sinks::ansicolor_stderr_sink_mt> stderrColorSink,
+                             std::shared_ptr<spdlog::logger> typeErrorsConsole, std::unique_ptr<KeyValueStore> kvstore,
                              bool disableFastPath);
 
 public:
@@ -123,9 +128,9 @@ class MultiThreadedLSPWrapper final : public LSPWrapper {
 
     /** Raw constructor. Note: Constructor is unwieldy so we can make class fields `const`. */
     MultiThreadedLSPWrapper(std::unique_ptr<core::GlobalState> gs, std::shared_ptr<options::Options> opts,
-                            std::shared_ptr<spd::logger> logger,
-                            std::shared_ptr<spd::sinks::ansicolor_stderr_sink_mt> stderrColorSink,
-                            std::shared_ptr<spd::logger> typeErrorsConsole, std::unique_ptr<KeyValueStore> kvstore,
+                            std::shared_ptr<spdlog::logger> logger,
+                            std::shared_ptr<spdlog::sinks::ansicolor_stderr_sink_mt> stderrColorSink,
+                            std::shared_ptr<spdlog::logger> typeErrorsConsole, std::unique_ptr<KeyValueStore> kvstore,
                             bool disableFastPath);
 
 public:

@@ -189,6 +189,28 @@ class T::Enum::Test::EnumTest < Critic::Unit::UnitTest
     end
   end
 
+  describe 'as_json' do
+    class CustomSerializedValue
+      def as_json(*args)
+        1234
+      end
+    end
+
+    class CustomSerializationEnum < T::Enum
+      enums do
+        SPADE = new(CustomSerializedValue.new)
+      end
+    end
+
+    it 'has a JSON representation' do
+      assert_equal("club", CardSuit::CLUB.as_json)
+    end
+
+    it 'asks for the JSON representation of the serialized value' do
+      assert_equal(1234, CustomSerializationEnum::SPADE.as_json)
+    end
+  end
+
   describe 'T::Props::CustomType integration' do
     it 'supports instance? checks on the Enum class' do
       assert_equal(true, CardSuit.instance?(CardSuit::SPADE))
@@ -347,7 +369,7 @@ class T::Enum::Test::EnumTest < Critic::Unit::UnitTest
   end
 
   describe 'string value conversion assertions' do
-    ENUM_CONVERSION_MSG = 'Implicit conversion of Enum instances to strings is not allowed. Call #serialize instead.'
+    ENUM_CONVERSION_MSG = /Implicit conversion of Enum instances to strings is not allowed. Call #serialize instead./.freeze
     before do
       T::Configuration.expects(:soft_assert_handler).never
     end
@@ -356,14 +378,14 @@ class T::Enum::Test::EnumTest < Critic::Unit::UnitTest
       ex = assert_raises(NoMethodError) do
         CardSuit::HEART.to_str
       end
-      assert_equal(ENUM_CONVERSION_MSG, ex.message)
+      assert_match(ENUM_CONVERSION_MSG, ex.message)
     end
 
     it 'raises an assertion if to_str is called (implicitly) and also returns the serialized value' do
       ex = assert_raises(NoMethodError) do
         'foo ' + CardSuit::HEART
       end
-      assert_equal(ENUM_CONVERSION_MSG, ex.message)
+      assert_match(ENUM_CONVERSION_MSG, ex.message)
     end
   end
 

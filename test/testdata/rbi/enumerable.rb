@@ -1,4 +1,5 @@
 # typed: true
+extend T::Sig
 
 # You can return any Comparable in the block *_by (and String is one)
 [1, 3, 20].min_by {|n| n.to_s}
@@ -18,7 +19,7 @@
 [1, 3, 20].minmax_by {|n| [n.to_s, [1, 2]]}
 [1, 3, 20].sort_by {|n| [n.to_s, [1, 2]]}
 
-T.assert_type!([1].lazy, Enumerator::Lazy[Integer])
+T.assert_type!([1].lazy, T::Enumerator::Lazy[Integer])
 T.assert_type!([1, 2].filter_map { |x| x.odd? ? x.to_f : x.to_s }, T::Array[T.any(Float, String)])
 T.assert_type!([1, 2, "3", nil].tally, T::Hash[T.nilable(T.any(Integer, String)), Integer])
 
@@ -52,3 +53,22 @@ T.reveal_type([1,2].detect(-> {}) {|x| false}) # error: Revealed type: `T.untype
 T.reveal_type([1,2].detect(-> {})) # error: Revealed type: `T::Enumerator[T.untyped]`
 T.reveal_type([1,2].detect(p) {|x| false}) # error: Revealed type: `Integer`
 T.reveal_type([1,2].detect(p)) # error: Revealed type: `T::Enumerator[Integer]`
+
+sig {params(xs: T::Array[Integer]).void}
+def example(xs)
+  res = xs.reduce('') do |acc, x|
+    T.reveal_type(acc) # error: `String`
+    T.reveal_type(x) # error: `Integer`
+    new_acc = acc + x.to_s
+    T.reveal_type(new_acc) # error: `String`
+  end
+  T.reveal_type(res) # error: `String`
+
+  res = xs.inject('') do |acc, x|
+    T.reveal_type(acc) # error: `T.untyped`
+    T.reveal_type(x) # error: `Integer`
+    new_acc = acc + x.to_s
+    T.reveal_type(new_acc) # error: `T.untyped`
+  end
+  T.reveal_type(res) # error: `T.untyped`
+end

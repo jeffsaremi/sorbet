@@ -4,15 +4,18 @@
 #include "absl/strings/str_replace.h"
 #include "absl/strings/str_split.h"
 #include "core/lsp/QueryResponse.h"
+#include "main/lsp/AbstractRenamer.h"
+#include "main/lsp/LSPLoop.h"
+#include "main/lsp/LSPQuery.h"
 #include "main/lsp/ShowOperation.h"
 #include "main/lsp/json_types.h"
-#include "main/lsp/lsp.h"
 #include <stdio.h>
 using namespace std;
 
 namespace sorbet::realmain::lsp {
 
 namespace {
+
 bool isValidRenameLocation(const core::SymbolRef &symbol, const core::GlobalState &gs,
                            unique_ptr<ResponseMessage> &response) {
     auto locs = symbol.locs(gs);
@@ -35,149 +38,45 @@ bool isValidRenameLocation(const core::SymbolRef &symbol, const core::GlobalStat
     return true;
 }
 
-// Follow superClass links until we find the highest class that contains the given method. In other words we find the
-// "root" of the tree of classes that define a method.
-core::ClassOrModuleRef findRootClassWithMethod(const core::GlobalState &gs, core::ClassOrModuleRef klass,
-                                               core::NameRef methodName) {
-    auto root = klass;
-    while (true) {
-        auto tmp = root.data(gs)->superClass();
-        ENFORCE(tmp.exists()); // everything derives from Kernel::Object so we can't ever reach the actual top type
-        if (!tmp.exists() || !(tmp.data(gs)->findMember(gs, methodName).exists())) {
-            break;
-        }
-        root = tmp;
-    }
-    return root;
-}
-
-class UniqueSymbolQueue {
+class LocalRenamer : public AbstractRenamer {
 public:
-    UniqueSymbolQueue() {}
-
-    bool tryEnqueue(core::SymbolRef s) {
-        auto insertResult = set.insert(s);
-        bool isNew = insertResult.second;
-        if (isNew) {
-            symbols.emplace_back(s);
+    LocalRenamer(const core::GlobalState &gs, const LSPConfiguration &config, const string oldName,
+                 const string newName, std::vector<core::Loc> localUsages)
+        : AbstractRenamer(gs, config, oldName, newName), localUsages(localUsages) {
+        // If the name is the same as before or empty, return an error. VS Code already prevents this on its own, but
+        // other IDEs might not
+        if (newName.empty()) {
+            invalid = true;
+            error = "The new name must not be empty.";
+            return;
         }
-        return isNew;
     }
 
-    core::SymbolRef pop() {
-        if (!symbols.empty()) {
-            auto s = symbols.front();
-            symbols.pop_front();
-            return s;
+    ~LocalRenamer() {}
+    void rename(unique_ptr<core::lsp::QueryResponse> &response, const core::SymbolRef originalSymbol) override {
+        if (invalid) {
+            return;
         }
-        return core::Symbols::noSymbol();
+
+        string source;
+
+        for (auto &localUsage : localUsages) {
+            source = localUsage.source(gs).value();
+            edits[localUsage] = source[source.length() - 1] == ':' ? newName + ":" : newName;
+        }
     }
+
+    void addSymbol(const core::SymbolRef symbol) override {}
 
 private:
-    deque<core::SymbolRef> symbols;
-    UnorderedSet<core::SymbolRef> set;
+    std::vector<core::Loc> localUsages;
 };
 
-// Add subclass-related methods (methods overriding and overridden by `symbol`) to the `methods` vector.
-void addSubclassRelatedMethods(const core::GlobalState &gs, core::MethodRef symbol, UniqueSymbolQueue &methods) {
-    auto symbolData = symbol.data(gs);
-
-    // We have to check for methods as part of a class hierarchy: Follow superClass() links till we find the root;
-    // then find the full tree; then look for methods with the same name as ours; then find all references to all
-    // those methods and rename them.
-    auto symbolClass = symbol.enclosingClass(gs);
-
-    // We have to be careful to follow superclass links only as long as we find a method that `symbol` overrides.
-    // Otherwise we will find unrelated methods and rename them even though they don't need to be (see the
-    // method_class_hierarchy test case for an example).
-    auto root = findRootClassWithMethod(gs, symbolClass, symbolData->name);
-
-    // Scans whole symbol table. This is slow, and we might need to make this faster eventually.
-    auto includeRoot = true;
-    auto subclasses = getSubclassesSlow(gs, root, includeRoot);
-
-    // find the target method definition in each subclass
-    for (auto c : subclasses) {
-        auto classSymbol = c.data(gs);
-        auto member = classSymbol->findMethod(gs, symbolData->name);
-        if (!member.exists()) {
-            continue;
-        }
-        methods.tryEnqueue(member);
-    }
-}
-
-// Add methods that are related because of dispatching via secondary components in sends (union types).
-void addDispatchRelatedMethods(const core::GlobalState &gs, const core::DispatchResult *dispatchResult,
-                               UniqueSymbolQueue &methods) {
-    for (const core::DispatchResult *dr = dispatchResult; dr != nullptr; dr = dr->secondary.get()) {
-        auto method = dr->main.method;
-        ENFORCE(method.exists());
-        auto isNew = methods.tryEnqueue(method);
-        if (isNew) {
-            addSubclassRelatedMethods(gs, method, methods);
-        }
-    }
-}
-
-class Renamer {
+class MethodRenamer : public AbstractRenamer {
 public:
-    Renamer(const core::GlobalState &gs, const LSPConfiguration &config, const string oldName, const string newName)
-        : gs(gs), config(config), oldName(oldName), newName(newName), invalid(false) {}
-    virtual ~Renamer() = default;
-    virtual void rename(unique_ptr<core::lsp::QueryResponse> &response) = 0;
-    variant<JSONNullObject, unique_ptr<WorkspaceEdit>> buildEdit();
-
-    bool getInvalid() {
-        return invalid;
-    }
-    string getError() {
-        return error;
-    }
-
-protected:
-    const core::GlobalState &gs;
-    const LSPConfiguration &config;
-    string oldName;
-    string newName;
-    UnorderedMap<core::Loc, string> edits;
-    bool invalid;
-    string error;
-};
-
-variant<JSONNullObject, unique_ptr<WorkspaceEdit>> Renamer::buildEdit() {
-    if (invalid) {
-        return JSONNullObject();
-    }
-
-    UnorderedMap<string, vector<unique_ptr<TextEdit>>> tmpEdits;
-    vector<unique_ptr<TextDocumentEdit>> textDocEdits;
-    // collect changes per file
-    for (auto &item : edits) {
-        core::Loc loc = item.first;
-        string newsrc = item.second;
-        auto location = config.loc2Location(gs, loc);
-        ENFORCE(location != nullptr); // loc should always exist
-        if (location == nullptr) {
-            continue;
-        }
-        tmpEdits[location->uri].push_back(make_unique<TextEdit>(move(location->range), move(newsrc)));
-    }
-    for (auto &item : tmpEdits) {
-        // TODO: Version.
-        textDocEdits.push_back(make_unique<TextDocumentEdit>(
-            make_unique<VersionedTextDocumentIdentifier>(item.first, JSONNullObject()), move(item.second)));
-    }
-    auto we = make_unique<WorkspaceEdit>();
-    we->documentChanges = move(textDocEdits);
-    return we;
-}
-
-class MethodRenamer : public Renamer {
-public:
-    MethodRenamer(const core::GlobalState &gs, const LSPConfiguration &config, UniqueSymbolQueue &symbolQueue,
-                  const string oldName, const string newName)
-        : Renamer(gs, config, oldName, newName), symbolQueue(symbolQueue) {
+    MethodRenamer(const core::GlobalState &gs, const LSPConfiguration &config, const string oldName,
+                  const string newName)
+        : AbstractRenamer(gs, config, oldName, newName) {
         const vector<string> invalidNames = {"initialize", "call"};
         for (auto name : invalidNames) {
             if (oldName == name) {
@@ -192,8 +91,9 @@ public:
             invalid = true;
         }
     }
+
     ~MethodRenamer() {}
-    void rename(unique_ptr<core::lsp::QueryResponse> &response) override {
+    void rename(unique_ptr<core::lsp::QueryResponse> &response, const core::SymbolRef originalSymbol) override {
         if (invalid) {
             return;
         }
@@ -201,8 +101,7 @@ public:
 
         // If we're renaming the exact same place twice, silently ignore it. We reach this condition when we find the
         // same method send through multiple definitions (e.g. in the case of union types)
-        auto it = edits.find(loc);
-        if (it != edits.end()) {
+        if (edits.contains(loc)) {
             return;
         }
 
@@ -213,7 +112,7 @@ public:
         string newsrc;
         if (auto sendResp = response->isSend()) {
             newsrc = replaceMethodNameInSend(string(source.value()), sendResp);
-        } else if (auto defResp = response->isDefinition()) {
+        } else if (auto defResp = response->isMethodDef()) {
             newsrc = replaceMethodNameInDef(string(source.value()));
         } else {
             ENFORCE(0, "Unexpected query response type while renaming method");
@@ -221,15 +120,18 @@ public:
         }
         edits[loc] = newsrc;
     }
+    void addSymbol(const core::SymbolRef symbol) override {
+        if (symbol.isMethod()) {
+            addSubclassRelatedMethods(gs, symbol.asMethodRef(), getQueue());
+        }
+    }
 
 private:
-    UniqueSymbolQueue &symbolQueue;
-
     string replaceMethodNameInSend(string source, const core::lsp::SendResponse *sendResp) {
         // For sends with multiple components, traverse the list of dispatch components and add them to the
         // queue of symbols to be renamed
         if (sendResp->dispatchResult->secondary) {
-            addDispatchRelatedMethods(gs, sendResp->dispatchResult.get(), symbolQueue);
+            addDispatchRelatedMethods(gs, sendResp->dispatchResult.get(), getQueue());
         }
 
         // find the method in the send expression
@@ -286,14 +188,15 @@ private:
         auto suffixOffset = pos + oldName.length();
         return absl::StrCat(input.substr(0, pos), newName, input.substr(suffixOffset, input.length() - suffixOffset));
     }
-}; // namespace
-class ConstRenamer : public Renamer {
+}; // MethodRenamer
+
+class ConstRenamer : public AbstractRenamer {
 public:
     ConstRenamer(const core::GlobalState &gs, const LSPConfiguration &config, const string oldName,
                  const string newName)
-        : Renamer(gs, config, oldName, newName) {}
+        : AbstractRenamer(gs, config, oldName, newName) {}
     ~ConstRenamer() {}
-    void rename(unique_ptr<core::lsp::QueryResponse> &response) override {
+    void rename(unique_ptr<core::lsp::QueryResponse> &response, const core::SymbolRef originalSymbol) override {
         auto loc = response->getLoc();
         auto source = loc.source(gs);
         if (!source.has_value()) {
@@ -304,54 +207,71 @@ public:
         auto newsrc = absl::StrJoin(strs, "::");
         edits[loc] = newsrc;
     }
+    void addSymbol(const core::SymbolRef symbol) override {
+        if (!symbol.isMethod()) {
+            getQueue()->tryEnqueue(symbol);
+        }
+    }
 };
 
-} // namespace
+class FieldRenamer : public AbstractRenamer {
+public:
+    FieldRenamer(const core::GlobalState &gs, const LSPConfiguration &config, const string oldName,
+                 const string newName)
+        : AbstractRenamer(gs, config, oldName, newName) {}
+    ~FieldRenamer() {}
 
-void RenameTask::getRenameEdits(LSPTypecheckerDelegate &typechecker, core::SymbolRef symbol, string newName,
-                                unique_ptr<ResponseMessage> &responseMsg) {
-    const core::GlobalState &gs = typechecker.state();
-    auto originalName = symbol.name(gs).show(gs);
-    unique_ptr<Renamer> renamer;
-
-    UniqueSymbolQueue symbolQueue;
-    if (symbol.isMethod()) {
-        renamer = make_unique<MethodRenamer>(gs, config, symbolQueue, originalName, newName);
-        addSubclassRelatedMethods(gs, symbol.asMethodRef(), symbolQueue);
-    } else {
-        renamer = make_unique<ConstRenamer>(gs, config, originalName, newName);
-        symbolQueue.tryEnqueue(symbol);
-    }
-
-    for (auto sym = symbolQueue.pop(); sym.exists(); sym = symbolQueue.pop()) {
-        auto queryResult = queryBySymbol(typechecker, sym);
-        if (queryResult.error) {
-            responseMsg->result = JSONNullObject();
+    void rename(unique_ptr<core::lsp::QueryResponse> &response, const core::SymbolRef originalSymbol) override {
+        auto loc = response->getLoc();
+        auto source = loc.source(gs);
+        if (!source.has_value() || source.value().empty()) {
             return;
         }
 
-        // Filter for untyped files, and deduplicate responses by location.  We don't use extractLocations here because
-        // in some cases like sends, we need the SendResponse to be able to accurately find the method name in the
-        // expression.
-        for (auto &response : filterAndDedup(gs, queryResult.responses)) {
-            auto loc = response->getLoc();
-            if (loc.file().data(gs).isPayload()) {
-                // We don't support renaming things in payload files.
-                responseMsg->result = JSONNullObject();
-                return;
-            }
+        string newsrc;
 
-            // We may process the same send multiple times in case of union types, but this is ok because the renamer
-            // de-duplicates edits at the same location
-            renamer->rename(response);
+        // If the source includes `@` in the first character, then we're renaming the instance variable and need to make
+        // sure to include it. Otherwise, we're renaming an attr_reader/writer/accessor and need to make sure to not
+        // include it. This allows users to not care about whether they need to add the `@` themselves.
+        if (source.value()[0] == '@' && newName[0] != '@') {
+            newsrc = "@" + newName;
+        } else if (source.value()[0] != '@' && newName[0] == '@') {
+            newsrc = newName.substr(1, newName.length() - 1);
+        } else {
+            newsrc = newName;
+        }
+
+        edits[loc] = newsrc;
+    }
+
+    void addSymbol(const core::SymbolRef symbol) override {
+        if (symbol.isField(gs)) {
+            getQueue()->tryEnqueue(symbol);
         }
     }
-    responseMsg->result = renamer->buildEdit();
+};
+
+void enrichResponse(unique_ptr<ResponseMessage> &responseMsg, shared_ptr<AbstractRenamer> renamer) {
+    responseMsg->result = renamer->buildWorkspaceEdit();
     if (renamer->getInvalid()) {
         responseMsg->error = make_unique<ResponseError>((int)LSPErrorCodes::InvalidRequest, renamer->getError());
     }
 }
 
+shared_ptr<AbstractRenamer> makeRenamer(const core::GlobalState &gs,
+                                        const sorbet::realmain::lsp::LSPConfiguration &config, core::SymbolRef symbol,
+                                        const std::string newName) {
+    auto originalName = symbol.name(gs).show(gs);
+    if (symbol.isMethod()) {
+        return make_shared<MethodRenamer>(gs, config, originalName, newName);
+    } else if (symbol.isField(gs)) {
+        return make_shared<FieldRenamer>(gs, config, originalName, newName);
+    } else {
+        return make_shared<ConstRenamer>(gs, config, originalName, newName);
+    }
+}
+
+} // namespace
 RenameTask::RenameTask(const LSPConfiguration &config, MessageId id, unique_ptr<RenameParams> params)
     : LSPRequestTask(config, move(id), LSPMethod::TextDocumentRename), params(move(params)) {}
 
@@ -370,7 +290,8 @@ unique_ptr<ResponseMessage> RenameTask::runRequest(LSPTypecheckerDelegate &typec
 
     ShowOperation op(config, ShowOperation::Kind::Rename);
 
-    auto result = queryByLoc(typechecker, params->textDocument->uri, *params->position, LSPMethod::TextDocumentRename);
+    auto result = LSPQuery::byLoc(config, typechecker, params->textDocument->uri, *params->position,
+                                  LSPMethod::TextDocumentRename);
     if (result.error) {
         // An error happened while setting up the query.
         response->error = move(result.error);
@@ -386,6 +307,7 @@ unique_ptr<ResponseMessage> RenameTask::runRequest(LSPTypecheckerDelegate &typec
     }
 
     auto resp = move(queryResponses[0]);
+    shared_ptr<AbstractRenamer> renamer;
     if (auto constResp = resp->isConstant()) {
         // Sanity check the text.
         if (islower(params->newName[0])) {
@@ -393,31 +315,44 @@ unique_ptr<ResponseMessage> RenameTask::runRequest(LSPTypecheckerDelegate &typec
                                                          "Constant names must begin with an uppercase letter.");
             return response;
         }
-        if (isValidRenameLocation(constResp->symbol, gs, response)) {
-            getRenameEdits(typechecker, constResp->symbol, params->newName, response);
+        if (isValidRenameLocation(constResp->symbolBeforeDealias, gs, response)) {
+            renamer = makeRenamer(gs, config, constResp->symbolBeforeDealias, params->newName);
+            renamer->getRenameEdits(typechecker, constResp->symbolBeforeDealias, params->newName);
+            enrichResponse(response, renamer);
         }
-    } else if (auto defResp = resp->isDefinition()) {
-        if (defResp->symbol.isClassOrModule() && islower(params->newName[0])) {
-            response->error = make_unique<ResponseError>((int)LSPErrorCodes::InvalidRequest,
-                                                         "Class and Module names must begin with an uppercase letter.");
-            return response;
-        }
-
-        if (defResp->symbol.isMethod() && isupper(params->newName[0])) {
-            response->error = make_unique<ResponseError>((int)LSPErrorCodes::InvalidRequest,
-                                                         "Method names must begin with an lowercase letter.");
-            return response;
-        }
-
-        if (defResp->symbol.isClassOrModule() || defResp->symbol.isMethod()) {
-            if (isValidRenameLocation(defResp->symbol, gs, response)) {
-                getRenameEdits(typechecker, defResp->symbol, params->newName, response);
-            }
+    } else if (auto defResp = resp->isMethodDef()) {
+        if (isValidRenameLocation(defResp->symbol, gs, response)) {
+            renamer = makeRenamer(gs, config, defResp->symbol, params->newName);
+            renamer->getRenameEdits(typechecker, defResp->symbol, params->newName);
+            enrichResponse(response, renamer);
         }
     } else if (auto sendResp = resp->isSend()) {
         // We don't need to handle dispatchResult->secondary here, because it will be checked in getRenameEdits.
         auto method = sendResp->dispatchResult->main.method;
-        getRenameEdits(typechecker, method, params->newName, response);
+        renamer = makeRenamer(gs, config, method, params->newName);
+        renamer->getRenameEdits(typechecker, method, params->newName);
+        enrichResponse(response, renamer);
+    } else if (auto identResp = resp->isIdent()) {
+        if (identResp->enclosingMethod.exists()) {
+            core::NameRef localName = identResp->variable._name;
+            auto references =
+                typechecker.query(core::lsp::Query::createVarQuery(identResp->enclosingMethod, identResp->variable),
+                                  {identResp->termLoc.file()});
+            std::vector<core::Loc> locations;
+
+            for (auto &reference : references.responses) {
+                locations.emplace_back(reference->getLoc());
+            }
+
+            shared_ptr<AbstractRenamer> renamer =
+                make_shared<LocalRenamer>(gs, config, localName.show(gs), params->newName, locations);
+            renamer->rename(resp, core::SymbolRef{});
+            enrichResponse(response, renamer);
+        }
+    } else if (auto fieldResp = resp->isField()) {
+        renamer = makeRenamer(gs, config, fieldResp->symbol, params->newName);
+        renamer->getRenameEdits(typechecker, fieldResp->symbol, params->newName);
+        enrichResponse(response, renamer);
     }
 
     return response;

@@ -1,6 +1,7 @@
 // has to go first as it violates our poisons
 #include "rang.hpp"
 
+#include "absl/strings/escaping.h"
 #include "absl/strings/match.h"
 #include "core/Context.h"
 #include "core/GlobalState.h"
@@ -36,8 +37,11 @@ Loc Loc::join(Loc other) const {
 Loc::Detail Loc::offset2Pos(const File &file, uint32_t off) {
     Loc::Detail pos;
 
-    ENFORCE(off <= file.source().size(), "file offset out of bounds in file: {} @ {} <= {}", string(file.path()),
-            to_string(off), to_string(file.source().size()));
+    if (off > file.source().size()) {
+        fatalLogger->error(R"(msg="Bad offset2Pos off" path="{}" off="{}"")", absl::CEscape(file.path()), off);
+        fatalLogger->error("source=\"{}\"", absl::CEscape(file.source()));
+        ENFORCE(false);
+    }
     auto it = absl::c_lower_bound(file.lineBreaks(), off);
     if (it == file.lineBreaks().begin()) {
         pos.line = 1;
@@ -57,6 +61,11 @@ optional<uint32_t> Loc::pos2Offset(const File &file, Loc::Detail pos) {
         return nullopt;
     }
     auto lineOffset = lineBreaks[l];
+    auto nextLineStart = l + 1 < lineBreaks.size() ? lineBreaks[l + 1] : file.source().size();
+    auto lineLength = nextLineStart - lineOffset;
+    if (pos.column > lineLength) {
+        return nullopt;
+    }
     return lineOffset + pos.column;
 }
 
@@ -101,22 +110,46 @@ constexpr unsigned int WINDOW_SIZE = 10; // how many lines of source to print
 constexpr unsigned int WINDOW_HALF_SIZE = WINDOW_SIZE / 2;
 static_assert((WINDOW_SIZE & 1) == 0, "WINDOW_SIZE should be divisable by 2");
 
-void addLocLine(stringstream &buf, int line, const File &file, int tabs, int posWidth) {
+void addLocLine(stringstream &buf, int line, const File &file, int tabs, int posWidth, bool censorForSnapshotTests) {
     printTabs(buf, tabs);
-    buf << rang::fgB::black << leftPad(to_string(line + 1), posWidth) << " |" << rang::style::reset;
-    ENFORCE(file.lineBreaks().size() > line + 1);
+    buf << rang::fgB::black;
+    if (censorForSnapshotTests) {
+        buf << leftPad("NN", posWidth);
+    } else {
+        buf << leftPad(to_string(line + 1), posWidth);
+    }
+    buf << " |" << rang::style::reset;
+    if (file.lineBreaks().size() <= line + 1) {
+        fatalLogger->error(R"(msg="Bad addLocLine line" path="{}" line="{}"")", absl::CEscape(file.path()), line);
+        fatalLogger->error("source=\"{}\"", absl::CEscape(file.source()));
+        ENFORCE(false);
+    }
     auto endPos = file.lineBreaks()[line + 1];
-    auto numToWrite = endPos - file.lineBreaks()[line];
+    auto numToWrite = endPos - file.lineBreaks()[line] - 1;
     if (numToWrite <= 0) {
         return;
     }
-    buf.write(file.source().data() + file.lineBreaks()[line] + 1, numToWrite - 1);
+    auto offset = file.lineBreaks()[line] + 1;
+    if (offset < 0 || offset >= file.source().size()) {
+        fatalLogger->error(R"(msg="Bad addLocLine offset" path="{}" line="{}" offset="{}")", absl::CEscape(file.path()),
+                           line, offset);
+        fatalLogger->error("source=\"{}\"", absl::CEscape(file.source()));
+        ENFORCE(false);
+    }
+    if (offset + numToWrite > file.source().size()) {
+        fatalLogger->error(R"(msg="Bad addLocLine write size" path="{}" line="{}" offset="{}" numToWrite="{}")",
+                           absl::CEscape(file.path()), line, offset, numToWrite);
+        fatalLogger->error("source=\"{}\"", absl::CEscape(file.source()));
+        ENFORCE(false);
+    }
+    buf.write(file.source().data() + offset, numToWrite);
 }
 } // namespace
 
 string Loc::toStringWithTabs(const GlobalState &gs, int tabs) const {
     stringstream buf;
     const File &file = this->file().data(gs);
+    auto censorForSnapshotTests = gs.censorForSnapshotTests && file.isPayload();
     auto pos = this->position(gs);
     int posWidth = pos.second.line < 100 ? 2 : pos.second.line < 10000 ? 4 : 8;
 
@@ -128,7 +161,7 @@ string Loc::toStringWithTabs(const GlobalState &gs, int tabs) const {
             buf << '\n';
         }
         first = false;
-        addLocLine(buf, lineIt, file, tabs, posWidth);
+        addLocLine(buf, lineIt, file, tabs, posWidth, censorForSnapshotTests);
         lineIt++;
     }
     if (lineIt != pos.second.line && lineIt < pos.second.line - WINDOW_HALF_SIZE) {
@@ -140,7 +173,7 @@ string Loc::toStringWithTabs(const GlobalState &gs, int tabs) const {
     }
     while (lineIt != pos.second.line) {
         buf << '\n';
-        addLocLine(buf, lineIt, file, tabs, posWidth);
+        addLocLine(buf, lineIt, file, tabs, posWidth, censorForSnapshotTests);
         lineIt++;
     }
 
@@ -171,10 +204,10 @@ string Loc::toStringWithTabs(const GlobalState &gs, int tabs) const {
 }
 
 string LocOffsets::showRaw(const Context ctx) const {
-    return Loc(ctx.file, *this).showRaw(ctx);
+    return ctx.locAt(*this).showRaw(ctx);
 }
 string LocOffsets::showRaw(const MutableContext ctx) const {
-    return Loc(ctx.file, *this).showRaw(ctx);
+    return ctx.locAt(*this).showRaw(ctx);
 }
 string LocOffsets::showRaw(const GlobalState &gs, const FileRef file) const {
     return Loc(file, *this).showRaw(gs);
@@ -236,14 +269,15 @@ string Loc::filePosToString(const GlobalState &gs, bool showFull) const {
             } else {
                 buf << ":";
             }
-            buf << pos.first.line;
+            auto censor = gs.censorForSnapshotTests && file().data(gs).isPayload();
+            buf << (censor ? "CENSORED" : to_string(pos.first.line));
             if (showFull) {
                 buf << ":";
-                buf << pos.first.column;
+                buf << (censor ? "CENSORED" : to_string(pos.first.column));
                 buf << "-";
-                buf << pos.second.line;
+                buf << (censor ? "CENSORED" : to_string(pos.second.line));
                 buf << ":";
-                buf << pos.second.column;
+                buf << (censor ? "CENSORED" : to_string(pos.second.column));
             } else {
                 // pos.second.line; is intentionally not printed so that iterm2 can open file name:line_number as links
             }
@@ -262,6 +296,8 @@ optional<string_view> Loc::source(const GlobalState &gs) const {
 }
 
 bool Loc::contains(const Loc &other) const {
+    ENFORCE_NO_TIMER(this->exists());
+    ENFORCE_NO_TIMER(other.exists());
     return file() == other.file() && other.beginPos() >= beginPos() && other.endPos() <= endPos();
 }
 

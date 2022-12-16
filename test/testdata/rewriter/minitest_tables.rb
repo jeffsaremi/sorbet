@@ -84,7 +84,7 @@ class MyTest
 
   test_each ["foo", 5, {x: false}] do |v|
     it "handles lists with several types" do
-      T.reveal_type(v) # error: Revealed type: `T.any(String, Integer, T::Hash[T.untyped, T.untyped])`
+      T.reveal_type(v) # error: Revealed type: `T.any(Integer, String, T::Hash[T.untyped, T.untyped])`
     end
   end
 
@@ -211,7 +211,9 @@ class MyTest
     end
   end
 
-  test_each_hash([1, 2, 3]) do |k, v| # error: Expected `T::Hash[T.type_parameter(:K), T.type_parameter(:V)]`
+  test_each_hash([1, 2, 3]) do |k, v|
+    #            ^^^^^^^^^ error: Expected `T::Hash[T.type_parameter(:K), T.type_parameter(:V)]`
+    #                              ^ error: This code is unreachable
     it "fails to typecheck with non-hash arguments to `test_each-hash`" do
       puts k, v
     end

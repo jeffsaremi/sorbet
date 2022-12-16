@@ -11,17 +11,26 @@ using namespace std;
 namespace sorbet::realmain::lsp::watchman {
 
 WatchmanProcess::WatchmanProcess(shared_ptr<spdlog::logger> logger, string_view watchmanPath, string_view workSpace,
-                                 vector<string> extensions,
-                                 function<void(unique_ptr<sorbet::realmain::lsp::WatchmanQueryResponse>)> processUpdate,
-                                 std::function<void(int, string const &)> processExit)
+                                 vector<string> extensions)
     : logger(std::move(logger)), watchmanPath(string(watchmanPath)), workSpace(string(workSpace)),
-      extensions(std::move(extensions)), processUpdate(std::move(processUpdate)), processExit(std::move(processExit)),
+      extensions(std::move(extensions)),
       thread(runInAThread("watchmanReader", std::bind(&WatchmanProcess::start, this))) {}
 
 WatchmanProcess::~WatchmanProcess() {
     exitWithCode(0, "");
     // Destructor of Joinable ensures Watchman thread exits before this destructor finishes.
 };
+
+namespace {
+template <typename F> void catchDeserializationError(spdlog::logger &logger, const string &line, F &&f) {
+    try {
+        f();
+    } catch (sorbet::realmain::lsp::DeserializationError e) {
+        // Gracefully handle deserialization errors, since they could be our fault.
+        logger.error("Unable to deserialize Watchman request: {}\nOriginal request:\n{}", e.what(), line);
+    }
+}
+} // namespace
 
 void WatchmanProcess::start() {
     auto mainPid = getpid();
@@ -46,7 +55,6 @@ void WatchmanProcess::start() {
             // Exclude rsync tmpfiles
             "[\"not\", [\"match\", \"**/.~tmp~/**\", \"wholename\", {{\"includedotfiles\": true}}]]"
             "], "
-            "\"defer_vcs\": false, "
             "\"fields\": [\"name\"], "
             "\"empty_on_fresh_instance\": true"
             "}}]",
@@ -62,32 +70,55 @@ void WatchmanProcess::start() {
         string buffer;
 
         while (!isStopped()) {
+            errno = 0;
             auto maybeLine = FileOps::readLineFromFd(fd, buffer);
             if (maybeLine.result == FileOps::ReadResult::Timeout) {
                 // Timeout occurred. See if we should abort before reading further.
                 continue;
-            } else if (maybeLine.result == FileOps::ReadResult::ErrorOrEof) {
+            }
+
+            if (maybeLine.result == FileOps::ReadResult::ErrorOrEof) {
+                if (errno == EINTR) {
+                    continue;
+                }
+
                 // Exit loop; unable to read from Watchman process.
+                exitWithCode(1, nullopt);
                 break;
             }
+
+            ENFORCE(maybeLine.result == FileOps::ReadResult::Success);
 
             const string &line = *maybeLine.output;
             // Line found!
             rapidjson::MemoryPoolAllocator<> alloc;
             rapidjson::Document d(&alloc);
             logger->debug(line);
-            if (d.Parse(line.c_str()).HasParseError()) {
+            if (d.Parse(line.c_str(), line.size()).HasParseError()) {
                 logger->error("Error parsing Watchman response: `{}` is not a valid json object", line);
             } else if (d.HasMember("is_fresh_instance")) {
-                try {
+                catchDeserializationError(*logger, line, [&d, this]() {
                     auto queryResponse = sorbet::realmain::lsp::WatchmanQueryResponse::fromJSONValue(d);
-                    processUpdate(move(queryResponse));
-                } catch (sorbet::realmain::lsp::DeserializationError e) {
-                    // Gracefully handle deserialization errors, since they could be our fault.
-                    logger->error("Unable to deserialize Watchman request: {}\nOriginal request:\n{}", e.what(), line);
-                }
+                    processQueryResponse(move(queryResponse));
+                });
+            } else if (d.HasMember("state-enter")) {
+                // These are messages from "state-enter" commands.  See
+                // https://facebook.github.io/watchman/docs/cmd/state-enter.html
+                // for more information.
+                catchDeserializationError(*logger, line, [&d, this]() {
+                    auto stateEnter = sorbet::realmain::lsp::WatchmanStateEnter::fromJSONValue(d);
+                    processStateEnter(move(stateEnter));
+                });
+            } else if (d.HasMember("state-leave")) {
+                // These are messages from "state-leave" commands.  See
+                // https://facebook.github.io/watchman/docs/cmd/state-leave.html
+                // for more information.
+                catchDeserializationError(*logger, line, [&d, this]() {
+                    auto stateLeave = sorbet::realmain::lsp::WatchmanStateLeave::fromJSONValue(d);
+                    processStateLeave(move(stateLeave));
+                });
             } else if (!d.HasMember("subscribe")) {
-                // Not a subscription response, or a file update.
+                // Something we don't understand yet.
                 logger->debug("Unknown Watchman response:\n{}", line);
             }
         }
@@ -106,6 +137,8 @@ void WatchmanProcess::start() {
             exit(1);
         }
     }
+
+    ENFORCE(isStopped());
 }
 
 bool WatchmanProcess::isStopped() {
@@ -113,11 +146,11 @@ bool WatchmanProcess::isStopped() {
     return stopped;
 }
 
-void WatchmanProcess::exitWithCode(int code, string const &message) {
+void WatchmanProcess::exitWithCode(int code, const std::optional<std::string> &msg) {
     absl::MutexLock lck(&mutex);
     if (!stopped) {
         stopped = true;
-        processExit(code, message);
+        processExit(code, msg);
     }
 }
 

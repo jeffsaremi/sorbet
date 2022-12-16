@@ -35,7 +35,7 @@ module T::Props::Serializable
       end
     end
 
-    h.merge!(@_extra_props) if @_extra_props
+    h.merge!(@_extra_props) if defined?(@_extra_props)
     h
   end
 
@@ -121,8 +121,8 @@ module T::Props::Serializable
   private def with_existing_hash(changed_props, existing_hash:)
     serialized = existing_hash
     new_val = self.class.from_hash(serialized.merge(recursive_stringify_keys(changed_props)))
-    old_extra = self.instance_variable_get(:@_extra_props)
-    new_extra = new_val.instance_variable_get(:@_extra_props)
+    old_extra = self.instance_variable_get(:@_extra_props) if self.instance_variable_defined?(:@_extra_props)
+    new_extra = new_val.instance_variable_get(:@_extra_props) if new_val.instance_variable_defined?(:@_extra_props)
     if old_extra != new_extra
       difference =
         if old_extra
@@ -137,7 +137,8 @@ module T::Props::Serializable
 
   # Asserts if this property is missing during strict serialize
   private def required_prop_missing_from_serialize(prop)
-    if @_required_props_missing_from_deserialize&.include?(prop)
+    if defined?(@_required_props_missing_from_deserialize) &&
+       @_required_props_missing_from_deserialize&.include?(prop)
       # If the prop was already missing during deserialization, that means the application
       # code already had to deal with a nil value, which means we wouldn't be accomplishing
       # much by raising here (other than causing an unnecessary breakage).
@@ -178,6 +179,14 @@ end
 module T::Props::Serializable::DecoratorMethods
   include T::Props::HasLazilySpecializedMethods::DecoratorMethods
 
+  # Heads up!
+  #
+  # There are already too many ad-hoc options on the prop DSL.
+  #
+  # We have already done a lot of work to remove unnecessary and confusing
+  # options. If you're considering adding a new rule key, please come chat with
+  # the Sorbet team first, as we'd really like to learn more about how to best
+  # solve the problem you're encountering.
   VALID_RULE_KEYS = {dont_store: true, name: true, raise_on_nil_write: true}.freeze
   private_constant :VALID_RULE_KEYS
 
@@ -322,7 +331,11 @@ module T::Props::Serializable::DecoratorMethods
   private_constant :EMPTY_EXTRA_PROPS
 
   def extra_props(instance)
-    instance.instance_variable_get(:@_extra_props) || EMPTY_EXTRA_PROPS
+    if instance.instance_variable_defined?(:@_extra_props)
+      instance.instance_variable_get(:@_extra_props) || EMPTY_EXTRA_PROPS
+    else
+      EMPTY_EXTRA_PROPS
+    end
   end
 
   # overrides T::Props::PrettyPrintable

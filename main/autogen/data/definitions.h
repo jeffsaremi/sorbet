@@ -8,11 +8,9 @@ namespace sorbet::autogen {
 // The types defined here are simplified views of class and constant definitions in a Ruby codebase, which we use to
 // create static output information and autoloader files
 
-// A `QualifiedName` is a vector of namerefs that includes the fully-qualified name as well as an optional package name
-// (if we're running in `--stripe-packages` mode)
+// A `QualifiedName` is a vector of namerefs that includes the fully-qualified name
 struct QualifiedName {
     std::vector<core::NameRef> nameParts;
-    std::optional<core::NameRef> package;
 
     static QualifiedName fromFullName(std::vector<core::NameRef> &&fullName);
 
@@ -25,7 +23,7 @@ struct QualifiedName {
     }
 
     bool operator==(const QualifiedName &rhs) const {
-        return nameParts == rhs.nameParts && package == rhs.package;
+        return nameParts == rhs.nameParts;
     }
 
     core::NameRef name() const {
@@ -150,6 +148,10 @@ struct Reference {
     DefinitionRef parent_of;
 };
 
+struct AutogenConfig {
+    const std::vector<std::string> behaviorAllowedInRBIsPaths;
+};
+
 // A `ParsedFile` contains all the `Definition`s and `References` used in a particular file
 struct ParsedFile {
     friend class MsgpackWriter;
@@ -168,7 +170,7 @@ struct ParsedFile {
     std::vector<core::NameRef> requireStatements;
 
     std::string toString(const core::GlobalState &gs, int version) const;
-    std::string toMsgpack(core::Context ctx, int version);
+    std::string toMsgpack(core::Context ctx, int version, const AutogenConfig &autogenCfg);
     std::vector<core::NameRef> showFullName(const core::GlobalState &gs, DefinitionRef id) const;
     QualifiedName showQualifiedName(const core::GlobalState &gs, DefinitionRef id) const;
     std::vector<std::string> listAllClasses(core::Context ctx);

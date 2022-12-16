@@ -8,12 +8,12 @@
 #include "common/formatting.h"
 #include "common/sort.h"
 #include "common/web_tracer_framework/tracing.h"
+#include "main/lsp/LSPConfiguration.h"
 #include "test/helpers/expectations.h"
 #include "test/helpers/lsp.h"
 #include "test/helpers/position_assertions.h"
 
 namespace sorbet::test {
-namespace spd = spdlog;
 using namespace std;
 
 string singleTest;
@@ -36,10 +36,13 @@ void updateDiagnostics(const LSPConfiguration &config, UnorderedMap<string, stri
         auto maybeDiagnosticParams = getPublishDiagnosticParams(response->asNotification());
         REQUIRE(maybeDiagnosticParams.has_value());
         auto &diagnosticParams = *maybeDiagnosticParams;
-        auto filename = uriToFilePath(config, diagnosticParams->uri);
-        {
+        string filename;
+        if (!absl::StartsWith(diagnosticParams->uri, core::File::URL_PREFIX)) {
+            filename = uriToFilePath(config, diagnosticParams->uri);
             INFO(fmt::format("Diagnostic URI is not a test file URI: {}", diagnosticParams->uri));
             CHECK_NE(testFileUris.end(), testFileUris.find(filename));
+        } else {
+            filename = diagnosticParams->uri;
         }
 
         // Will explicitly overwrite older diagnostics that are irrelevant.
@@ -66,8 +69,253 @@ string documentSymbolsToString(const variant<JSONNullObject, vector<unique_ptr<D
         return "null";
     } else {
         auto &symbols = get<vector<unique_ptr<DocumentSymbol>>>(symbolResult);
-        return fmt::format("{}", fmt::map_join(symbols.begin(), symbols.end(), ", ",
-                                               [](const auto &sym) -> string { return sym->toJSON(true); }));
+        return fmt::format("{}",
+                           fmt::map_join(symbols, ", ", [](const auto &sym) -> string { return sym->toJSON(true); }));
+    }
+}
+
+// cf.
+// https://github.com/microsoft/vscode/blob/21f7df634a8ac45d1198cb414fe90366f782bcee/src/vs/workbench/api/common/extHostTypes.ts#L1224-L1232
+void validateDocumentSymbol(unique_ptr<DocumentSymbol> &sym) {
+    REQUIRE(!sym->name.empty());
+    REQUIRE(sym->range != nullptr);
+    REQUIRE(sym->selectionRange != nullptr);
+    REQUIRE(sym->range->start != nullptr);
+    REQUIRE(sym->range->end != nullptr);
+    REQUIRE(sym->selectionRange->start != nullptr);
+    REQUIRE(sym->selectionRange->end != nullptr);
+
+    INFO(fmt::format("Checking range {} contains selectionRange {}", sym->range->toJSON(false),
+                     sym->selectionRange->toJSON(false)));
+    REQUIRE(sym->range->contains(*sym->selectionRange));
+
+    if (sym->children.has_value()) {
+        for (auto &child : *sym->children) {
+            validateDocumentSymbol(child);
+        }
+    }
+}
+
+optional<unique_ptr<CodeAction>> resolveCodeAction(LSPWrapper &lspWrapper, int &nextId,
+                                                   unique_ptr<CodeAction> codeAction) {
+    const auto &config = lspWrapper.config().getClientConfig();
+    if (!config.clientCodeActionResolveEditSupport || !config.clientCodeActionDataSupport) {
+        return codeAction;
+    }
+
+    auto req = make_unique<RequestMessage>("2.0", nextId++, LSPMethod::CodeActionResolve, move(codeAction));
+    auto responses = getLSPResponsesFor(lspWrapper, make_unique<LSPMessage>(move(req)));
+    {
+        INFO("Did not receive exactly one response for a codeAction request.");
+        CHECK_EQ(responses.size(), 1);
+    }
+    if (responses.size() != 1) {
+        return nullopt;
+    }
+
+    auto &msg = responses.at(0);
+    CHECK(msg->isResponse());
+    if (!msg->isResponse()) {
+        return nullopt;
+    }
+    auto &response = msg->asResponse();
+    auto &receivedResponse = get<optional<unique_ptr<CodeAction>>>(*response.result);
+    CHECK(receivedResponse.has_value());
+    return move(receivedResponse);
+}
+
+optional<vector<unique_ptr<CodeAction>>> requestCodeActions(LSPWrapper &lspWrapper, string fileUri,
+                                                            unique_ptr<Range> range, int &nextId,
+                                                            vector<CodeActionKind> &selectedCodeActionKinds) {
+    vector<unique_ptr<Diagnostic>> diagnostics;
+
+    auto codeActionContext = make_unique<CodeActionContext>(move(diagnostics));
+    codeActionContext->only = selectedCodeActionKinds;
+
+    // Unfortunately there's no simpler way to copy the range (yet).
+    auto params = make_unique<CodeActionParams>(make_unique<TextDocumentIdentifier>(fileUri), range->copy(),
+                                                move(codeActionContext));
+    auto req = make_unique<RequestMessage>("2.0", nextId++, LSPMethod::TextDocumentCodeAction, move(params));
+    auto responses = getLSPResponsesFor(lspWrapper, make_unique<LSPMessage>(move(req)));
+    {
+        INFO("Did not receive exactly one response for a codeAction request.");
+        CHECK_EQ(responses.size(), 1);
+    }
+    if (responses.size() != 1) {
+        return nullopt;
+    }
+
+    auto &msg = responses.at(0);
+    CHECK(msg->isResponse());
+    if (!msg->isResponse()) {
+        return nullopt;
+    }
+
+    auto &response = msg->asResponse();
+    auto &receivedCodeActionResponse = get<variant<JSONNullObject, vector<unique_ptr<CodeAction>>>>(*response.result);
+    CHECK_FALSE(get_if<JSONNullObject>(&receivedCodeActionResponse));
+    if (get_if<JSONNullObject>(&receivedCodeActionResponse)) {
+        return nullopt;
+    }
+
+    auto codeActions = move(get<vector<unique_ptr<CodeAction>>>(receivedCodeActionResponse));
+    vector<unique_ptr<CodeAction>> resolvedCodeActions;
+
+    for (auto &ca : codeActions) {
+        if (ca->edit.has_value()) {
+            resolvedCodeActions.emplace_back(move(ca));
+            continue;
+        }
+        auto resolvedCodeAction = resolveCodeAction(lspWrapper, nextId, move(ca));
+        if (resolvedCodeAction.has_value()) {
+            resolvedCodeActions.emplace_back(move(resolvedCodeAction.value()));
+        }
+    }
+
+    for (auto &ca : resolvedCodeActions) {
+        CHECK_MESSAGE(ca->edit.has_value(), fmt::format("Code action with kind {} has no edits",
+                                                        convertCodeActionKindToString(ca->kind.value())));
+    }
+
+    return resolvedCodeActions;
+}
+
+void validateCodeActionAbsence(LSPWrapper &lspWrapper, string fileUri, unique_ptr<Range> range, int &nextId,
+                               vector<CodeActionKind> &selectedCodeActionKinds,
+                               vector<CodeActionKind> &ignoredCodeActionKinds) {
+    auto maybeReceivedCodeActions =
+        requestCodeActions(lspWrapper, fileUri, range->copy(), nextId, selectedCodeActionKinds);
+    if (!maybeReceivedCodeActions.has_value()) {
+        return;
+    }
+    auto receivedCodeActions = move(maybeReceivedCodeActions.value());
+    if (!ignoredCodeActionKinds.empty()) {
+        vector<CodeActionKind> receivedCodeActionKinds;
+        for (const auto &ca : receivedCodeActions) {
+            if (!ca->kind.has_value()) {
+                continue;
+            }
+            receivedCodeActionKinds.push_back(ca->kind.value());
+        }
+
+        vector<CodeActionKind> ignoredCodeActionsDiff;
+        set_intersection(receivedCodeActionKinds.begin(), receivedCodeActionKinds.end(), ignoredCodeActionKinds.begin(),
+                         ignoredCodeActionKinds.end(), back_inserter(ignoredCodeActionsDiff));
+
+        REQUIRE_MESSAGE(ignoredCodeActionsDiff.empty(),
+                        fmt::format("Received unexpected code actions with kinds: {}",
+                                    fmt::map_join(ignoredCodeActionsDiff, ", ", [](auto codeAction) {
+                                        return convertCodeActionKindToString(codeAction);
+                                    })));
+    }
+}
+
+void validateCodeActions(LSPWrapper &lspWrapper, Expectations &test, string fileUri, unique_ptr<Range> range,
+                         int &nextId, vector<CodeActionKind> &selectedCodeActionKinds,
+                         vector<CodeActionKind> &ignoredCodeActionKinds,
+                         vector<shared_ptr<ApplyCodeActionAssertion>> &applyCodeActionAssertions,
+                         string codeActionDescription, bool assertAllChanges) {
+    auto isSelectedKind = [&selectedCodeActionKinds](CodeActionKind kind) {
+        return count(selectedCodeActionKinds.begin(), selectedCodeActionKinds.end(), kind) != 0;
+    };
+
+    UnorderedMap<string, unique_ptr<CodeAction>> receivedCodeActionsByTitle;
+
+    auto receivedCodeActions =
+        requestCodeActions(lspWrapper, fileUri, range->copy(), nextId, selectedCodeActionKinds).value();
+    unique_ptr<CodeAction> sourceLevelCodeAction;
+
+    // One code action should be a 'source' level code action. Remove it.
+    if (!receivedCodeActions.empty() && isSelectedKind(CodeActionKind::Quickfix)) {
+        for (auto it = receivedCodeActions.begin(); it != receivedCodeActions.end();) {
+            if ((*it)->kind == CodeActionKind::SourceFixAllSorbet) {
+                INFO("Received multiple source-level code actions");
+                CHECK_EQ(sourceLevelCodeAction, nullptr);
+                sourceLevelCodeAction = move(*it);
+                // Remove from vector and continue
+                it = receivedCodeActions.erase(it);
+            } else {
+                it++;
+            }
+        }
+        INFO("Expected one source-level code action for code action request");
+        CHECK_NE(sourceLevelCodeAction, nullptr);
+    }
+
+    for (auto &codeAction : receivedCodeActions) {
+        if (!isSelectedKind(codeAction->kind.value())) {
+            continue;
+        }
+        // We send two identical "Apply all Sorbet autocorrects" code actions with different kinds: One is a
+        // Source, the other is a Quickfix. This logic strips out the quickfix.
+        if (sourceLevelCodeAction != nullptr && codeAction->title == sourceLevelCodeAction->title) {
+            continue;
+        }
+
+        bool codeActionTitleUnique =
+            receivedCodeActionsByTitle.find(codeAction->title) == receivedCodeActionsByTitle.end();
+        CHECK_MESSAGE(codeActionTitleUnique, "Found code action with duplicate title: " << codeAction->title);
+        if (codeActionTitleUnique) {
+            receivedCodeActionsByTitle[codeAction->title] = move(codeAction);
+        }
+    }
+
+    uint32_t receivedCodeActionsCount = receivedCodeActionsByTitle.size();
+    vector<shared_ptr<ApplyCodeActionAssertion>> matchedCodeActionAssertions;
+
+    // Test code action assertions matching the range of this error.
+    auto it = applyCodeActionAssertions.begin();
+    while (it != applyCodeActionAssertions.end()) {
+        auto codeActionAssertion = it->get();
+        if (!(range->start->cmp(*codeActionAssertion->range->start) <= 0 &&
+              range->end->cmp(*codeActionAssertion->range->end) >= 0)) {
+            ++it;
+            continue;
+        }
+
+        // Ensure we received a code action matching the assertion.
+        auto it2 = receivedCodeActionsByTitle.find(codeActionAssertion->title);
+        {
+            INFO(fmt::format(
+                "Did not receive code action matching assertion `{}` for error or selected code action `{}`...",
+                codeActionAssertion->toString(), codeActionDescription));
+            INFO("(If this was the expected behavior, add `# assert-no-code-action: $CODE_ACTION_KIND` to your "
+                 "testcase)");
+            REQUIRE_NE(it2, receivedCodeActionsByTitle.end());
+        }
+
+        // Ensure that the received code action applies correctly.
+        if (it2 != receivedCodeActionsByTitle.end()) {
+            auto codeAction = move(it2->second);
+            if (assertAllChanges) {
+                codeActionAssertion->checkAll(test.sourceFileContents, lspWrapper, *codeAction.get());
+            } else {
+                codeActionAssertion->check(test.sourceFileContents, lspWrapper, *codeAction.get());
+            }
+
+            // Some bookkeeping to make surfacing errors re. extra/insufficient
+            // apply-code-action annotations easier.
+            receivedCodeActionsByTitle.erase(it2);
+
+            if (isSelectedKind(codeAction->kind.value())) {
+                (*it)->kind = codeAction->kind;
+                matchedCodeActionAssertions.emplace_back(*it);
+                it = applyCodeActionAssertions.erase(it);
+            }
+        } else {
+            ++it;
+        }
+    }
+
+    if (matchedCodeActionAssertions.size() > receivedCodeActionsCount) {
+        FAIL_CHECK(fmt::format("Found apply-code-action assertions without "
+                               "corresponding code actions from the server:\n{}",
+                               fmt::map_join(applyCodeActionAssertions, ", ",
+                                             [](const auto &assertion) -> string { return assertion->toString(); })));
+    } else if (matchedCodeActionAssertions.size() < receivedCodeActionsCount) {
+        FAIL_CHECK(fmt::format("Received code actions without corresponding apply-code-action assertions:\n{}",
+                               fmt::map_join(receivedCodeActionsByTitle, "\n",
+                                             [](const auto &action) -> string { return action.second->toJSON(); })));
     }
 }
 
@@ -81,12 +329,27 @@ void testQuickFixCodeActions(LSPWrapper &lspWrapper, Expectations &test, const v
         }
     }
 
-    bool exhaustiveApplyCodeAction =
-        BooleanPropertyAssertion::getValue("exhaustive-apply-code-action", assertions).value_or(false);
-
-    if (applyCodeActionAssertionsByFilename.empty() && !exhaustiveApplyCodeAction) {
+    auto selectedCodeActions =
+        StringPropertyAssertions::getValues("selective-apply-code-action", assertions).value_or(vector<string>{});
+    if (applyCodeActionAssertionsByFilename.empty() && selectedCodeActions.empty()) {
         return;
     }
+
+    {
+        INFO("No code actions provided for the selective-apply-code-action assertion. Correct usage example "
+             "`selective-apply-code-action: quickfix, quickfix.refactor`");
+        CHECK(!selectedCodeActions.empty());
+    }
+
+    vector<CodeActionKind> selectedCodeActionKinds;
+    transform(selectedCodeActions.begin(), selectedCodeActions.end(), back_inserter(selectedCodeActionKinds),
+              getCodeActionKind);
+
+    auto ignoredCodeActionAssertions =
+        StringPropertyAssertions::getValues("assert-no-code-action", assertions).value_or(vector<string>{});
+    vector<CodeActionKind> ignoredCodeActionKinds;
+    transform(ignoredCodeActionAssertions.begin(), ignoredCodeActionAssertions.end(),
+              back_inserter(ignoredCodeActionKinds), getCodeActionKind);
 
     auto errors = RangeAssertion::getErrorAssertions(assertions);
     UnorderedMap<string, std::vector<std::shared_ptr<RangeAssertion>>> errorsByFilename;
@@ -96,134 +359,41 @@ void testQuickFixCodeActions(LSPWrapper &lspWrapper, Expectations &test, const v
 
     for (auto &filename : filenames) {
         auto applyCodeActionAssertions = applyCodeActionAssertionsByFilename[filename];
+        auto fileUri = testFileUris[filename];
 
-        // Request code actions for each of this file's error.
-        for (auto &error : errorsByFilename[filename]) {
-            vector<unique_ptr<Diagnostic>> diagnostics;
-            auto fileUri = testFileUris[filename];
-            // Unfortunately there's no simpler way to copy the range (yet).
-            auto params =
-                make_unique<CodeActionParams>(make_unique<TextDocumentIdentifier>(fileUri), error->range->copy(),
-                                              make_unique<CodeActionContext>(move(diagnostics)));
-            auto req = make_unique<RequestMessage>("2.0", nextId++, LSPMethod::TextDocumentCodeAction, move(params));
-            auto responses = getLSPResponsesFor(lspWrapper, make_unique<LSPMessage>(move(req)));
-            {
-                INFO("Did not receive exactly one response for a codeAction request.");
-                CHECK_EQ(responses.size(), 1);
-            }
-            if (responses.size() != 1) {
-                continue;
+        if (ignoredCodeActionKinds.empty()) {
+            // Request code actions for each of this file's error.
+            for (auto &error : errorsByFilename[filename]) {
+                validateCodeActions(lspWrapper, test, fileUri, error->range->copy(), nextId, selectedCodeActionKinds,
+                                    ignoredCodeActionKinds, applyCodeActionAssertions, error->toString(), false);
             }
 
-            auto &msg = responses.at(0);
-            CHECK(msg->isResponse());
-            if (!msg->isResponse()) {
-                continue;
+            // This weird loop is here because `validateCodeActions` erases the elements from
+            // `applyCodeActionAssertions` and we are iterating over that container
+            while (!applyCodeActionAssertions.empty()) {
+                auto initialSize = applyCodeActionAssertions.size();
+                if (applyCodeActionAssertions.empty()) {
+                    break;
+                }
+                auto codeActionAssertion = applyCodeActionAssertions.at(0);
+                validateCodeActions(lspWrapper, test, fileUri, codeActionAssertion->range->copy(), nextId,
+                                    selectedCodeActionKinds, ignoredCodeActionKinds, applyCodeActionAssertions,
+                                    codeActionAssertion->toString(), true);
+                REQUIRE_LT(applyCodeActionAssertions.size(), initialSize);
             }
 
-            auto &response = msg->asResponse();
-            REQUIRE_MESSAGE(response.result, "Code action request returned error: " << msg->toJSON());
-            auto &receivedCodeActionResponse =
-                get<variant<JSONNullObject, vector<unique_ptr<CodeAction>>>>(*response.result);
-            CHECK_FALSE(get_if<JSONNullObject>(&receivedCodeActionResponse));
-            if (get_if<JSONNullObject>(&receivedCodeActionResponse)) {
-                continue;
-            }
-
-            UnorderedMap<string, unique_ptr<CodeAction>> receivedCodeActionsByTitle;
-            auto &receivedCodeActions = get<vector<unique_ptr<CodeAction>>>(receivedCodeActionResponse);
-            unique_ptr<CodeAction> sourceLevelCodeAction;
-            // One code action should be a 'source' level code action. Remove it.
-            if (!receivedCodeActions.empty()) {
-                for (auto it = receivedCodeActions.begin(); it != receivedCodeActions.end();) {
-                    if ((*it)->kind == CodeActionKind::SourceFixAllSorbet) {
-                        INFO("Received multiple source-level code actions");
-                        CHECK_EQ(sourceLevelCodeAction, nullptr);
-                        sourceLevelCodeAction = move(*it);
-                        // Remove from vector and continue
-                        it = receivedCodeActions.erase(it);
-                    } else {
-                        it++;
-                    }
-                }
-                INFO("Expected one source-level code action for code action request");
-                CHECK_NE(sourceLevelCodeAction, nullptr);
-            }
-
-            for (auto &codeAction : receivedCodeActions) {
-                // We send two identical "Apply all Sorbet autocorrects" code actions with different kinds: One is a
-                // Source, the other is a Quickfix. This logic strips out the quickfix.
-                if (sourceLevelCodeAction != nullptr && codeAction->title == sourceLevelCodeAction->title) {
-                    continue;
-                }
-
-                bool codeActionTitleUnique =
-                    receivedCodeActionsByTitle.find(codeAction->title) == receivedCodeActionsByTitle.end();
-                CHECK_MESSAGE(codeActionTitleUnique, "Found code action with duplicate title: " << codeAction->title);
-
-                if (codeActionTitleUnique) {
-                    receivedCodeActionsByTitle[codeAction->title] = move(codeAction);
-                }
-            }
-
-            uint32_t receivedCodeActionsCount = receivedCodeActionsByTitle.size();
-            vector<shared_ptr<ApplyCodeActionAssertion>> matchedCodeActionAssertions;
-
-            // Test code action assertions matching the range of this error.
-            auto it = applyCodeActionAssertions.begin();
-            while (it != applyCodeActionAssertions.end()) {
-                auto codeActionAssertion = it->get();
-                if (!(error->range->start->cmp(*codeActionAssertion->range->start) <= 0 &&
-                      error->range->end->cmp(*codeActionAssertion->range->end) >= 0)) {
-                    ++it;
-                    continue;
-                }
-
-                // Ensure we received a code action matching the assertion.
-                auto it2 = receivedCodeActionsByTitle.find(codeActionAssertion->title);
-                {
-                    INFO(fmt::format("Did not receive code action matching assertion `{}` for error `{}`...",
-                                     codeActionAssertion->toString(), error->toString()));
-                    CHECK_NE(it2, receivedCodeActionsByTitle.end());
-                }
-
-                // Ensure that the received code action applies correctly.
-                if (it2 != receivedCodeActionsByTitle.end()) {
-                    auto codeAction = move(it2->second);
-                    codeActionAssertion->check(test.sourceFileContents, lspWrapper, *codeAction.get());
-
-                    // Some bookkeeping to make surfacing errors re. extra/insufficient
-                    // apply-code-action annotations easier.
-                    receivedCodeActionsByTitle.erase(it2);
-                    matchedCodeActionAssertions.emplace_back(*it);
-                    it = applyCodeActionAssertions.erase(it);
-                } else {
-                    ++it;
-                }
-            }
-
-            if (exhaustiveApplyCodeAction) {
-                if (matchedCodeActionAssertions.size() > receivedCodeActionsCount) {
-                    FAIL_CHECK(fmt::format(
-                        "Found apply-code-action assertions without "
-                        "corresponding code actions from the server:\n{}",
-                        fmt::map_join(applyCodeActionAssertions.begin(), applyCodeActionAssertions.end(), ", ",
-                                      [](const auto &assertion) -> string { return assertion->toString(); })));
-                } else if (matchedCodeActionAssertions.size() < receivedCodeActionsCount) {
-                    FAIL_CHECK(fmt::format(
-                        "Received code actions without corresponding apply-code-action assertions:\n{}",
-                        fmt::map_join(receivedCodeActionsByTitle.begin(), receivedCodeActionsByTitle.end(), "\n",
-                                      [](const auto &action) -> string { return action.second->toJSON(); })));
-                }
+            // We've already removed any code action assertions that matches a received code action assertion.
+            // Any remaining are therefore extraneous.
+            INFO(fmt::format("Found extraneous apply-code-action assertions:\n{}",
+                             fmt::map_join(applyCodeActionAssertions, "\n",
+                                           [](const auto &assertion) -> string { return assertion->toString(); })));
+            CHECK_EQ(applyCodeActionAssertions.size(), 0);
+        } else {
+            for (auto assertion : applyCodeActionAssertions) {
+                validateCodeActionAbsence(lspWrapper, fileUri, assertion->range->copy(), nextId,
+                                          selectedCodeActionKinds, ignoredCodeActionKinds);
             }
         }
-
-        // We've already removed any code action assertions that matches a received code action assertion.
-        // Any remaining are therefore extraneous.
-        INFO(fmt::format("Found extraneous apply-code-action assertions:\n{}",
-                         fmt::map_join(applyCodeActionAssertions.begin(), applyCodeActionAssertions.end(), "\n",
-                                       [](const auto &assertion) -> string { return assertion->toString(); })));
-        CHECK_EQ(applyCodeActionAssertions.size(), 0);
     }
 }
 
@@ -257,13 +427,17 @@ void testDocumentSymbols(LSPWrapper &lspWrapper, Expectations &test, int &nextId
     // Simple string comparison, just like other *.exp files.
     CHECK_EQ_DIFF(documentSymbolsToString(expectedSymbolResponse), documentSymbolsToString(receivedSymbolResponse),
                   "Mismatch on: " + expectedSymbolsPath);
+
+    // VSCode validates document symbols, so we should too.
+    if (auto *syms = get_if<vector<unique_ptr<DocumentSymbol>>>(&receivedSymbolResponse)) {
+        for (auto &sym : *syms) {
+            validateDocumentSymbol(sym);
+        }
+    }
 }
 
 void testDocumentFormatting(LSPWrapper &lspWrapper, Expectations &test, int &nextId, string_view uri,
                             string_view testFile) {
-    if (!rubyfmt_enabled) {
-        return;
-    }
     auto expectationFileName = test.expectations["document-formatting-rubyfmt"][testFile];
     if (expectationFileName.empty()) {
         // No .exp file found; nothing to do.
@@ -274,27 +448,78 @@ void testDocumentFormatting(LSPWrapper &lspWrapper, Expectations &test, int &nex
                                                         make_unique<FormattingOptions>(4, 4));
     auto req = make_unique<RequestMessage>("2.0", nextId++, LSPMethod::TextDocumentFormatting, move(params));
     auto responses = getLSPResponsesFor(lspWrapper, make_unique<LSPMessage>(move(req)));
-    {
+
+    // successful response
+    if (responses.at(0)->isResponse()) {
         INFO("Did not receive exactly one response for a documentFormatting request.");
         REQUIRE_EQ(responses.size(), 1);
+        auto &msg = responses.at(0);
+        REQUIRE(msg->isResponse());
+        auto &response = msg->asResponse();
+        REQUIRE_MESSAGE(response.result, "Document formatting request returned error: " << msg->toJSON());
+        auto &receivedFormattingResponse = get<variant<JSONNullObject, vector<unique_ptr<TextEdit>>>>(*response.result);
+        auto expectedOutput = FileOps::read(test.folder + expectationFileName);
+        if (auto *edits = get_if<vector<unique_ptr<TextEdit>>>(&receivedFormattingResponse)) {
+            // We can support multiple edits, but right now the impl only returns one.
+            REQUIRE_EQ(1, edits->size());
+            auto formattedText = (*edits)[0]->newText;
+            REQUIRE_EQ(expectedOutput, formattedText);
+        } else {
+            // Syntax error responses return null
+            auto isJSONNullObject = std::holds_alternative<JSONNullObject>(receivedFormattingResponse);
+            REQUIRE(isJSONNullObject);
+            REQUIRE_EQ(expectedOutput, "");
+        }
+    } else {
+        // Error responses return both a user notification and an LSP error
+        REQUIRE_EQ(responses.size(), 2);
+        REQUIRE(responses.at(0)->isNotification());
+        auto &errorMsg = responses.at(1);
+        REQUIRE(errorMsg->isResponse());
+        auto &receivedErrorResponse = *errorMsg->asResponse().error;
+        auto expectedOutput = FileOps::read(test.folder + expectationFileName);
+        REQUIRE_EQ(expectedOutput, receivedErrorResponse->message);
     }
-    auto &msg = responses.at(0);
-    REQUIRE(msg->isResponse());
-    auto &response = msg->asResponse();
-    REQUIRE_MESSAGE(response.result, "Document formatting request returned error: " << msg->toJSON());
-    auto &receivedFormattingResponse = get<variant<JSONNullObject, vector<unique_ptr<TextEdit>>>>(*response.result);
-    string formattedText = string(test.sourceFileContents[testFile]->source());
-    if (auto *edits = get_if<vector<unique_ptr<TextEdit>>>(&receivedFormattingResponse)) {
-        // We can support multiple edits, but right now the impl only returns one.
-        REQUIRE_EQ(1, edits->size());
-        formattedText = (*edits)[0]->newText;
+}
+
+enum class ExpectDiagnosticMessages {
+    No = 0,
+    Yes = 1,
+};
+
+// Check responses for a SorbetTypecheckRunInfo notification with the expected
+// status.  If such a notification is found, run custom logic via the handler.
+void verifyTypecheckRunInfo(const string &errorPrefix, vector<unique_ptr<LSPMessage>> &responses,
+                            SorbetTypecheckRunStatus expectedStatus, ExpectDiagnosticMessages expectDiagnostics,
+                            function<void(unique_ptr<SorbetTypecheckRunInfo> &)> handler) {
+    bool foundTypecheckRunInfo = false;
+
+    for (auto &r : responses) {
+        if (!r->isNotification()) {
+            FAIL_CHECK(errorPrefix << "Sorbet sent an unexpected message");
+            continue;
+        }
+
+        if (r->method() != LSPMethod::SorbetTypecheckRunInfo) {
+            if (expectDiagnostics == ExpectDiagnosticMessages::Yes &&
+                r->method() == LSPMethod::TextDocumentPublishDiagnostics) {
+                continue;
+            }
+            FAIL_CHECK(errorPrefix << fmt::format("Unexpected message response to file update of type {}:\n{}",
+                                                  convertLSPMethodToString(r->method()), r->toJSON()));
+            continue;
+        }
+
+        auto &params = get<unique_ptr<SorbetTypecheckRunInfo>>(r->asNotification().params);
+        if (params->status == expectedStatus) {
+            foundTypecheckRunInfo = true;
+            handler(params);
+        }
     }
 
-    auto expectedFormattingPath = test.folder + expectationFileName;
-    auto expectedFormattedText = FileOps::read(expectedFormattingPath);
-
-    // Simple string comparison, just like other *.exp files.
-    CHECK_EQ_DIFF(expectedFormattedText, formattedText, "Mismatch on: " + expectedFormattingPath);
+    if (!foundTypecheckRunInfo) {
+        FAIL_CHECK(errorPrefix << "Sorbet did not send expected typechecking metadata.");
+    }
 }
 
 TEST_CASE("LSPTest") {
@@ -319,26 +544,37 @@ TEST_CASE("LSPTest") {
     {
         shared_ptr<realmain::options::Options> opts = make_shared<realmain::options::Options>();
         opts->noStdlib = BooleanPropertyAssertion::getValue("no-stdlib", assertions).value_or(false);
+        opts->ruby3KeywordArgs =
+            BooleanPropertyAssertion::getValue("experimental-ruby3-keyword-args", assertions).value_or(false);
         opts->requiresAncestorEnabled =
             BooleanPropertyAssertion::getValue("enable-experimental-requires-ancestor", assertions).value_or(false);
         opts->stripePackages = BooleanPropertyAssertion::getValue("enable-packager", assertions).value_or(false);
         if (opts->stripePackages) {
-            auto extraDir = StringPropertyAssertion::getValue("extra-package-files-directory-prefix", assertions);
-            if (extraDir.has_value()) {
-                opts->extraPackageFilesDirectoryPrefixes.emplace_back(extraDir.value());
+            auto extraDirUnderscore =
+                StringPropertyAssertion::getValue("extra-package-files-directory-prefix-underscore", assertions);
+            if (extraDirUnderscore.has_value()) {
+                opts->extraPackageFilesDirectoryUnderscorePrefixes.emplace_back(extraDirUnderscore.value());
+            }
+            auto extraDirSlash =
+                StringPropertyAssertion::getValue("extra-package-files-directory-prefix-slash", assertions);
+            if (extraDirSlash.has_value()) {
+                opts->extraPackageFilesDirectorySlashPrefixes.emplace_back(extraDirSlash.value());
             }
             opts->secondaryTestPackageNamespaces.emplace_back("Critic");
         }
-        // Set to a number that is reasonable large for tests, but small enough that we can have a test to handle this
-        // edge case. If you change this number, update the `lsp/fast_path/too_many_files` and `not_enough_files` tests.
+        opts->disableWatchman = true;
+        opts->rubyfmtPath = "test/testdata/lsp/rubyfmt-stub/rubyfmt";
+        opts->lspExperimentalFastPathEnabled = true;
+
+        // Set to a number that is reasonable large for tests, but small enough that we can have a test to handle
+        // this edge case. If you change this number, `fast_path/{too_many_files,not_enough_files,initialize}` will
+        // need to be changed as well.
         opts->lspMaxFilesOnFastPath = 10;
         lspWrapper = SingleThreadedLSPWrapper::create("", move(opts));
         lspWrapper->enableAllExperimentalFeatures();
     }
 
     if (test.expectations.contains("autogen")) {
-        // When autogen is enabled, skip Rewriter passes...
-        lspWrapper->opts->skipRewriterPasses = true;
         // Some autogen tests assume that some errors will occur from the resolver step, others assume the resolver
         // won't run.
         if (!RangeAssertion::getErrorAssertions(assertions).empty()) {
@@ -351,6 +587,8 @@ TEST_CASE("LSPTest") {
     }
 
     const auto &config = lspWrapper->config();
+    auto shouldUseCodeActionResolve =
+        BooleanPropertyAssertion::getValue("use-code-action-resolve", assertions).value_or(true);
 
     // Perform initialize / initialized handshake.
     {
@@ -358,8 +596,8 @@ TEST_CASE("LSPTest") {
         string rootUri = fmt::format("file://{}", rootPath);
         auto sorbetInitOptions = make_unique<SorbetInitializationOptions>();
         sorbetInitOptions->enableTypecheckInfo = true;
-        auto initializedResponses =
-            initializeLSP(rootPath, rootUri, *lspWrapper, nextId, true, move(sorbetInitOptions));
+        auto initializedResponses = initializeLSP(rootPath, rootUri, *lspWrapper, nextId, true,
+                                                  shouldUseCodeActionResolve, move(sorbetInitOptions));
         INFO("Should not receive any response to 'initialized' message.");
         CHECK_EQ(0, countNonTestMessages(initializedResponses));
     }
@@ -481,6 +719,19 @@ TEST_CASE("LSPTest") {
             // Shouldn't be possible to have an entry with 0 assertions, but explicitly check anyway.
             CHECK_GE(entryAssertions.size(), 1);
 
+            // Collect importUsageAssertions into a separate collection to handle them differently.
+            std::vector<shared_ptr<RangeAssertion>> importUsageAssertions;
+            entryAssertions.erase(std::remove_if(entryAssertions.begin(), entryAssertions.end(),
+                                                 [&](auto &assertion) -> bool {
+                                                     if (dynamic_pointer_cast<ImportUsageAssertion>(assertion)) {
+                                                         importUsageAssertions.emplace_back(assertion);
+                                                         return true;
+                                                     }
+
+                                                     return false;
+                                                 }),
+                                  entryAssertions.end());
+
             for (auto &assertion : entryAssertions) {
                 string_view symbol;
                 vector<int> versions;
@@ -520,20 +771,30 @@ TEST_CASE("LSPTest") {
                 }
 
                 auto queryLoc = assertion->getLocation(config);
+
                 // Check that a definition request at this location returns defs.
                 DefAssertion::check(test.sourceFileContents, *lspWrapper, nextId, *queryLoc, defs);
-                // Check that a reference request at this location returns entryAssertions.
-                UsageAssertion::check(test.sourceFileContents, *lspWrapper, nextId, symbol, *queryLoc, entryAssertions);
-                // Check that a highlight request at this location returns all of the entryAssertions for the same
-                // file as the request.
-                vector<shared_ptr<RangeAssertion>> filteredEntryAssertions;
-                for (auto &e : entryAssertions) {
-                    if (absl::StartsWith(e->getLocation(config)->uri, queryLoc->uri)) {
-                        filteredEntryAssertions.push_back(e);
+                if (dynamic_pointer_cast<ImportAssertion>(assertion)) {
+                    // For an ImportAssertion, check that a reference request at this location returns
+                    // importUsageAssertions.
+                    UsageAssertion::check(test.sourceFileContents, *lspWrapper, nextId, symbol, *queryLoc,
+                                          importUsageAssertions);
+                } else {
+                    // For a regular UsageAssertion, check that a reference request at this location returns
+                    // entryAssertions.
+                    UsageAssertion::check(test.sourceFileContents, *lspWrapper, nextId, symbol, *queryLoc,
+                                          entryAssertions);
+                    // Check that a highlight request at this location returns all of the entryAssertions for the same
+                    // file as the request.
+                    vector<shared_ptr<RangeAssertion>> filteredEntryAssertions;
+                    for (auto &e : entryAssertions) {
+                        if (absl::StartsWith(e->getLocation(config)->uri, queryLoc->uri)) {
+                            filteredEntryAssertions.push_back(e);
+                        }
                     }
+                    UsageAssertion::checkHighlights(test.sourceFileContents, *lspWrapper, nextId, symbol, *queryLoc,
+                                                    filteredEntryAssertions);
                 }
-                UsageAssertion::checkHighlights(test.sourceFileContents, *lspWrapper, nextId, symbol, *queryLoc,
-                                                filteredEntryAssertions);
             }
         }
 
@@ -588,54 +849,59 @@ TEST_CASE("LSPTest") {
         // Apply updates in order.
         for (auto version : sortedUpdates) {
             auto errorPrefix = fmt::format("[*.{}.rbupdate] ", version);
-            auto &updates = test.sourceLSPFileUpdates[version];
+            const auto &updates = test.sourceLSPFileUpdates[version];
             vector<unique_ptr<LSPMessage>> lspUpdates;
             UnorderedMap<std::string, std::shared_ptr<core::File>> updatesAndContents;
 
-            for (auto &update : updates) {
+            for (const auto &update : updates) {
                 auto originalFile = test.folder + update.first;
                 auto updateFile = test.folder + update.second;
                 auto fileContents = FileOps::read(updateFile);
-                lspUpdates.push_back(makeChange(testFileUris[originalFile], fileContents, baseVersion + version));
                 updatesAndContents[originalFile] =
                     make_shared<core::File>(string(originalFile), move(fileContents), core::File::Type::Normal);
             }
             auto assertions = RangeAssertion::parseAssertions(updatesAndContents);
+            for (const auto &update : updates) {
+                auto originalFile = test.folder + update.first;
+                auto updateFile = test.folder + update.second;
+
+                auto fileContents = updatesAndContents[originalFile]->source();
+                if (!absl::StrContains(fileContents, "# exclude-from-file-update: true")) {
+                    // Allow some files in the version to only be used for the sake of asserting
+                    // errors that occur after the update, not extending the file update itself.
+                    lspUpdates.push_back(makeChange(testFileUris[originalFile], fileContents, baseVersion + version));
+                }
+            }
             auto assertFastPath = FastPathAssertion::get(assertions);
             auto assertSlowPath = BooleanPropertyAssertion::getValue("assert-slow-path", assertions);
             auto responses = getLSPResponsesFor(*lspWrapper, move(lspUpdates));
-            bool foundTypecheckRunInfo = false;
 
-            for (auto &r : responses) {
-                if (r->isNotification()) {
-                    if (r->method() == LSPMethod::SorbetTypecheckRunInfo) {
-                        auto &params = get<unique_ptr<SorbetTypecheckRunInfo>>(r->asNotification().params);
-                        // Ignore started messages. Note that cancelation messages cannot occur in test_corpus since
-                        // test_corpus only runs LSP in single-threaded mode.
-                        if (params->status == SorbetTypecheckRunStatus::Ended) {
-                            foundTypecheckRunInfo = true;
-                            if (assertSlowPath.value_or(false)) {
-                                INFO(errorPrefix << "Expected Sorbet to take slow path, but it took the fast path.");
-                                CHECK_EQ(params->fastPath, false);
-                            }
-                            if (assertFastPath.has_value()) {
-                                (*assertFastPath)->check(*params, test.folder, version, errorPrefix);
-                            }
+            // Ignore started messages.  Note that cancelation messages cannot occur
+            // in this codepath since we are running in single-threaded mode.
+            verifyTypecheckRunInfo(
+                errorPrefix, responses, SorbetTypecheckRunStatus::Ended, ExpectDiagnosticMessages::Yes,
+                [&errorPrefix, assertSlowPath, &assertFastPath, &test,
+                 &version](unique_ptr<SorbetTypecheckRunInfo> &params) -> void {
+                    auto validateAssertions = [&params, &errorPrefix](TypecheckingPath path, string actualPath,
+                                                                      bool assertValue, string expectedPath) {
+                        auto isSelectedPath = params->typecheckingPath == path;
+                        if (isSelectedPath && assertValue) {
+                            INFO(errorPrefix << fmt::format("Expected Sorbet to take {} path, but it took the {} path.",
+                                                            expectedPath, actualPath));
+                            CHECK_NE(isSelectedPath, assertValue);
+                        } else if (!isSelectedPath && !assertValue) {
+                            INFO(errorPrefix << fmt::format("Expected Sorbet to take {} path, but it took the {} path.",
+                                                            expectedPath, actualPath));
+                            CHECK_NE(isSelectedPath, assertValue);
                         }
-                    } else if (r->method() != LSPMethod::TextDocumentPublishDiagnostics) {
-                        FAIL_CHECK(errorPrefix
-                                   << fmt::format("Unexpected message response to file update of type {}:\n{}",
-                                                  convertLSPMethodToString(r->method()), r->toJSON()));
+                    };
+                    if (assertSlowPath.has_value()) {
+                        validateAssertions(TypecheckingPath::Fast, "fast", assertSlowPath.value(), "slow");
                     }
-                } else {
-                    FAIL_CHECK(errorPrefix
-                               << fmt::format("Unexpected message response to file update:\n{}", r->toJSON()));
-                }
-            }
-
-            if (!foundTypecheckRunInfo) {
-                FAIL_CHECK(errorPrefix << "Sorbet did not send expected typechecking metadata.");
-            }
+                    if (assertFastPath.has_value()) {
+                        (*assertFastPath)->check(*params, test.folder, version, errorPrefix);
+                    }
+                });
 
             updateDiagnostics(config, testFileUris, responses, diagnostics);
 

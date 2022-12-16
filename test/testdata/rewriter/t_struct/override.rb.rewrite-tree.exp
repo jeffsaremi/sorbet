@@ -6,7 +6,7 @@ class <emptyTree><<C <root>>> < (::<todo sym>)
 
     def initialize<<todo method>>(foo:, &<blk>)
       begin
-        @foo = ::T.let(foo, <emptyTree>::<C String>)
+        @foo = <cast:let>(foo, <todo sym>, <emptyTree>::<C String>)
         nil
       end
     end
@@ -35,17 +35,17 @@ class <emptyTree><<C <root>>> < (::<todo sym>)
       <self>.puts("override")
     end
 
-    ::Sorbet::Private::Static.keep_def(<self>, :initialize, :normal)
+    <runtime method definition of initialize>
 
     <self>.extend(<emptyTree>::<C T>::<C Sig>)
 
     <self>.prop(:foo, <emptyTree>::<C String>, :without_accessors, true)
 
-    ::Sorbet::Private::Static.keep_def(<self>, :foo, :attr_reader)
+    <runtime method definition of foo>
 
-    ::Sorbet::Private::Static.keep_def(<self>, :foo=, :normal)
+    <runtime method definition of foo=>
 
-    ::Sorbet::Private::Static.keep_def(<self>, :initialize, :normal)
+    <runtime method definition of initialize>
   end
 
   <emptyTree>::<C Override>.new()

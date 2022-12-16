@@ -1,6 +1,7 @@
 ---
 id: nilable-types
 title: Nilable Types
+sidebar_label: Nilable Types (T.nilable)
 ---
 
 Sorbet can track when a value is allowed to be `nil`, or when a value of a
@@ -129,6 +130,8 @@ this code's correctness from Sorbet to the programmer, and we as programmers can
 "prove" that this code is not nil using whatever means is convenient (tests,
 observability, etc.). In fact, it's the same tradeoff we make every time we
 `raise` an exception, and comes with the same set of caution labels:
+
+→ For more information, see the [`T.must` docs](type-assertions.md#tmust).
 
 > **Note**: Like all other type checks in Sorbet, `T.must` will raise at runtime
 > if it fails. For more information, see [Enabling Runtime Checks](runtime.md).

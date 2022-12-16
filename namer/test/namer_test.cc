@@ -14,14 +14,12 @@
 #include "spdlog/sinks/stdout_color_sinks.h"
 #include "spdlog/spdlog.h"
 
-namespace spd = spdlog;
-
 using namespace std;
 
 namespace sorbet::namer::test {
 
 namespace {
-auto logger = spd::stderr_color_mt("namer_test");
+auto logger = spdlog::stderr_color_mt("namer_test");
 auto errorQueue = make_shared<sorbet::core::ErrorQueue>(*logger, *logger);
 
 static string_view testClass_str = "Test"sv;
@@ -30,8 +28,8 @@ ast::ParsedFile getTree(core::GlobalState &gs, string str) {
     sorbet::core::UnfreezeNameTable nameTableAccess(gs); // enters original strings
     sorbet::core::UnfreezeFileTable ft(gs);              // enters original strings
     auto file = gs.enterFile("<test>", str);
-    auto trace = false;
-    auto tree = parser::Parser::run(gs, file, trace);
+    auto settings = parser::Parser::Settings{};
+    auto tree = parser::Parser::run(gs, file, settings);
     file.data(gs).strictLevel = core::StrictLevel::Strict;
     sorbet::core::MutableContext ctx(gs, core::Symbols::root(), file);
     auto ast = ast::desugar::node2Tree(ctx, move(tree));
@@ -47,7 +45,8 @@ vector<ast::ParsedFile> runNamer(core::GlobalState &gs, ast::ParsedFile tree) {
     vector<ast::ParsedFile> v;
     v.emplace_back(move(tree));
     auto workers = WorkerPool::create(0, *logger);
-    return move(namer::Namer::run(gs, move(v), *workers).result());
+    core::FoundDefHashes foundHashes; // compute this just for test coverage
+    return move(namer::Namer::run(gs, move(v), *workers, &foundHashes).result());
 }
 
 } // namespace
@@ -66,7 +65,7 @@ TEST_CASE("namer tests") {
         }
 
         const auto &objectScope = core::Symbols::Object().data(gs);
-        REQUIRE_EQ(core::Symbols::root(), objectScope->owner.asClassOrModuleRef());
+        REQUIRE_EQ(core::Symbols::root(), objectScope->owner);
 
         REQUIRE_EQ(4, objectScope->members().size());
         auto methodSym = objectScope->members().at(gs.enterNameUTF8("hello_world")).asMethodRef();

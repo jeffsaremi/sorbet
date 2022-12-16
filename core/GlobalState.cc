@@ -3,7 +3,7 @@
 #include "common/Timer.h"
 #include "common/sort.h"
 #include "core/Error.h"
-#include "core/NameHash.h"
+#include "core/FileHash.h"
 #include "core/Names.h"
 #include "core/Names_gen.h"
 #include "core/NullFlusher.h"
@@ -130,23 +130,127 @@ MethodBuilder enterMethod(GlobalState &gs, ClassOrModuleRef klass, NameRef name)
     return MethodBuilder{gs, gs.enterMethodSymbol(Loc::none(), klass, name)};
 }
 
+struct ParentLinearizationInformation {
+    const InlinedVector<core::ClassOrModuleRef, 4> &mixins;
+    core::ClassOrModuleRef superClass;
+    core::ClassOrModuleRef klass;
+    InlinedVector<core::ClassOrModuleRef, 4> fullLinearizationSlow(core::GlobalState &gs);
+};
+
+int maybeAddMixin(core::GlobalState &gs, core::ClassOrModuleRef forSym,
+                  InlinedVector<core::ClassOrModuleRef, 4> &mixinList, core::ClassOrModuleRef mixin,
+                  core::ClassOrModuleRef parent, int pos) {
+    if (forSym == mixin) {
+        Exception::raise("Loop in mixins");
+    }
+    if (parent.data(gs)->derivesFrom(gs, mixin)) {
+        return pos;
+    }
+    auto fnd = find(mixinList.begin(), mixinList.end(), mixin);
+    if (fnd != mixinList.end()) {
+        auto newPos = fnd - mixinList.begin();
+        if (newPos >= pos) {
+            return newPos + 1;
+        }
+        return pos;
+    } else {
+        mixinList.insert(mixinList.begin() + pos, mixin);
+        return pos + 1;
+    }
+}
+
+// ** This implements Dmitry's understanding of Ruby linerarization with an optimization that common
+// tails of class linearization aren't copied around.
+// In order to obtain Ruby-side ancestors, one would need to walk superclass chain and concatenate `mixins`.
+// The algorithm is harder to explain than to code, so just follow code & tests if `testdata/resolver/linearization`
+ParentLinearizationInformation computeClassLinearization(core::GlobalState &gs, core::ClassOrModuleRef ofClass) {
+    ENFORCE_NO_TIMER(ofClass.exists());
+    auto data = ofClass.data(gs);
+    if (!data->flags.isLinearizationComputed) {
+        if (data->superClass().exists()) {
+            computeClassLinearization(gs, data->superClass());
+        }
+        InlinedVector<core::ClassOrModuleRef, 4> currentMixins = data->mixins();
+        InlinedVector<core::ClassOrModuleRef, 4> newMixins;
+        for (auto mixin : currentMixins) {
+            ENFORCE(mixin != core::Symbols::PlaceholderMixin(), "Resolver failed to replace all placeholders");
+            if (mixin == data->superClass()) {
+                continue;
+            }
+            if (mixin.data(gs)->superClass() == core::Symbols::StubSuperClass() ||
+                mixin.data(gs)->superClass() == core::Symbols::StubModule()) {
+                newMixins.emplace_back(mixin);
+                continue;
+            }
+            ParentLinearizationInformation mixinLinearization = computeClassLinearization(gs, mixin);
+
+            if (!mixin.data(gs)->flags.isModule) {
+                // insert all transitive parents of class to bring methods back.
+                auto allMixins = mixinLinearization.fullLinearizationSlow(gs);
+                newMixins.insert(newMixins.begin(), allMixins.begin(), allMixins.end());
+            } else {
+                int pos = 0;
+                pos = maybeAddMixin(gs, ofClass, newMixins, mixin, data->superClass(), pos);
+                for (auto &mixinLinearizationComponent : mixinLinearization.mixins) {
+                    pos = maybeAddMixin(gs, ofClass, newMixins, mixinLinearizationComponent, data->superClass(), pos);
+                }
+            }
+        }
+        data->mixins() = std::move(newMixins);
+        data->flags.isLinearizationComputed = true;
+        if (debug_mode) {
+            for (auto oldMixin : currentMixins) {
+                ENFORCE(ofClass.data(gs)->derivesFrom(gs, oldMixin), "{} no longer derives from {}",
+                        ofClass.showFullName(gs), oldMixin.showFullName(gs));
+            }
+        }
+    }
+    ENFORCE_NO_TIMER(data->flags.isLinearizationComputed);
+    return ParentLinearizationInformation{data->mixins(), data->superClass(), ofClass};
+}
+
+void fullLinearizationSlowImpl(core::GlobalState &gs, const ParentLinearizationInformation &info,
+                               InlinedVector<core::ClassOrModuleRef, 4> &acc) {
+    ENFORCE(!absl::c_linear_search(acc, info.klass));
+    acc.emplace_back(info.klass);
+
+    for (auto m : info.mixins) {
+        if (!absl::c_linear_search(acc, m)) {
+            if (m.data(gs)->flags.isModule) {
+                acc.emplace_back(m);
+            } else {
+                fullLinearizationSlowImpl(gs, computeClassLinearization(gs, m), acc);
+            }
+        }
+    }
+    if (info.superClass.exists()) {
+        if (!absl::c_linear_search(acc, info.superClass)) {
+            fullLinearizationSlowImpl(gs, computeClassLinearization(gs, info.superClass), acc);
+        }
+    }
+};
+InlinedVector<core::ClassOrModuleRef, 4> ParentLinearizationInformation::fullLinearizationSlow(core::GlobalState &gs) {
+    InlinedVector<core::ClassOrModuleRef, 4> res;
+    fullLinearizationSlowImpl(gs, *this, res);
+    return res;
+}
+
 } // namespace
 
-ClassOrModuleRef GlobalState::synthesizeClass(NameRef nameId, uint32_t superclass, bool isModule) {
+ClassOrModuleRef GlobalState::synthesizeClass(NameRef name, uint32_t superclass, bool isModule) {
     // This can't use enterClass since there is a chicken and egg problem.
     // These will be added to Symbols::root().members later.
     ClassOrModuleRef symRef = ClassOrModuleRef(*this, classAndModules.size());
     classAndModules.emplace_back();
-    SymbolData data = symRef.dataAllowingNone(*this); // allowing noSymbol is needed because this enters noSymbol.
-    data->name = nameId;
+    ClassOrModuleData data =
+        symRef.dataAllowingNone(*this); // allowing noSymbol is needed because this enters noSymbol.
+    data->name = name;
     data->owner = Symbols::root();
-    data->flags = 0;
-    data->setClassOrModule();
     data->setIsModule(isModule);
     data->setSuperClass(ClassOrModuleRef(*this, superclass));
 
     if (symRef.id() > Symbols::root().id()) {
-        Symbols::root().data(*this)->members()[nameId] = symRef;
+        Symbols::root().data(*this)->members()[name] = symRef;
     }
     return symRef;
 }
@@ -243,8 +347,6 @@ void GlobalState::initEmpty() {
     ENFORCE(klass == Symbols::NilClass());
     klass = synthesizeClass(core::Names::Constants::Untyped(), 0);
     ENFORCE(klass == Symbols::untyped());
-    klass = synthesizeClass(core::Names::Constants::Opus(), 0, true);
-    ENFORCE(klass == Symbols::Opus());
     klass = synthesizeClass(core::Names::Constants::T(), Symbols::todo().id(), true);
     ENFORCE(klass == Symbols::T());
     klass = synthesizeClass(core::Names::Constants::Class(), 0);
@@ -386,6 +488,8 @@ void GlobalState::initEmpty() {
     ENFORCE(klass == Symbols::Enumerator());
     klass = enterClassSymbol(Loc::none(), Symbols::T(), core::Names::Constants::Enumerator());
     ENFORCE(klass == Symbols::T_Enumerator());
+    klass = enterClassSymbol(Loc::none(), Symbols::T_Enumerator(), core::Names::Constants::Lazy());
+    ENFORCE(klass == Symbols::T_Enumerator_Lazy());
 
     klass = enterClassSymbol(Loc::none(), Symbols::T(), core::Names::Constants::Struct());
     ENFORCE(klass == Symbols::T_Struct());
@@ -401,7 +505,7 @@ void GlobalState::initEmpty() {
     method = enterMethod(*this, Symbols::T_Sig(), Names::sig()).defaultArg(Names::arg0()).build();
     ENFORCE(method == Symbols::sig());
 
-    // Enumerable::Lazy
+    // Enumerator::Lazy
     klass = enterClassSymbol(Loc::none(), Symbols::Enumerator(), core::Names::Constants::Lazy());
     ENFORCE(klass == Symbols::Enumerator_Lazy());
 
@@ -416,6 +520,11 @@ void GlobalState::initEmpty() {
     ENFORCE(klass == Symbols::T_Private_Types_Void_VOID());
     klass = klass.data(*this)->singletonClass(*this);
     ENFORCE(klass == Symbols::T_Private_Types_Void_VOIDSingleton());
+    klass = enterClassSymbol(Loc::none(), Symbols::T_Private(), Names::Constants::Methods());
+    ENFORCE(klass == Symbols::T_Private_Methods());
+    klass = enterClassSymbol(Loc::none(), Symbols::T_Private_Methods(), Names::Constants::DeclBuilder());
+    klass.data(*this)->setIsModule(false);
+    ENFORCE(klass == Symbols::T_Private_Methods_DeclBuilder());
 
     // T.class_of(T::Sig::WithoutRuntime)
     klass = Symbols::T_Sig_WithoutRuntime().data(*this)->singletonClass(*this);
@@ -435,10 +544,8 @@ void GlobalState::initEmpty() {
                  .build();
     ENFORCE(method == Symbols::SorbetPrivateStaticSingleton_sig());
 
-    klass = enterClassSymbol(Loc::none(), Symbols::root(), Names::Constants::PackageRegistry());
-    ENFORCE(klass == Symbols::PackageRegistry());
-    klass = enterClassSymbol(Loc::none(), Symbols::root(), Names::Constants::PackageTests());
-    ENFORCE(klass == Symbols::PackageTests());
+    klass = enterClassSymbol(Loc::none(), Symbols::root(), Names::Constants::PackageSpecRegistry());
+    ENFORCE(klass == Symbols::PackageSpecRegistry());
 
     // PackageSpec is a class that can be subclassed.
     klass = enterClassSymbol(Loc::none(), Symbols::root(), Names::Constants::PackageSpec());
@@ -460,8 +567,6 @@ void GlobalState::initEmpty() {
 
     method = enterMethod(*this, Symbols::PackageSpecSingleton(), Names::export_()).arg(Names::arg0()).build();
     ENFORCE(method == Symbols::PackageSpec_export());
-    method = enterMethod(*this, Symbols::PackageSpecSingleton(), Names::export_for_test()).arg(Names::arg0()).build();
-    ENFORCE(method == Symbols::PackageSpec_export_for_test());
     method =
         enterMethod(*this, Symbols::PackageSpecSingleton(), Names::restrict_to_service()).arg(Names::arg0()).build();
     ENFORCE(method == Symbols::PackageSpec_restrict_to_service());
@@ -480,6 +585,14 @@ void GlobalState::initEmpty() {
     enterMethodArgumentSymbol(Loc::none(), method, Names::args());
     ENFORCE(method == Symbols::todoMethod());
 
+    method = this->staticInitForClass(core::Symbols::root(), Loc::none());
+    ENFORCE(method == Symbols::rootStaticInit());
+
+    method = enterMethod(*this, Symbols::PackageSpecSingleton(), Names::autoloader_compatibility())
+                 .arg(Names::arg0())
+                 .build();
+    ENFORCE(method == Symbols::PackageSpec_autoloader_compatibility());
+
     klass = enterClassSymbol(Loc::none(), Symbols::Sorbet_Private_Static(), core::Names::Constants::ResolvedSig());
     ENFORCE(klass == Symbols::Sorbet_Private_Static_ResolvedSig());
     klass = Symbols::Sorbet_Private_Static_ResolvedSig().data(*this)->singletonClass(*this);
@@ -489,6 +602,19 @@ void GlobalState::initEmpty() {
     ENFORCE(klass == Symbols::T_Private_Compiler());
     klass = Symbols::T_Private_Compiler().data(*this)->singletonClass(*this);
     ENFORCE(klass == Symbols::T_Private_CompilerSingleton());
+
+    // Magic classes for special proc bindings
+    klass = enterClassSymbol(Loc::none(), Symbols::Magic(), core::Names::Constants::BindToAttachedClass());
+    ENFORCE(klass == Symbols::MagicBindToAttachedClass());
+
+    klass = enterClassSymbol(Loc::none(), Symbols::Magic(), core::Names::Constants::BindToSelfType());
+    ENFORCE(klass == Symbols::MagicBindToSelfType());
+
+    klass = enterClassSymbol(Loc::none(), Symbols::T(), core::Names::Constants::Types());
+    ENFORCE(klass == Symbols::T_Types());
+
+    klass = enterClassSymbol(Loc::none(), Symbols::T_Types(), core::Names::Constants::Base());
+    ENFORCE(klass == Symbols::T_Types_Base());
 
     typeArgument =
         enterTypeArgument(Loc::none(), Symbols::noMethod(), Names::Constants::TodoTypeArgument(), Variance::CoVariant);
@@ -503,7 +629,7 @@ void GlobalState::initEmpty() {
     // Sorbet::Private::Static::VERSION
     field = enterStaticFieldSymbol(Loc::none(), Symbols::Sorbet_Private_Static(), Names::Constants::VERSION());
     field.data(*this)->resultType =
-        make_type<LiteralType>(Symbols::String(), enterNameUTF8(sorbet_full_version_string));
+        make_type<NamedLiteralType>(Symbols::String(), enterNameUTF8(sorbet_full_version_string));
 
     // ::<ErrorNode>
     field = enterStaticFieldSymbol(Loc::none(), Symbols::root(), Names::Constants::ErrorNode());
@@ -557,19 +683,31 @@ void GlobalState::initEmpty() {
     method = enterMethod(*this, Symbols::MagicSingleton(), Names::callWithSplatAndBlock())
                  .repeatedUntypedArg(Names::arg0())
                  .buildWithResultUntyped();
-    // Synthesize <Magic>.<suggest-type>(arg: *T.untyped) => T.untyped
-    method = enterMethod(*this, Symbols::MagicSingleton(), Names::suggestType())
+    // Synthesize <Magic>.<suggest-constant-type>(arg: *T.untyped) => T.untyped
+    method = enterMethod(*this, Symbols::MagicSingleton(), Names::suggestConstantType())
                  .untypedArg(Names::arg0())
+                 .buildWithResultUntyped();
+    // Synthesize <Magic>.<suggest-field-type>
+    method = enterMethod(*this, Symbols::MagicSingleton(), Names::suggestFieldType())
+                 .untypedArg(Names::arg0()) // expr
+                 .untypedArg(Names::arg1()) // field kind (instance or class)
+                 .untypedArg(Names::arg2()) // method name where assign is
+                 .untypedArg(Names::arg3()) // name of variable
                  .buildWithResultUntyped();
     // Synthesize <Magic>.<self-new>(arg: *T.untyped) => T.untyped
     method = enterMethod(*this, Symbols::MagicSingleton(), Names::selfNew())
                  .repeatedUntypedArg(Names::arg0())
                  .buildWithResultUntyped();
-    // Synthesize <Magic>.<check-and-and>(arg0: T.untyped, arg1: T.untyped, arg2: Symbol, arg: *T.untyped) => T.untyped
+    // Synthesize <Magic>.attachedClass(arg: *T.untyped) => T.untyped
+    // (accept any args to avoid repeating errors that would otherwise be reported by type syntax parsing)
+    method = enterMethod(*this, Symbols::MagicSingleton(), Names::attachedClass())
+                 .repeatedUntypedArg(Names::arg0())
+                 .buildWithResultUntyped();
+    // Synthesize <Magic>.<check-and-and>(arg0: T.untyped, arg1: Symbol, arg2: T.untyped, arg: *T.untyped) => T.untyped
     method = enterMethod(*this, Symbols::MagicSingleton(), Names::checkAndAnd())
                  .untypedArg(Names::arg0())
-                 .untypedArg(Names::arg1())
-                 .typedArg(Names::arg2(), core::Types::Symbol())
+                 .typedArg(Names::arg1(), core::Types::Symbol())
+                 .untypedArg(Names::arg2())
                  .repeatedUntypedArg(Names::arg())
                  .buildWithResultUntyped();
     // Synthesize <Magic>.<nil-for-safe-navigation>(recv: T.untyped) => NilClass
@@ -643,20 +781,20 @@ void GlobalState::initEmpty() {
                  .untypedArg(Names::arg0())
                  .buildWithResultUntyped();
 
-    // Synthesize <DeclBuilderForProcs>.<params>(args: T.untyped) => DeclBuilderForProcs
+    // Synthesize <DeclBuilderForProcs>.params(args: T.untyped) => DeclBuilderForProcs
     method = enterMethod(*this, Symbols::DeclBuilderForProcsSingleton(), Names::params())
                  .kwsplatArg(Names::arg0())
                  .buildWithResult(Types::declBuilderForProcsSingletonClass());
-    // Synthesize <DeclBuilderForProcs>.<bind>(args: T.untyped) =>
+    // Synthesize <DeclBuilderForProcs>.bind(args: T.untyped) =>
     // DeclBuilderForProcs
     method = enterMethod(*this, Symbols::DeclBuilderForProcsSingleton(), Names::bind())
                  .untypedArg(Names::arg0())
                  .buildWithResult(Types::declBuilderForProcsSingletonClass());
-    // Synthesize <DeclBuilderForProcs>.<returns>(args: T.untyped) => DeclBuilderForProcs
+    // Synthesize <DeclBuilderForProcs>.returns(args: T.untyped) => DeclBuilderForProcs
     method = enterMethod(*this, Symbols::DeclBuilderForProcsSingleton(), Names::returns())
                  .untypedArg(Names::arg0())
                  .buildWithResult(Types::declBuilderForProcsSingletonClass());
-    // Synthesize <DeclBuilderForProcs>.<type_parameters>(args: T.untyped) =>
+    // Synthesize <DeclBuilderForProcs>.type_parameters(args: T.untyped) =>
     // DeclBuilderForProcs
     method = enterMethod(*this, Symbols::DeclBuilderForProcsSingleton(), Names::typeParameters())
                  .untypedArg(Names::arg0())
@@ -717,6 +855,7 @@ void GlobalState::initEmpty() {
             Symbols::MAX_SYNTHETIC_TYPEARGUMENT_SYMBOLS);
 
     installIntrinsics();
+    computeLinearization();
 
     Symbols::top().data(*this)->resultType = Types::top();
     Symbols::bottom().data(*this)->resultType = Types::bottom();
@@ -740,7 +879,9 @@ void GlobalState::initEmpty() {
 }
 
 void GlobalState::installIntrinsics() {
-    for (auto &entry : intrinsicMethods) {
+    int offset = -1;
+    for (auto &entry : intrinsicMethods()) {
+        ++offset;
         ClassOrModuleRef symbol;
         switch (entry.singleton) {
             case Intrinsic::Kind::Instance:
@@ -752,11 +893,21 @@ void GlobalState::installIntrinsics() {
         }
         auto countBefore = methodsUsed();
         auto method = enterMethodSymbol(Loc::none(), symbol, entry.method);
-        method.data(*this)->intrinsic = entry.impl;
+        method.data(*this)->intrinsicOffset = offset + Method::FIRST_VALID_INTRINSIC_OFFSET;
         if (countBefore != methodsUsed()) {
             auto &blkArg = enterMethodArgumentSymbol(Loc::none(), method, Names::blkArg());
             blkArg.flags.isBlock = true;
         }
+    }
+}
+
+void GlobalState::computeLinearization() {
+    Timer timer(this->tracer(), "resolver.compute_linearization");
+
+    // TODO: this does not support `prepend`
+    for (int i = 1; i < this->classAndModulesUsed(); ++i) {
+        const auto &ref = core::ClassOrModuleRef(*this, i);
+        computeClassLinearization(*this, ref);
     }
 }
 
@@ -795,8 +946,17 @@ void GlobalState::preallocateTables(uint32_t classAndModulesSize, uint32_t metho
 
 constexpr decltype(GlobalState::STRINGS_PAGE_SIZE) GlobalState::STRINGS_PAGE_SIZE;
 
-MethodRef GlobalState::lookupMethodSymbolWithHash(ClassOrModuleRef owner, NameRef name,
-                                                  const vector<uint32_t> &methodHash) const {
+namespace {
+bool matchesArityHash(const GlobalState &gs, ArityHash arityHash, MethodRef method) {
+    auto methodData = method.data(gs);
+    // lookupMethodSymbolWithHash is called from namer, before resolver enters overloads.
+    // It wants to be able to find the "namer version" of the method, not the overload.
+    return !methodData->flags.isOverloaded &&
+           (methodData->methodArityHash(gs) == arityHash || (methodData->hasIntrinsic() && !methodData->hasSig()));
+}
+} // namespace
+
+MethodRef GlobalState::lookupMethodSymbolWithHash(ClassOrModuleRef owner, NameRef name, ArityHash arityHash) const {
     ENFORCE(owner.exists(), "looking up symbol from non-existing owner");
     ENFORCE(name.exists(), "looking up symbol with non-existing name");
     auto ownerScope = owner.dataAllowingNone(*this);
@@ -809,12 +969,23 @@ MethodRef GlobalState::lookupMethodSymbolWithHash(ClassOrModuleRef owner, NameRe
         ENFORCE(res->second.exists());
         auto resSym = res->second;
         if (resSym.isMethod()) {
-            auto resMethod = resSym.asMethodRef().data(*this);
-            if (resMethod->methodArgumentHash(*this) == methodHash ||
-                (resMethod->intrinsic != nullptr && !resMethod->hasSig())) {
-                return resSym.asMethodRef();
+            auto resMethod = resSym.asMethodRef();
+            if (matchesArityHash(*this, arityHash, resMethod)) {
+                return resMethod;
             }
         }
+
+        auto lookupNameOverload = lookupNameUnique(UniqueNameKind::MangleRenameOverload, lookupName, 1);
+        if (lookupNameOverload.exists()) {
+            auto overloadIt = ownerScope->members().find(lookupNameOverload);
+            if (overloadIt != ownerScope->members().end() && overloadIt->second.isMethod()) {
+                auto resMethod = overloadIt->second.asMethodRef();
+                if (matchesArityHash(*this, arityHash, resMethod)) {
+                    return resMethod;
+                }
+            }
+        }
+
         lookupName = lookupNameUnique(UniqueNameKind::MangleRename, name, unique);
         if (!lookupName.exists()) {
             break;
@@ -858,12 +1029,29 @@ SymbolRef GlobalState::findRenamedSymbol(ClassOrModuleRef owner, SymbolRef sym) 
     // the previous name was: for `x$n` where `n` is larger than 2, it'll be `x$(n-1)`, for bare `x`,
     // it'll be whatever the largest `x$n` that exists is, if any; otherwise, there will be none.
     ENFORCE(sym.exists(), "lookup up previous name of non-existing symbol");
+    // The name un-mangling logic described here no longer applies to constant symbols, only methods.
+    ENFORCE(sym.isMethod());
     NameRef name = sym.name(*this);
     auto ownerScope = owner.dataAllowingNone(*this);
 
     if (name.kind() == NameKind::UNIQUE) {
         auto uniqueData = name.dataUnique(*this);
-        if (uniqueData->uniqueNameKind != UniqueNameKind::MangleRename) {
+        if (uniqueData->uniqueNameKind == UniqueNameKind::MangleRenameOverload) {
+            auto it = ownerScope->members().find(uniqueData->original);
+            ENFORCE(it != ownerScope->members().end());
+            // return it->second;
+            auto res = findRenamedSymbol(owner, it->second);
+            if (res.exists() && res.isMethod()) {
+                const auto &resData = res.asMethodRef().data(*this);
+                if (resData->flags.isOverloaded) {
+                    auto overloadedName = lookupNameUnique(UniqueNameKind::MangleRenameOverload, resData->name, 1);
+                    auto it = ownerScope->members().find(overloadedName);
+                    ENFORCE(it != ownerScope->members().end());
+                    res = it->second;
+                }
+            }
+            return res;
+        } else if (uniqueData->uniqueNameKind != UniqueNameKind::MangleRename) {
             return Symbols::noSymbol();
         }
         if (uniqueData->num == 1) {
@@ -898,7 +1086,7 @@ SymbolRef GlobalState::findRenamedSymbol(ClassOrModuleRef owner, SymbolRef sym) 
 ClassOrModuleRef GlobalState::enterClassSymbol(Loc loc, ClassOrModuleRef owner, NameRef name) {
     // ENFORCE_NO_TIMER(!owner.exists()); // Owner may not exist on purely synthetic symbols.
     ENFORCE_NO_TIMER(name.isClassName(*this));
-    SymbolData ownerScope = owner.dataAllowingNone(*this);
+    ClassOrModuleData ownerScope = owner.dataAllowingNone(*this);
     histogramInc("symbol_enter_by_name", ownerScope->members().size());
 
     auto &store = ownerScope->members()[name];
@@ -912,9 +1100,8 @@ ClassOrModuleRef GlobalState::enterClassSymbol(Loc loc, ClassOrModuleRef owner, 
     auto ret = ClassOrModuleRef(*this, classAndModules.size());
     store = ret; // DO NOT MOVE this assignment down. emplace_back on classAndModules invalidates `store`
     classAndModules.emplace_back();
-    SymbolData data = ret.data(*this);
+    ClassOrModuleData data = ret.data(*this);
     data->name = name;
-    data->flags = Symbol::Flags::CLASS_OR_MODULE;
     data->owner = owner;
     data->addLoc(*this, loc);
     DEBUG_ONLY(categoryCounterInc("symbols", "class"));
@@ -924,27 +1111,26 @@ ClassOrModuleRef GlobalState::enterClassSymbol(Loc loc, ClassOrModuleRef owner, 
 }
 
 TypeMemberRef GlobalState::enterTypeMember(Loc loc, ClassOrModuleRef owner, NameRef name, Variance variance) {
-    uint32_t flags;
+    TypeParameter::Flags flags;
     ENFORCE(owner.exists() || name == Names::Constants::NoTypeMember());
     ENFORCE(name.exists());
     if (variance == Variance::Invariant) {
-        flags = Symbol::Flags::TYPE_INVARIANT;
+        flags.isInvariant = true;
     } else if (variance == Variance::CoVariant) {
-        flags = Symbol::Flags::TYPE_COVARIANT;
+        flags.isCovariant = true;
     } else if (variance == Variance::ContraVariant) {
-        flags = Symbol::Flags::TYPE_CONTRAVARIANT;
+        flags.isContravariant = true;
     } else {
         Exception::notImplemented();
     }
+    flags.isTypeMember = true;
 
-    flags = flags | Symbol::Flags::TYPE_MEMBER;
-
-    SymbolData ownerScope = owner.dataAllowingNone(*this);
+    ClassOrModuleData ownerScope = owner.dataAllowingNone(*this);
     histogramInc("symbol_enter_by_name", ownerScope->members().size());
 
     auto &store = ownerScope->members()[name];
     if (store.exists()) {
-        ENFORCE(store.isTypeMember() && (store.asTypeMemberRef().data(*this)->flags & flags) == flags,
+        ENFORCE(store.isTypeMember() && store.asTypeMemberRef().data(*this)->flags.hasFlags(flags),
                 "existing symbol has wrong flags");
         counterInc("symbols.hit");
         return store.asTypeMemberRef();
@@ -955,7 +1141,7 @@ TypeMemberRef GlobalState::enterTypeMember(Loc loc, ClassOrModuleRef owner, Name
     store = result; // DO NOT MOVE this assignment down. emplace_back on typeMembers invalidates `store`
     typeMembers.emplace_back();
 
-    SymbolData data = result.dataAllowingNone(*this);
+    TypeParameterData data = result.dataAllowingNone(*this);
     data->name = name;
     data->flags = flags;
     data->owner = owner;
@@ -963,7 +1149,7 @@ TypeMemberRef GlobalState::enterTypeMember(Loc loc, ClassOrModuleRef owner, Name
     DEBUG_ONLY(categoryCounterInc("symbols", "type_member"));
     wasModified_ = true;
 
-    auto &members = owner.dataAllowingNone(*this)->typeMembers();
+    auto &members = owner.dataAllowingNone(*this)->getOrCreateTypeMembers();
     if (!absl::c_linear_search(members, result)) {
         members.emplace_back(result);
     }
@@ -974,35 +1160,34 @@ TypeArgumentRef GlobalState::enterTypeArgument(Loc loc, MethodRef owner, NameRef
     ENFORCE(owner.exists() || name == Names::Constants::NoTypeArgument() ||
             name == Names::Constants::TodoTypeArgument());
     ENFORCE(name.exists());
-    uint32_t flags;
+    TypeParameter::Flags flags;
     if (variance == Variance::Invariant) {
-        flags = Symbol::Flags::TYPE_INVARIANT;
+        flags.isInvariant = true;
     } else if (variance == Variance::CoVariant) {
-        flags = Symbol::Flags::TYPE_COVARIANT;
+        flags.isCovariant = true;
     } else if (variance == Variance::ContraVariant) {
-        flags = Symbol::Flags::TYPE_CONTRAVARIANT;
+        flags.isContravariant = true;
     } else {
         Exception::notImplemented();
     }
-
-    flags = flags | Symbol::Flags::TYPE_ARGUMENT;
+    flags.isTypeArgument = true;
 
     auto ownerScope = owner.dataAllowingNone(*this);
-    histogramInc("symbol_enter_by_name", ownerScope->typeArguments.size());
+    histogramInc("symbol_enter_by_name", ownerScope->typeArguments().size());
 
-    for (auto typeArg : ownerScope->typeArguments) {
+    for (auto typeArg : ownerScope->typeArguments()) {
         if (typeArg.dataAllowingNone(*this)->name == name) {
-            ENFORCE((typeArg.dataAllowingNone(*this)->flags & flags) == flags, "existing symbol has wrong flags");
+            ENFORCE(typeArg.dataAllowingNone(*this)->flags.hasFlags(flags), "existing symbol has wrong flags");
             counterInc("symbols.hit");
             return typeArg;
         }
     }
 
     ENFORCE(!symbolTableFrozen);
-    auto result = TypeArgumentRef(*this, typeArguments.size());
-    typeArguments.emplace_back();
+    auto result = TypeArgumentRef(*this, this->typeArguments.size());
+    this->typeArguments.emplace_back();
 
-    SymbolData data = result.dataAllowingNone(*this);
+    TypeParameterData data = result.dataAllowingNone(*this);
     data->name = name;
     data->flags = flags;
     data->owner = owner;
@@ -1010,12 +1195,12 @@ TypeArgumentRef GlobalState::enterTypeArgument(Loc loc, MethodRef owner, NameRef
     DEBUG_ONLY(categoryCounterInc("symbols", "type_argument"));
     wasModified_ = true;
 
-    owner.dataAllowingNone(*this)->typeArguments.emplace_back(result);
+    owner.dataAllowingNone(*this)->getOrCreateTypeArguments().emplace_back(result);
     return result;
 }
 
 MethodRef GlobalState::enterMethodSymbol(Loc loc, ClassOrModuleRef owner, NameRef name) {
-    SymbolData ownerScope = owner.dataAllowingNone(*this);
+    ClassOrModuleData ownerScope = owner.dataAllowingNone(*this);
     histogramInc("symbol_enter_by_name", ownerScope->members().size());
 
     auto &store = ownerScope->members()[name];
@@ -1048,27 +1233,34 @@ MethodRef GlobalState::enterNewMethodOverload(Loc sigLoc, MethodRef original, co
                              : sigLoc; // use original Loc for main overload so that we get right jump-to-def for it.
     auto owner = original.data(*this)->owner;
     auto res = enterMethodSymbol(loc, owner, name);
-    ENFORCE(res != original);
-    if (res.data(*this)->arguments.size() != original.data(*this)->arguments.size()) {
-        ENFORCE(res.data(*this)->arguments.empty());
-        res.data(*this)->arguments.reserve(original.data(*this)->arguments.size());
-        const auto &originalArguments = original.data(*this)->arguments;
-        int i = -1;
-        for (auto &arg : originalArguments) {
-            i += 1;
-            Loc loc = arg.loc;
-            if (!argsToKeep[i]) {
-                if (arg.flags.isBlock) {
-                    loc = Loc::none();
-                } else {
-                    continue;
-                }
+    bool newMethod = res != original;
+    const auto &resArguments = res.data(*this)->arguments;
+    ENFORCE(newMethod || !resArguments.empty(), "must be at least the block arg");
+    auto resInitialArgSize = resArguments.size();
+    ENFORCE(original.data(*this)->arguments.size() == argsToKeep.size());
+    const auto &originalArguments = original.data(*this)->arguments;
+    int i = -1;
+    for (auto &arg : originalArguments) {
+        i += 1;
+        Loc loc = arg.loc;
+        if (!argsToKeep[i]) {
+            if (arg.flags.isBlock) {
+                loc = Loc::none();
+            } else {
+                DEBUG_ONLY(if (!newMethod) {
+                    auto f = [&](const auto &resArg) { return arg.name == resArg.name; };
+                    auto it = absl::c_find_if(resArguments, move(f));
+                    ENFORCE(it == resArguments.end(), "fast path should not remove arguments from existing overload");
+                });
+                continue;
             }
-            NameRef nm = arg.name;
-            auto &newArg = enterMethodArgumentSymbol(loc, res, nm);
-            newArg = arg.deepCopy();
-            newArg.loc = loc;
         }
+        NameRef nm = arg.name;
+        auto &newArg = enterMethodArgumentSymbol(loc, res, nm);
+        ENFORCE(newMethod || resArguments.size() == resInitialArgSize,
+                "fast path should not add new arguments to existing overload");
+        newArg = arg.deepCopy();
+        newArg.loc = loc;
     }
     return res;
 }
@@ -1076,7 +1268,7 @@ MethodRef GlobalState::enterNewMethodOverload(Loc sigLoc, MethodRef original, co
 FieldRef GlobalState::enterFieldSymbol(Loc loc, ClassOrModuleRef owner, NameRef name) {
     ENFORCE(name.exists());
 
-    SymbolData ownerScope = owner.dataAllowingNone(*this);
+    ClassOrModuleData ownerScope = owner.dataAllowingNone(*this);
     histogramInc("symbol_enter_by_name", ownerScope->members().size());
 
     auto &store = ownerScope->members()[name];
@@ -1107,7 +1299,7 @@ FieldRef GlobalState::enterFieldSymbol(Loc loc, ClassOrModuleRef owner, NameRef 
 FieldRef GlobalState::enterStaticFieldSymbol(Loc loc, ClassOrModuleRef owner, NameRef name) {
     ENFORCE(name.exists());
 
-    SymbolData ownerScope = owner.dataAllowingNone(*this);
+    ClassOrModuleData ownerScope = owner.dataAllowingNone(*this);
     histogramInc("symbol_enter_by_name", ownerScope->members().size());
 
     auto &store = ownerScope->members()[name];
@@ -1461,7 +1653,7 @@ FileRef GlobalState::enterFile(const shared_ptr<File> &file) {
                     : this->files) {
         if (f) {
             if (f->path() == file->path()) {
-                Exception::raise("should never happen");
+                Exception::raise("Request to `enterFile` for already-entered file path?");
             }
         }
     })
@@ -1493,44 +1685,108 @@ FileRef GlobalState::reserveFileRef(string path) {
     return GlobalState::enterFile(make_shared<File>(move(path), "", File::Type::NotYetRead));
 }
 
-void GlobalState::mangleRenameSymbol(SymbolRef what, NameRef origName) {
-    auto owner = what.owner(*this).asClassOrModuleRef();
+NameRef GlobalState::nextMangledName(ClassOrModuleRef owner, NameRef origName) {
     auto ownerData = owner.data(*this);
-    auto &ownerMembers = ownerData->members();
-    auto fnd = ownerMembers.find(origName);
-    ENFORCE(fnd != ownerMembers.end());
-    ENFORCE(fnd->second == what);
-    ENFORCE(what.name(*this) == origName);
     uint32_t collisionCount = 1;
     NameRef name;
     do {
         name = freshNameUnique(UniqueNameKind::MangleRename, origName, collisionCount++);
     } while (ownerData->findMember(*this, name).exists());
+
+    return name;
+}
+
+void GlobalState::mangleRenameMethodInternal(MethodRef what, NameRef origName, UniqueNameKind kind) {
+    auto owner = what.data(*this)->owner;
+    auto ownerData = owner.data(*this);
+    auto &ownerMembers = ownerData->members();
+    auto fnd = ownerMembers.find(origName);
+    ENFORCE(fnd != ownerMembers.end());
+    ENFORCE(fnd->second == what);
+    ENFORCE(what.data(*this)->name == origName);
+    NameRef name;
+    if (kind == UniqueNameKind::MangleRename) {
+        name = nextMangledName(owner, origName);
+    } else {
+        // We don't loop in this case because we're not trying to find an actually unique name, we
+        // just want to essentially move the existing, non-overloaded `what` out of the way to allow
+        // the first overload to have the name that `what` currently has. We also need to be able to
+        // map predictably between the new, overloaded symbol and the original it came from, so the
+        // unique name is always chosen using `1` for the `num` argument.
+        //
+        // We know that there is no method with this name, because otherwise resolver would not have
+        // called mangleRenameForOverload.
+        ENFORCE(kind == UniqueNameKind::MangleRenameOverload);
+        name = freshNameUnique(UniqueNameKind::MangleRenameOverload, origName, 1);
+    }
+    // Both branches of the above `if` condition should ENFORCE this (either due to the loop post
+    // condition, or by way of the resolveMultiSignatureJob call site guaranteeing this).
+    ENFORCE(!ownerData->findMember(*this, name).exists(), "would overwrite the Symbol with name {}",
+            name.showRaw(*this));
     ownerMembers.erase(fnd);
     ownerMembers[name] = what;
-    switch (what.kind()) {
-        case SymbolRef::Kind::ClassOrModule: {
-            auto whatKlass = what.asClassOrModuleRef().data(*this);
-            whatKlass->name = name;
-            auto singleton = whatKlass->lookupSingletonClass(*this);
-            if (singleton.exists()) {
-                mangleRenameSymbol(singleton, singleton.data(*this)->name);
-            }
-            break;
-        }
-        case SymbolRef::Kind::Method:
-            what.asMethodRef().data(*this)->name = name;
-            break;
-        case SymbolRef::Kind::FieldOrStaticField:
-            what.asFieldRef().data(*this)->name = name;
-            break;
-        case SymbolRef::Kind::TypeArgument:
-            what.asTypeArgumentRef().data(*this)->name = name;
-            break;
-        case SymbolRef::Kind::TypeMember:
-            what.asTypeMemberRef().data(*this)->name = name;
-            break;
+    what.data(*this)->name = name;
+}
+
+// We have to use this mangle renaming logic to get old methods out of the way, because method
+// redefinitions are not an error at `typed: false`, which means that people can expect that their
+// redefined method will be given precedence when called in another (typed: true) file.
+//
+// (Constant redefinition errors are always enforced at `# typed: false`, so we can afford to simply
+// define a new symbol with a mangled name, instead of mangling AND renaming constant symbols.)
+void GlobalState::mangleRenameMethod(MethodRef what, NameRef origName) {
+    mangleRenameMethodInternal(what, origName, UniqueNameKind::MangleRename);
+}
+void GlobalState::mangleRenameForOverload(MethodRef what, NameRef origName) {
+    mangleRenameMethodInternal(what, origName, UniqueNameKind::MangleRenameOverload);
+}
+
+// This method should be used sparingly, because using it correctly is tricky.
+// Consider using mangleRenameMethod (or defining a new constant with a name produced by nextMangledName)
+// instead, unless you absolutely know that you must use this method.
+//
+// This method's existence can introduce use-after-free style problems, but with Symbol IDs instead of
+// pointers. Importantly, callers of this method assume the burden of ensuring that the deleted
+// symbol's ID is not referenced by any other symbols or by any ASTs.
+//
+// (In our case, we're lucky that core::Method objects do not generally store sensitive information
+// that an attacker would be trying to exfiltrate, so the downside is not quite as severe as
+// arbitrary malloc/free use-after-free bugs. But it does mean that this could be the source of
+// particularly confusing user-visible errors or even crashes.)
+//
+// In particular, this method should basically be considered a private namer/namer.cc helper
+// function. The only reason why it's a method on GlobalState and not an anonymous helper in Namer
+// is because it requires direct (private) access to `this->methods` (and also because it looks very
+// similar to mangleRenameMethod, so it's nice to have the implementation in the same file). But in
+// spirit, this is a private Namer helper function.
+void GlobalState::deleteMethodSymbol(MethodRef what) {
+    const auto &whatData = what.data(*this);
+    auto owner = whatData->owner;
+    auto &ownerMembers = owner.data(*this)->members();
+    auto fnd = ownerMembers.find(whatData->name);
+    ENFORCE(fnd != ownerMembers.end());
+    ENFORCE(fnd->second == what);
+    ownerMembers.erase(fnd);
+    for (const auto typeArgument : whatData->typeArguments()) {
+        this->typeArguments[typeArgument.id()] = this->typeArguments[0].deepCopy(*this);
     }
+    // This drops the existing core::Method, which drops the `ArgInfo`s the method owned.
+    this->methods[what.id()] = this->methods[0].deepCopy(*this);
+}
+
+// Before using this method, double check the disclaimer on GlobalState::deleteMethodSymbol above.
+//
+// NOTE: This method does double duty, deleting both static-field and field symbols.
+void GlobalState::deleteFieldSymbol(FieldRef what) {
+    ENFORCE(what.data(*this)->flags.isField);
+    const auto &whatData = what.data(*this);
+    auto owner = whatData->owner;
+    auto &ownerMembers = owner.data(*this)->members();
+    auto fnd = ownerMembers.find(whatData->name);
+    ENFORCE(fnd != ownerMembers.end());
+    ENFORCE(fnd->second == what);
+    ownerMembers.erase(fnd);
+    this->fields[what.id()] = this->fields[0].deepCopy(*this);
 }
 
 unsigned int GlobalState::classAndModulesUsed() const {
@@ -1707,8 +1963,10 @@ unique_ptr<GlobalState> GlobalState::deepCopy(bool keepId) const {
     result->ensureCleanStrings = this->ensureCleanStrings;
     result->runningUnderAutogen = this->runningUnderAutogen;
     result->censorForSnapshotTests = this->censorForSnapshotTests;
-    result->sleepInSlowPath = this->sleepInSlowPath;
+    result->sleepInSlowPathSeconds = this->sleepInSlowPathSeconds;
     result->requiresAncestorEnabled = this->requiresAncestorEnabled;
+    result->ruby3KeywordArgs = this->ruby3KeywordArgs;
+    result->lspExperimentalFastPathEnabled = this->lspExperimentalFastPathEnabled;
 
     if (keepId) {
         result->globalStateId = this->globalStateId;
@@ -1769,11 +2027,11 @@ unique_ptr<GlobalState> GlobalState::deepCopy(bool keepId) const {
     }
     result->typeArguments.reserve(this->typeArguments.capacity());
     for (auto &sym : this->typeArguments) {
-        result->typeArguments.emplace_back(sym.deepCopy(*result, keepId));
+        result->typeArguments.emplace_back(sym.deepCopy(*result));
     }
     result->typeMembers.reserve(this->typeMembers.capacity());
     for (auto &sym : this->typeMembers) {
-        result->typeMembers.emplace_back(sym.deepCopy(*result, keepId));
+        result->typeMembers.emplace_back(sym.deepCopy(*result));
     }
     result->pathPrefix = this->pathPrefix;
     for (auto &semanticExtension : this->semanticExtensions) {
@@ -1801,8 +2059,10 @@ unique_ptr<GlobalState> GlobalState::copyForIndex() const {
     result->ensureCleanStrings = this->ensureCleanStrings;
     result->runningUnderAutogen = this->runningUnderAutogen;
     result->censorForSnapshotTests = this->censorForSnapshotTests;
-    result->sleepInSlowPath = this->sleepInSlowPath;
+    result->lspExperimentalFastPathEnabled = this->lspExperimentalFastPathEnabled;
+    result->sleepInSlowPathSeconds = this->sleepInSlowPathSeconds;
     result->requiresAncestorEnabled = this->requiresAncestorEnabled;
+    result->ruby3KeywordArgs = this->ruby3KeywordArgs;
     result->kvstoreUuid = this->kvstoreUuid;
     result->errorUrlBase = this->errorUrlBase;
     result->suppressedErrorClasses = this->suppressedErrorClasses;
@@ -1947,7 +2207,7 @@ void GlobalState::replaceFile(FileRef whatFile, const shared_ptr<File> &withWhat
 }
 
 FileRef GlobalState::findFileByPath(string_view path) const {
-    auto fnd = fileRefByPath.find(string(path));
+    auto fnd = fileRefByPath.find(path);
     if (fnd != fileRefByPath.end()) {
         return fnd->second;
     }
@@ -1959,7 +2219,9 @@ const packages::PackageDB &GlobalState::packageDB() const {
 }
 
 void GlobalState::setPackagerOptions(const std::vector<std::string> &secondaryTestPackageNamespaces,
-                                     const std::vector<std::string> &extraPackageFilesDirectoryPrefixes,
+                                     const std::vector<std::string> &extraPackageFilesDirectoryUnderscorePrefixes,
+                                     const std::vector<std::string> &extraPackageFilesDirectorySlashPrefixes,
+                                     const std::vector<std::string> &packageSkipRBIExportEnforcementDirs,
                                      std::string errorHint) {
     ENFORCE(packageDB_.secondaryTestPackageNamespaceRefs_.size() == 0);
     ENFORCE(!packageDB_.frozen);
@@ -1968,7 +2230,9 @@ void GlobalState::setPackagerOptions(const std::vector<std::string> &secondaryTe
         packageDB_.secondaryTestPackageNamespaceRefs_.emplace_back(enterNameConstant(ns));
     }
 
-    packageDB_.extraPackageFilesDirectoryPrefixes_ = extraPackageFilesDirectoryPrefixes;
+    packageDB_.extraPackageFilesDirectoryUnderscorePrefixes_ = extraPackageFilesDirectoryUnderscorePrefixes;
+    packageDB_.extraPackageFilesDirectorySlashPrefixes_ = extraPackageFilesDirectorySlashPrefixes;
+    packageDB_.skipRBIExportEnforcementDirs_ = packageSkipRBIExportEnforcementDirs;
     packageDB_.errorHint_ = errorHint;
 }
 
@@ -1982,31 +2246,57 @@ unique_ptr<GlobalState> GlobalState::markFileAsTombStone(unique_ptr<GlobalState>
     return what;
 }
 
-uint32_t patchHash(uint32_t hash) {
-    if (hash == GlobalStateHash::HASH_STATE_NOT_COMPUTED) {
-        hash = GlobalStateHash::HASH_STATE_NOT_COMPUTED_COLLISION_AVOID;
-    } else if (hash == GlobalStateHash::HASH_STATE_INVALID) {
-        hash = GlobalStateHash::HASH_STATE_INVALID_COLLISION_AVOID;
-    }
-    return hash;
-}
-
-unique_ptr<GlobalStateHash> GlobalState::hash() const {
+unique_ptr<LocalSymbolTableHashes> GlobalState::hash() const {
     constexpr bool DEBUG_HASHING_TAIL = false;
     uint32_t hierarchyHash = 0;
-    UnorderedMap<NameHash, uint32_t> methodHashes;
+    uint32_t classModuleHash = 0;
+    uint32_t typeArgumentHash = 0; // TODO(jez) Delete at same times as lspExperimentalFastPathEnabled
+    uint32_t typeMemberHash = 0;
+    uint32_t fieldHash = 0;
+    uint32_t staticFieldHash = 0;
+    uint32_t classAliasHash = 0;
+    uint32_t methodHash = 0;
+    UnorderedMap<WithoutUniqueNameHash, uint32_t> deletableSymbolHashesMap;
     int counter = 0;
 
-    for (const auto *symbolType : {&this->classAndModules, &this->typeArguments, &this->typeMembers}) {
-        counter = 0;
-        for (const auto &sym : *symbolType) {
-            if (!sym.ignoreInHashing(*this)) {
-                hierarchyHash = mix(hierarchyHash, sym.hash(*this));
-                counter++;
-                if (DEBUG_HASHING_TAIL && counter > symbolType->size() - 15) {
-                    errorQueue->logger.info("Hashing symbols: {}, {}", hierarchyHash, sym.name.show(*this));
-                }
+    for (const auto &sym : this->classAndModules) {
+        if (!sym.ignoreInHashing(*this)) {
+            uint32_t symhash = sym.hash(*this);
+            hierarchyHash = mix(hierarchyHash, symhash);
+            classModuleHash = mix(classModuleHash, symhash);
+            counter++;
+            if (DEBUG_HASHING_TAIL && counter > this->classAndModules.size() - 15) {
+                errorQueue->logger.info("Hashing symbols: {}, {}", hierarchyHash, sym.name.show(*this));
             }
+        }
+    }
+
+    // Type arguments are included in Method::hash. If only a type argument changes, the method's
+    // hash will change but the hierarchyHash will not change, so Sorbet will take the fast path and
+    // delete the method and all its arguments
+    if (!this->lspExperimentalFastPathEnabled) {
+        counter = 0;
+        for (const auto &typeArg : this->typeArguments) {
+            counter++;
+            // No type arguments are ignored in hashing.
+            uint32_t symhash = typeArg.hash(*this);
+            hierarchyHash = mix(hierarchyHash, symhash);
+            typeArgumentHash = mix(typeArgumentHash, symhash);
+            if (DEBUG_HASHING_TAIL && counter > this->typeArguments.size() - 15) {
+                errorQueue->logger.info("Hashing symbols: {}, {}", hierarchyHash, typeArg.name.show(*this));
+            }
+        }
+    }
+
+    counter = 0;
+    for (const auto &typeMember : this->typeMembers) {
+        counter++;
+        // No type members are ignored in hashing.
+        uint32_t symhash = typeMember.hash(*this);
+        hierarchyHash = mix(hierarchyHash, symhash);
+        typeMemberHash = mix(typeMemberHash, symhash);
+        if (DEBUG_HASHING_TAIL && counter > this->typeMembers.size() - 15) {
+            errorQueue->logger.info("Hashing symbols: {}, {}", hierarchyHash, typeMember.name.show(*this));
         }
     }
 
@@ -2014,7 +2304,28 @@ unique_ptr<GlobalStateHash> GlobalState::hash() const {
     for (const auto &field : this->fields) {
         counter++;
         // No fields are ignored in hashing.
-        hierarchyHash = mix(hierarchyHash, field.hash(*this));
+        uint32_t symhash = field.hash(*this);
+        if (field.flags.isStaticField && !field.isClassAlias()) {
+            // Either normal static-field or static-field-type-alias
+            auto &target = deletableSymbolHashesMap[WithoutUniqueNameHash(*this, field.name)];
+            target = mix(target, symhash);
+            uint32_t staticFieldShapeHash = field.fieldShapeHash(*this);
+            hierarchyHash = mix(hierarchyHash, staticFieldShapeHash);
+            staticFieldHash = mix(fieldHash, staticFieldShapeHash);
+        } else if (field.flags.isStaticField) {
+            // static-field class alias
+            hierarchyHash = mix(hierarchyHash, symhash);
+            classAliasHash = mix(classAliasHash, symhash);
+        } else {
+            ENFORCE(field.flags.isField);
+            auto &target = deletableSymbolHashesMap[WithoutUniqueNameHash(*this, field.name)];
+            target = mix(target, symhash);
+            if (!this->lspExperimentalFastPathEnabled) {
+                uint32_t fieldShapeHash = field.fieldShapeHash(*this);
+                hierarchyHash = mix(hierarchyHash, fieldShapeHash);
+                fieldHash = mix(fieldHash, fieldShapeHash);
+            }
+        }
 
         if (DEBUG_HASHING_TAIL && counter > this->fields.size() - 15) {
             errorQueue->logger.info("Hashing symbols: {}, {}", hierarchyHash, field.name.show(*this));
@@ -2024,9 +2335,26 @@ unique_ptr<GlobalStateHash> GlobalState::hash() const {
     counter = 0;
     for (const auto &sym : this->methods) {
         if (!sym.ignoreInHashing(*this)) {
-            auto &target = methodHashes[NameHash(*this, sym.name)];
+            auto &target = deletableSymbolHashesMap[WithoutUniqueNameHash(*this, sym.name)];
             target = mix(target, sym.hash(*this));
-            hierarchyHash = mix(hierarchyHash, sym.methodShapeHash(*this));
+            auto needMethodShapeHash =
+                this->lspExperimentalFastPathEnabled
+                    ? (sym.name == Names::unresolvedAncestors() || sym.name == Names::requiredAncestors() ||
+                       sym.name == Names::requiredAncestorsLin())
+                    : true;
+            if (needMethodShapeHash) {
+                uint32_t methodShapeHash = sym.methodShapeHash(*this);
+                hierarchyHash = mix(hierarchyHash, methodShapeHash);
+                if (this->lspExperimentalFastPathEnabled) {
+                    // With this feature enabled, the only three methods that trigger a method
+                    // change anymore all relate to inheritance. Let's blame this to a change to
+                    // class symbols, not to methods
+                    classModuleHash = mix(classModuleHash, methodShapeHash);
+                } else {
+                    methodHash = mix(methodHash, methodShapeHash);
+                }
+            }
+
             counter++;
             if (DEBUG_HASHING_TAIL && counter > this->methods.size() - 15) {
                 errorQueue->logger.info("Hashing method symbols: {}, {}", hierarchyHash, sym.name.show(*this));
@@ -2034,15 +2362,22 @@ unique_ptr<GlobalStateHash> GlobalState::hash() const {
         }
     }
 
-    unique_ptr<GlobalStateHash> result = make_unique<GlobalStateHash>();
-    result->methodHashes.reserve(methodHashes.size());
-    for (const auto &e : methodHashes) {
-        result->methodHashes.emplace_back(e.first, patchHash(e.second));
+    unique_ptr<LocalSymbolTableHashes> result = make_unique<LocalSymbolTableHashes>();
+    result->deletableSymbolHashes.reserve(deletableSymbolHashesMap.size());
+    for (const auto &[nameHash, symbolHash] : deletableSymbolHashesMap) {
+        result->deletableSymbolHashes.emplace_back(nameHash, LocalSymbolTableHashes::patchHash(symbolHash));
     }
     // Sort the hashes. Semantically important for quickly diffing hashes.
-    fast_sort(result->methodHashes);
+    fast_sort(result->deletableSymbolHashes);
 
-    result->hierarchyHash = patchHash(hierarchyHash);
+    result->hierarchyHash = LocalSymbolTableHashes::patchHash(hierarchyHash);
+    result->classModuleHash = LocalSymbolTableHashes::patchHash(classModuleHash);
+    result->typeArgumentHash = LocalSymbolTableHashes::patchHash(typeArgumentHash);
+    result->typeMemberHash = LocalSymbolTableHashes::patchHash(typeMemberHash);
+    result->fieldHash = LocalSymbolTableHashes::patchHash(fieldHash);
+    result->staticFieldHash = LocalSymbolTableHashes::patchHash(staticFieldHash);
+    result->classAliasHash = LocalSymbolTableHashes::patchHash(classAliasHash);
+    result->methodHash = LocalSymbolTableHashes::patchHash(methodHash);
     return result;
 }
 
@@ -2061,10 +2396,10 @@ MethodRef GlobalState::staticInitForClass(ClassOrModuleRef klass, Loc loc) {
     return sym;
 }
 
-MethodRef GlobalState::lookupStaticInitForClass(ClassOrModuleRef klass) const {
+MethodRef GlobalState::lookupStaticInitForClass(ClassOrModuleRef klass, bool allowMissing) const {
     auto classData = klass.data(*this);
     auto ref = classData->lookupSingletonClass(*this).data(*this)->findMethod(*this, core::Names::staticInit());
-    ENFORCE(ref.exists(), "looking up non-existent <static-init> for {}", klass.toString(*this));
+    ENFORCE(ref.exists() || allowMissing, "looking up non-existent <static-init> for {}", klass.toString(*this));
     return ref;
 }
 
@@ -2080,10 +2415,10 @@ MethodRef GlobalState::staticInitForFile(Loc loc) {
     return sym;
 }
 
-MethodRef GlobalState::lookupStaticInitForFile(Loc loc) const {
-    auto nm = lookupNameUnique(core::UniqueNameKind::Namer, core::Names::staticInit(), loc.file().id());
+MethodRef GlobalState::lookupStaticInitForFile(FileRef file) const {
+    auto nm = lookupNameUnique(core::UniqueNameKind::Namer, core::Names::staticInit(), file.id());
     auto ref = core::Symbols::rootSingleton().data(*this)->findMember(*this, nm);
-    ENFORCE(ref.exists(), "looking up non-existent <static-init> for {}", loc.toString(*this));
+    ENFORCE(ref.exists(), "looking up non-existent <static-init> for {}", file.data(*this).path());
     return ref.asMethodRef();
 }
 

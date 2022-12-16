@@ -13,6 +13,7 @@ def dropExtension(p):
     return p.partition(".")[0]
 
 _TEST_SCRIPT = """#!/usr/bin/env bash
+export ASAN_SYMBOLIZER_PATH=`pwd`/external/llvm_toolchain_12_0_0/bin/llvm-symbolizer
 set -x
 exec {runner} --single_test="{test}"
 """
@@ -27,6 +28,7 @@ def _exp_test_impl(ctx):
     )
 
     runfiles = ctx.runfiles(files = ctx.files.runner + ctx.files.test + ctx.files.data)
+    runfiles = runfiles.merge(ctx.attr._llvm_symbolizer[DefaultInfo].default_runfiles)
 
     return [DefaultInfo(runfiles = runfiles)]
 
@@ -45,8 +47,60 @@ exp_test = rule(
             cfg = "target",
             allow_files = True,
         ),
+        "_llvm_symbolizer": attr.label(
+            default = "//test:llvm-symbolizer",
+        ),
     },
 )
+
+_GEN_PACKAGE_RUNNER_SCRIPT = """
+set -x
+
+{runner} {test_directory}
+"""
+
+def _end_to_end_rbi_test_impl(ctx):
+    packager_folder = "/packager/"
+
+    rb_file_path = ctx.files.rb_files[0].path
+    pos = rb_file_path.find(packager_folder)
+    final_dirsep = rb_file_path.find("/", pos + len(packager_folder))
+    test_directory = rb_file_path[0:final_dirsep]
+
+    ctx.actions.write(
+        output = ctx.outputs.executable,
+        content = _GEN_PACKAGE_RUNNER_SCRIPT.format(
+            runner = ctx.executable._runner.short_path,
+            test_directory = test_directory,
+        ),
+    )
+    runfiles = ctx.runfiles(ctx.files.rb_files)
+    runfiles = runfiles.merge(ctx.attr._runner[DefaultInfo].default_runfiles)
+
+    return [DefaultInfo(runfiles = runfiles)]
+
+end_to_end_rbi_test = rule(
+    implementation = _end_to_end_rbi_test_impl,
+    test = True,
+    attrs = {
+        "rb_files": attr.label_list(
+            allow_files = True,
+            mandatory = True,
+        ),
+        "_runner": attr.label(
+            cfg = "target",
+            default = "//test:single_package_runner",
+            executable = True,
+        ),
+    },
+)
+
+def single_package_rbi_test(name, rb_files):
+    end_to_end_rbi_test(
+        name = name,
+        rb_files = rb_files,
+        size = "small",
+    )
 
 _TEST_RUNNERS = {
     "PosTests": ":pipeline_test_runner",
@@ -55,7 +109,7 @@ _TEST_RUNNERS = {
     "PackagerTests": ":pipeline_test_runner",
 }
 
-def pipeline_tests(suite_name, all_paths, test_name_prefix, extra_args = [], tags = []):
+def pipeline_tests(suite_name, all_paths, test_name_prefix, extra_files = [], tags = []):
     tests = {}  # test_name-> {"path": String, "prefix": String, "sentinel": String}
 
     # The packager step needs folder-based steps since folder structure dictates package membership.
@@ -123,6 +177,7 @@ def pipeline_tests(suite_name, all_paths, test_name_prefix, extra_args = [], tag
             enabled_tests.append(test_name)
 
         data = []
+        data += extra_files
         if tests[name]["isDirectory"]:
             data += native.glob(["{}**/*".format(prefix)])
         elif tests[name]["isMultiFile"]:

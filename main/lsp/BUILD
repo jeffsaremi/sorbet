@@ -8,52 +8,40 @@ cc_library(
         "notifications/*.cc",
         "watchman/*.cc",
     ]) + [
-        "lsp_messages_gen.h",
-        "lsp_messages_gen.cc",
-        "lsp_messages_enums_gen.h",
-        "lsp_messages_enums_gen.cc",
-        "LSPFileUpdates.h",
+        ":lsp_messages",
+        "AbstractRenamer.h",
         "DefLocSaver.h",
-        "watchman/WatchmanProcess.h",
-        "NextMethodFinder.h",
-        "LocalVarFinder.h",
-        "json_enums.h",
-        "LocalVarSaver.h",
-        "ShowOperation.h",
-        "lsp_messages_gen_helpers.h",
+        "ErrorFlusherLSP.h",
+        "ErrorReporter.h",
+        "FieldFinder.h",
+        "LSPFileUpdates.h",
         "LSPIndexer.h",
+        "LSPPathType.h",
         "LSPTask.h",
         "LSPTypechecker.h",
         "LSPTypecheckerCoordinator.h",
-        "UndoState.h",
-        "ErrorReporter.h",
-        "ErrorFlusherLSP.h",
+        "LocalVarFinder.h",
+        "LocalVarSaver.h",
+        "NextMethodFinder.h",
         "QueryCollector.h",
+        "ShowOperation.h",
+        "UndoState.h",
+        "json_enums.h",
+        "lsp_messages_gen_helpers.h",
+        "watchman/WatchmanProcess.h",
     ],
     hdrs = [
         "LSPConfiguration.h",
         "LSPInput.h",
+        "LSPLoop.h",
         "LSPMessage.h",
         "LSPOutput.h",
         "LSPPreprocessor.h",
+        "LSPQuery.h",
+        "MoveMethod.h",
         "json_types.h",
-        "lsp.h",
         "wrapper.h",
     ],
-    # Required for compiling //experimental/rubyfmt on Mac with dynamic linking
-    # webasm has no options specified since it links against a no-op rubyfmt
-    linkopts = select({
-        "//conditions:default": [],
-        "//experimental/rubyfmt:enable_rubyfmt": [
-            "-lcrypt",
-            "-lrt",
-            "-lz",
-            "-lgmp",
-        ],
-        "//experimental/rubyfmt:enable_rubyfmt_darwin": [
-            "-framework Foundation",
-        ],
-    }),
     linkstatic = select({
         "//tools/config:linkshared": 0,
         "//conditions:default": 1,
@@ -67,11 +55,11 @@ cc_library(
         "//core",
         "//core/proto",
         "//core/serialize",
-        "//experimental/rubyfmt",
         "//hashing",
         "//main/cache",
         "//main/options",
         "//main/pipeline",
+        "//main/sig_finder",
         "//payload:interface",
         "//payload/binary",
         "//payload/text",
@@ -98,18 +86,45 @@ cc_binary(
     ],
 )
 
+LSP_MESSAGES_SHARDS = [
+    "lsp_messages_gen_1.cc",
+    "lsp_messages_gen_2.cc",
+    "lsp_messages_gen_3.cc",
+    "lsp_messages_gen_4.cc",
+    "lsp_messages_gen_5.cc",
+]
+
+filegroup(
+    name = "lsp_messages",
+    srcs = [
+        "lsp_messages_gen.h",
+        "lsp_messages_enums_gen.h",
+        "lsp_messages_enums_gen.cc",
+    ] + LSP_MESSAGES_SHARDS,
+)
+
 genrule(
     name = "generate_lsp_messages_h",
     outs = [
-        "lsp_messages_gen.h",
-        "lsp_messages_gen.cc",
         "lsp_messages_enums_gen.h",
         "lsp_messages_enums_gen.cc",
-    ],
-    cmd = "$(location :generate_lsp_messages) $(location lsp_messages_gen.h) $(location lsp_messages_gen.cc) \
-             $(location lsp_messages_enums_gen.h) $(location lsp_messages_enums_gen.cc) && \
-             $(location //tools:clang-format) -i $(location lsp_messages_gen.h) $(location lsp_messages_gen.cc) \
-             $(location lsp_messages_enums_gen.h) $(location lsp_messages_enums_gen.cc)",
+        "lsp_messages_gen.h",
+    ] + LSP_MESSAGES_SHARDS,
+    cmd = """
+    set -euo pipefail
+
+    $(location :generate_lsp_messages) \
+        $(location lsp_messages_enums_gen.h) \
+        $(location lsp_messages_enums_gen.cc) \
+        $(location lsp_messages_gen.h) \
+        {shards}
+
+    $(location //tools:clang-format) -i \
+        $(location lsp_messages_enums_gen.h) \
+        $(location lsp_messages_enums_gen.cc) \
+        $(location lsp_messages_gen.h) \
+        {shards}
+    """.format(shards = " ".join(["$(location {})".format(file) for file in LSP_MESSAGES_SHARDS])),
     tools = [
         ":generate_lsp_messages",
         "//tools:clang-format",

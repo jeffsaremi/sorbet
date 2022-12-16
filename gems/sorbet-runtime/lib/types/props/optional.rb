@@ -12,6 +12,14 @@ end
 module T::Props::Optional::DecoratorMethods
   extend T::Sig
 
+  # Heads up!
+  #
+  # There are already too many ad-hoc options on the prop DSL.
+  #
+  # We have already done a lot of work to remove unnecessary and confusing
+  # options. If you're considering adding a new rule key, please come chat with
+  # the Sorbet team first, as we'd really like to learn more about how to best
+  # solve the problem you're encountering.
   VALID_RULE_KEYS = {
     default: true,
     factory: true,
@@ -49,13 +57,13 @@ module T::Props::Optional::DecoratorMethods
     if default_setter
       @props_with_defaults ||= {}
       @props_with_defaults[prop] = default_setter
-      @props_without_defaults&.delete(prop) # Handle potential override
+      props_without_defaults&.delete(prop) # Handle potential override
 
       rules[DEFAULT_SETTER_RULE_KEY] = default_setter
     else
       @props_without_defaults ||= {}
       @props_without_defaults[prop] = rules.fetch(:setter_proc)
-      @props_with_defaults&.delete(prop) # Handle potential override
+      props_with_defaults&.delete(prop) # Handle potential override
     end
 
     super

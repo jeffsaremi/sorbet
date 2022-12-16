@@ -77,7 +77,7 @@ class File < IO
   Separator = T.let(T.unsafe(nil), String)
 
   extend T::Generic
-  Elem = type_member(:out, fixed: String)
+  Elem = type_member(:out) {{fixed: String}}
 
   # Converts a pathname to an absolute pathname. Relative paths are referenced
   # from the current working directory of the process unless *dir\_string* is
@@ -308,10 +308,11 @@ class File < IO
   sig do
     params(
         file: T.any(String, Pathname),
+        level: Integer,
     )
     .returns(String)
   end
-  def self.dirname(file); end
+  def self.dirname(file, level = 1); end
 
   # Returns `true` if the named file exists and has a zero size.
   #
@@ -741,7 +742,7 @@ class File < IO
       filename: T.any(String, Pathname),
       mode: T.any(Integer, String),
       perm: T.nilable(Integer),
-      opt: T.nilable(T::Hash[Symbol, T.untyped]),
+      opt: T.untyped,
     ).returns(File)
   end
   sig do
@@ -749,11 +750,11 @@ class File < IO
       filename: T.any(String, Pathname),
       mode: T.any(Integer, String),
       perm: T.nilable(Integer),
-      opt: T.nilable(T::Hash[Symbol, T.untyped]),
+      opt: T.untyped,
       blk: T.proc.params(file: File).returns(T.type_parameter(:U))
     ).returns(T.type_parameter(:U))
   end
-  def self.open(filename, mode='r', perm=nil, opt=nil, &blk); end
+  def self.open(filename, mode='r', perm=nil, **opt, &blk); end
 
   # Returns `true` if the named file exists and the effective used id of the
   # calling process is the owner of the file.

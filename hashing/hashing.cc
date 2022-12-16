@@ -3,7 +3,7 @@
 #include "ast/treemap/treemap.h"
 #include "common/concurrency/ConcurrentQueue.h"
 #include "core/ErrorQueue.h"
-#include "core/NameHash.h"
+#include "core/FileHash.h"
 #include "core/NameSubstitution.h"
 #include "core/Unfreeze.h"
 #include "main/pipeline/pipeline.h"
@@ -24,7 +24,7 @@ pair<ast::ParsedFile, core::UsageHash> rewriteAST(const core::GlobalState &origi
     core::LazyNameSubstitution subst(originalGS, newGS);
     core::MutableContext ctx(newGS, core::Symbols::root(), newFref);
     core::UnfreezeNameTable nameTableAccess(newGS);
-    rewritten.tree = ast::Substitute::run(ctx, subst, move(rewritten.tree));
+    rewritten = ast::Substitute::run(ctx, subst, move(rewritten));
     return make_pair<ast::ParsedFile, core::UsageHash>(move(rewritten), subst.getAllNames());
 }
 
@@ -34,12 +34,11 @@ bool isEmptyParseResult(const core::GlobalState &gs, const ast::ExpressionPtr &t
     }
 
     auto *classDef = ast::cast_tree<ast::ClassDef>(tree);
-    if (classDef == nullptr || classDef->symbol != core::Symbols::root() || classDef->rhs.empty()) {
+    if (classDef == nullptr || classDef->symbol != core::Symbols::root()) {
         return false;
     }
 
-    auto *rhsLiteral = ast::cast_tree<ast::Literal>(classDef->rhs[0]);
-    return rhsLiteral != nullptr && rhsLiteral->isNil(gs);
+    return classDef->rhs.empty();
 }
 
 unique_ptr<core::FileHash> computeFileHashForAST(spdlog::logger &logger, unique_ptr<core::GlobalState> &lgs,
@@ -56,30 +55,32 @@ unique_ptr<core::FileHash> computeFileHashForAST(spdlog::logger &logger, unique_
                 writer.Bool(true);
 
                 writer.String("file_path");
-                writer.String(string(file.file.data(*lgs).path()));
+                auto path = file.file.data(*lgs).path();
+                writer.String(path.data(), path.size());
 
                 writer.String("contents");
-                writer.String(string(file.file.data(*lgs).source()));
+                auto source = file.file.data(*lgs).source();
+                writer.String(source.data(), source.size());
 
                 writer.EndObject();
             }
 
-            logger.debug(result.GetString());
+            auto view = string_view{result.GetString(), result.GetLength()};
+            logger.debug(view);
 
-            core::GlobalStateHash invalid;
-            invalid.hierarchyHash = core::GlobalStateHash::HASH_STATE_INVALID;
-            return make_unique<core::FileHash>(move(invalid), move(usageHash));
+            return make_unique<core::FileHash>(core::LocalSymbolTableHashes::invalidParse(), move(usageHash),
+                                               core::FoundDefHashes{});
         }
     }
 
     vector<ast::ParsedFile> single;
     single.emplace_back(move(file));
 
-    core::Context ctx(*lgs, core::Symbols::root(), single[0].file);
     auto workers = WorkerPool::create(0, lgs->tracer());
-    realmain::pipeline::resolve(lgs, move(single), opts(), *workers);
+    core::FoundDefHashes foundHashes; // out parameter
+    realmain::pipeline::resolve(lgs, move(single), opts(), *workers, &foundHashes);
 
-    return make_unique<core::FileHash>(move(*lgs->hash()), move(usageHash));
+    return make_unique<core::FileHash>(move(*lgs->hash()), move(usageHash), move(foundHashes));
 }
 
 // Note: lgs is an outparameter.
@@ -88,6 +89,8 @@ core::FileRef makeEmptyGlobalStateForFile(spdlog::logger &logger, shared_ptr<cor
                                           const realmain::options::Options &hashingOpts) {
     lgs = core::GlobalState::makeEmptyGlobalStateForHashing(logger);
     lgs->requiresAncestorEnabled = hashingOpts.requiresAncestorEnabled;
+    lgs->ruby3KeywordArgs = hashingOpts.ruby3KeywordArgs;
+    lgs->lspExperimentalFastPathEnabled = hashingOpts.lspExperimentalFastPathEnabled;
     {
         core::UnfreezeFileTable fileTableAccess(*lgs);
         auto fref = lgs->enterFile(forWhat);
@@ -107,7 +110,7 @@ unique_ptr<core::FileHash> computeFileHashForFile(shared_ptr<core::File> forWhat
     // when fromGS == toGS (hence we intentionally do not unfreeze name table).
     core::LazyNameSubstitution subst(*lgs, *lgs);
     core::MutableContext ctx(*lgs, core::Symbols::root(), fref);
-    ast.tree = ast::Substitute::run(ctx, subst, move(ast.tree));
+    ast = ast::Substitute::run(ctx, subst, move(ast));
     return computeFileHashForAST(logger, lgs, subst.getAllNames(), move(ast));
 }
 }; // namespace

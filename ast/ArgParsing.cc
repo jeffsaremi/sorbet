@@ -8,58 +8,68 @@ using namespace std;
 namespace sorbet::ast {
 
 namespace {
-ParsedArg parseArg(const ast::ExpressionPtr &arg) {
-    ParsedArg parsedArg;
+core::ParsedArg parseArg(const ast::ExpressionPtr &arg) {
+    core::ParsedArg parsedArg;
+    auto *cursor = &arg;
 
-    typecase(
-        arg,
-        [&](const ast::RestArg &rest) {
-            parsedArg = parseArg(rest.expr);
-            parsedArg.flags.isRepeated = true;
-        },
-        [&](const ast::KeywordArg &kw) {
-            parsedArg = parseArg(kw.expr);
-            parsedArg.flags.isKeyword = true;
-        },
-        [&](const ast::OptionalArg &opt) {
-            parsedArg = parseArg(opt.expr);
-            parsedArg.flags.isDefault = true;
-        },
-        [&](const ast::BlockArg &blk) {
-            parsedArg = parseArg(blk.expr);
-            parsedArg.flags.isBlock = true;
-        },
-        [&](const ast::ShadowArg &shadow) {
-            parsedArg = parseArg(shadow.expr);
-            parsedArg.flags.isShadow = true;
-        },
-        [&](const ast::Local &local) {
-            parsedArg.local = local.localVariable;
-            parsedArg.loc = local.loc;
-        });
+    while (cursor != nullptr) {
+        typecase(
+            *cursor,
+            [&](const ast::RestArg &rest) {
+                parsedArg.flags.isRepeated = true;
+                cursor = &rest.expr;
+            },
+            [&](const ast::KeywordArg &kw) {
+                parsedArg.flags.isKeyword = true;
+                cursor = &kw.expr;
+            },
+            [&](const ast::OptionalArg &opt) {
+                parsedArg.flags.isDefault = true;
+                cursor = &opt.expr;
+            },
+            [&](const ast::BlockArg &blk) {
+                parsedArg.flags.isBlock = true;
+                cursor = &blk.expr;
+            },
+            [&](const ast::ShadowArg &shadow) {
+                parsedArg.flags.isShadow = true;
+                cursor = &shadow.expr;
+            },
+            [&](const ast::Local &local) {
+                parsedArg.local = local.localVariable;
+                parsedArg.loc = local.loc;
+                cursor = nullptr;
+            });
+    }
 
     return parsedArg;
 }
 
 ExpressionPtr getDefaultValue(ExpressionPtr arg) {
-    ExpressionPtr default_;
-    typecase(
-        arg, [&](ast::RestArg &rest) { default_ = getDefaultValue(move(rest.expr)); },
-        [&](ast::KeywordArg &kw) { default_ = getDefaultValue(move(kw.expr)); },
-        [&](ast::OptionalArg &opt) { default_ = move(opt.default_); },
-        [&](ast::BlockArg &blk) { default_ = getDefaultValue(move(blk.expr)); },
-        [&](ast::ShadowArg &shadow) { default_ = getDefaultValue(move(shadow.expr)); },
-        [&](ast::Local &local) {
-            // No default.
-        });
-    ENFORCE(default_ != nullptr);
-    return default_;
+    auto *cursor = &arg;
+    bool done = false;
+    while (!done) {
+        typecase(
+            *cursor, [&](ast::RestArg &rest) { cursor = &rest.expr; }, [&](ast::KeywordArg &kw) { cursor = &kw.expr; },
+            [&](ast::OptionalArg &opt) {
+                cursor = &opt.default_;
+                done = true;
+            },
+            [&](ast::BlockArg &blk) { cursor = &blk.expr; }, [&](ast::ShadowArg &shadow) { cursor = &shadow.expr; },
+            [&](ast::Local &local) {
+                ENFORCE(false, "shouldn't reach a local variable for arg");
+                done = true;
+                // No default.
+            });
+    }
+    ENFORCE(cursor != &arg);
+    return std::move(*cursor);
 }
 
 } // namespace
 
-vector<ParsedArg> ArgParsing::parseArgs(const ast::MethodDef::ARGS_store &args) {
-    vector<ParsedArg> parsedArgs;
+vector<core::ParsedArg> ArgParsing::parseArgs(const ast::MethodDef::ARGS_store &args) {
+    vector<core::ParsedArg> parsedArgs;
     for (auto &arg : args) {
         if (!ast::isa_reference(arg)) {
             Exception::raise("Must be a reference!");
@@ -70,35 +80,26 @@ vector<ParsedArg> ArgParsing::parseArgs(const ast::MethodDef::ARGS_store &args) 
     return parsedArgs;
 }
 
-std::vector<uint32_t> ArgParsing::hashArgs(core::Context ctx, const std::vector<ParsedArg> &args) {
-    std::vector<uint32_t> result;
-    result.reserve(args.size());
+// This has to match the implementation of Method::methodArityHash
+core::ArityHash ArgParsing::hashArgs(core::Context ctx, const std::vector<core::ParsedArg> &args) {
+    uint32_t result = 0;
+    result = core::mix(result, args.size());
     for (const auto &e : args) {
-        uint32_t arg = 0;
-        uint8_t flags = 0;
         if (e.flags.isKeyword) {
-            arg = core::mix(arg, core::_hash(e.local._name.shortName(ctx)));
-            flags += 1;
-        }
-        if (e.flags.isRepeated) {
-            flags += 2;
-        }
-        if (e.flags.isDefault) {
-            flags += 4;
-        }
-        if (e.flags.isShadow) {
-            flags += 8;
-        }
-        if (e.flags.isBlock) {
-            flags += 16;
+            if (e.flags.isRepeated && e.local._name != core::Names::fwdKwargs()) {
+                auto name = core::Names::kwargs();
+                result = core::mix(result, core::_hash(name.shortName(ctx)));
+            } else {
+                result = core::mix(result, core::_hash(e.local._name.shortName(ctx)));
+            }
         }
 
-        result.push_back(core::mix(arg, flags));
+        result = core::mix(result, e.flags.toU1());
     }
-    return result;
+    return core::ArityHash(result);
 }
 
-ExpressionPtr ArgParsing::getDefault(const ParsedArg &parsedArg, ExpressionPtr arg) {
+ExpressionPtr ArgParsing::getDefault(const core::ParsedArg &parsedArg, ExpressionPtr arg) {
     if (!parsedArg.flags.isDefault) {
         return nullptr;
     }

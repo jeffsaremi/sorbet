@@ -82,6 +82,13 @@ module Enumerable
   sig { params(pattern: T.untyped).returns(T::Boolean) }
   def any?(pattern = nil, &blk); end
 
+  # Returns an enumerator object generated from this enumerator and given
+  # enumerables.
+  #
+  # ```ruby
+  # e = (1..3).chain([4, 5])
+  # e.to_a #=> [1, 2, 3, 4, 5]
+  # ```
   sig do
     type_parameters(:U).params(enums: T::Enumerable[T.type_parameter(:U)])
     .returns(T::Enumerator[T.any(Elem, T.type_parameter(:U))])
@@ -598,9 +605,6 @@ module Enumerable
   sig {returns(T::Enumerator[[Elem, Integer]])}
   def each_with_index(&blk); end
 
-  ### TODO: the arg1 type in blk should be `T.type_parameter(:U)`, but because of
-  ### issue #38, this won't work.
-
   # Iterates the given block for each element with an arbitrary object given,
   # and returns the initially given object.
   #
@@ -613,7 +617,7 @@ module Enumerable
   sig do
     type_parameters(:U).params(
         arg0: T.type_parameter(:U),
-        blk: T.proc.params(arg0: Elem, arg1: T.untyped).returns(BasicObject),
+        blk: T.proc.params(arg0: Elem, arg1: T.type_parameter(:U)).returns(BasicObject),
     )
     .returns(T.type_parameter(:U))
   end
@@ -798,7 +802,7 @@ module Enumerable
   # ```
   sig do
     params(
-        arg0: BasicObject,
+        arg0: Elem,
     )
     .returns(T::Boolean)
   end
@@ -1640,6 +1644,64 @@ module Enumerable
   sig {returns(T::Enumerator[Elem])}
   def sort_by(&blk); end
 
+  # Returns the sum of elements in an
+  # [`Enumerable`](https://docs.ruby-lang.org/en/2.7.0/Enumerable.html).
+  #
+  # If a block is given, the block is applied to each element before addition.
+  #
+  # If *enum* is empty, it returns *init*.
+  #
+  # For example:
+  #
+  # ```ruby
+  # { 1 => 10, 2 => 20 }.sum {|k, v| k * v }  #=> 50
+  # (1..10).sum                               #=> 55
+  # (1..10).sum {|v| v * 2 }                  #=> 110
+  # ('a'..'z').sum                            #=> TypeError
+  # ```
+  #
+  # This method can be used for non-numeric objects by explicit *init* argument.
+  #
+  # ```ruby
+  # { 1 => 10, 2 => 20 }.sum([])                   #=> [1, 10, 2, 20]
+  # "a\nb\nc".each_line.lazy.map(&:chomp).sum("")  #=> "abc"
+  # ```
+  #
+  # If the method is applied to an
+  # [`Integer`](https://docs.ruby-lang.org/en/2.7.0/Integer.html) range without
+  # a block, the sum is not done by iteration, but instead using Gauss's
+  # summation formula.
+  #
+  # [`Enumerable#sum`](https://docs.ruby-lang.org/en/2.7.0/Enumerable.html#method-i-sum)
+  # method may not respect method redefinition of "+" methods such as
+  # [`Integer#+`](https://docs.ruby-lang.org/en/2.7.0/Integer.html#method-i-2B),
+  # or "each" methods such as
+  # [`Range#each`](https://docs.ruby-lang.org/en/2.7.0/Range.html#method-i-each).
+  sig do
+    returns(T.all(Elem, Numeric))
+  end
+  sig do
+    params(
+      init: BasicObject,
+    )
+    .returns(T.untyped)
+  end
+  sig do
+    type_parameters(:U)
+      .params(
+        blk: T.proc.params(arg0: Elem).returns(T.all(Numeric, T.type_parameter(:U)))
+      )
+      .returns(T.type_parameter(:U))
+  end
+  sig do
+    params(
+      init: BasicObject,
+      blk: T.proc.params(arg0: Elem).returns(T.untyped)
+    )
+    .returns(T.untyped)
+  end
+  def sum(init=0, &blk); end
+
   # Returns first n elements from *enum*.
   #
   # ```ruby
@@ -1882,17 +1944,17 @@ module Enumerable
     .returns(T.untyped)
   end
   sig do
-    params(
-        initial: T.untyped,
-        blk: T.proc.params(arg0: T.untyped, arg1: Elem).returns(T.untyped),
+    type_parameters(:U).params(
+        initial: T.type_parameter(:U),
+        blk: T.proc.params(arg0: T.type_parameter(:U), arg1: Elem).returns(T.type_parameter(:U)),
     )
-    .returns(T.untyped)
+    .returns(T.type_parameter(:U))
   end
   sig do
-    params(
-        blk: T.proc.params(arg0: T.untyped, arg1: Elem).returns(T.untyped),
+    type_parameters(:U).params(
+        blk: T.proc.params(arg0: T.any(Elem, T.type_parameter(:U)), arg1: Elem).returns(T.type_parameter(:U)),
     )
-    .returns(T.untyped)
+    .returns(T.nilable(T.type_parameter(:U)))
   end
   def reduce(initial=T.unsafe(nil), arg0=T.unsafe(nil), &blk); end
 
@@ -1996,7 +2058,7 @@ module Enumerable
   # # show pythagorean triples less than 100
   # p pythagorean_triples.take_while { |*, z| z < 100 }.force
   # ```
-  sig { returns(Enumerator::Lazy[Elem])}
+  sig { returns(T::Enumerator::Lazy[Elem])}
   def lazy(); end
 
   # Takes one element from *enum* and merges corresponding elements from each

@@ -39,56 +39,55 @@ class LocalNameInserter {
 
     struct NamedArg {
         core::NameRef name;
+        ArgFlags flags;
         core::LocalVariable local;
         core::LocOffsets loc;
         ast::ExpressionPtr expr;
-        ArgFlags flags;
     };
 
     // Map through the reference structure, naming the locals, and preserving
     // the outer structure for the namer proper.
     NamedArg nameArg(ast::ExpressionPtr arg) {
         NamedArg named;
+        auto *cursor = &arg;
 
-        typecase(
-            arg,
-            [&](ast::UnresolvedIdent &nm) {
-                named.name = nm.name;
-                named.local = enterLocal(named.name);
-                named.loc = arg.loc();
-                named.expr = ast::make_expression<ast::Local>(arg.loc(), named.local);
-            },
-            [&](ast::RestArg &rest) {
-                named = nameArg(move(rest.expr));
-                named.expr = ast::MK::RestArg(arg.loc(), move(named.expr));
-                named.flags.repeated = true;
-            },
-            [&](ast::KeywordArg &kw) {
-                named = nameArg(move(kw.expr));
-                named.expr = ast::make_expression<ast::KeywordArg>(arg.loc(), move(named.expr));
-                named.flags.keyword = true;
-            },
-            [&](ast::OptionalArg &opt) {
-                named = nameArg(move(opt.expr));
-                named.expr = ast::MK::OptionalArg(arg.loc(), move(named.expr), move(opt.default_));
-            },
-            [&](ast::BlockArg &blk) {
-                named = nameArg(move(blk.expr));
-                named.expr = ast::MK::BlockArg(arg.loc(), move(named.expr));
-                named.flags.block = true;
-            },
-            [&](ast::ShadowArg &shadow) {
-                named = nameArg(move(shadow.expr));
-                named.expr = ast::MK::ShadowArg(arg.loc(), move(named.expr));
-                named.flags.shadow = true;
-            },
-            [&](const ast::Local &local) {
-                named.name = local.localVariable._name;
-                named.local = enterLocal(named.name);
-                named.loc = arg.loc();
-                named.expr = ast::make_expression<ast::Local>(local.loc, named.local);
-            });
+        while (cursor != nullptr) {
+            typecase(
+                *cursor,
+                [&](ast::UnresolvedIdent &nm) {
+                    named.name = nm.name;
+                    named.local = enterLocal(nm.name);
+                    named.loc = nm.loc;
+                    *cursor = ast::make_expression<ast::Local>(nm.loc, named.local);
+                    cursor = nullptr;
+                },
+                [&](ast::RestArg &rest) {
+                    named.flags.repeated = true;
+                    cursor = &rest.expr;
+                },
+                [&](ast::KeywordArg &kw) {
+                    named.flags.keyword = true;
+                    cursor = &kw.expr;
+                },
+                [&](ast::OptionalArg &opt) { cursor = &opt.expr; },
+                [&](ast::BlockArg &blk) {
+                    named.flags.block = true;
+                    cursor = &blk.expr;
+                },
+                [&](ast::ShadowArg &shadow) {
+                    named.flags.shadow = true;
+                    cursor = &shadow.expr;
+                },
+                [&](const ast::Local &local) {
+                    named.name = local.localVariable._name;
+                    named.local = enterLocal(local.localVariable._name);
+                    named.loc = local.loc;
+                    *cursor = ast::make_expression<ast::Local>(local.loc, named.local);
+                    cursor = nullptr;
+                });
+        }
 
+        named.expr = move(arg);
         return named;
     }
 
@@ -222,11 +221,19 @@ class LocalNameInserter {
         original.clearArgs();
 
         if (!scopeStack.back().insideMethod) {
-            if (auto e = ctx.beginError(original.loc, core::errors::Namer::SelfOutsideClass)) {
+            if (auto e = ctx.beginError(original.loc, core::errors::Namer::SuperOutsideMethod)) {
                 e.setHeader("`{}` outside of method", "super");
             }
             return tree;
         }
+
+        auto rit = scopeStack.rbegin();
+        for (; rit != scopeStack.rend(); rit++) {
+            if (!rit->insideBlock) {
+                break;
+            }
+        }
+        auto &enclosingMethodScopeStack = *rit;
 
         // In the context of a method with a signature like this:
         //
@@ -269,7 +276,7 @@ class LocalNameInserter {
         // We'll also look for the block arg, which should always be present at the end of the args.
         ast::ExpressionPtr blockArg;
 
-        for (auto arg : scopeStack.back().args) {
+        for (const auto &arg : enclosingMethodScopeStack.args) {
             ENFORCE(blockArg == nullptr, "Block arg was not in final position");
 
             if (arg.flags.isPositional()) {
@@ -292,15 +299,16 @@ class LocalNameInserter {
             } else if (arg.flags.isKeyword()) {
                 ENFORCE(kwArgsHash == nullptr, "Saw keyword arg after keyword splat");
 
+                auto name = arg.arg._name;
                 kwArgKeyEntries.emplace_back(ast::MK::Literal(
-                    original.loc, core::make_type<core::LiteralType>(core::Symbols::Symbol(), arg.arg._name)));
+                    original.loc, core::make_type<core::NamedLiteralType>(core::Symbols::Symbol(), name)));
                 kwArgValueEntries.emplace_back(ast::make_expression<ast::Local>(original.loc, arg.arg));
             } else if (arg.flags.isKeywordSplat()) {
                 ENFORCE(kwArgsHash == nullptr, "Saw multiple keyword splats");
 
                 // TODO(aprocter): is it necessary to duplicate the hash here?
-                kwArgsHash = ast::MK::Send1(original.loc, ast::MK::Constant(original.loc, core::Symbols::Magic()),
-                                            core::Names::toHashDup(), original.loc.copyWithZeroLength(),
+                kwArgsHash = ast::MK::Send1(original.loc, ast::MK::Magic(original.loc), core::Names::toHashDup(),
+                                            original.loc.copyWithZeroLength(),
                                             ast::make_expression<ast::Local>(original.loc, arg.arg));
                 if (!kwArgKeyEntries.empty()) {
                     // TODO(aprocter): it might make more sense to replace this with an InsSeq that calls
@@ -334,7 +342,7 @@ class LocalNameInserter {
         }
 
         auto method = ast::MK::Literal(
-            original.loc, core::make_type<core::LiteralType>(core::Symbols::Symbol(), core::Names::super()));
+            original.loc, core::make_type<core::NamedLiteralType>(core::Symbols::Symbol(), core::Names::super()));
 
         if (posArgsArray != nullptr) {
             // We wrap self with T.unsafe in order to get around the requirement for <call-with-splat> and
@@ -372,7 +380,7 @@ class LocalNameInserter {
             }
             original.addPosArg(std::move(boxedKwArgs));
 
-            original.recv = ast::MK::Constant(original.loc, core::Symbols::Magic());
+            original.recv = ast::MK::Magic(original.loc);
 
             if (originalBlock != nullptr) {
                 // <call-with-splat> and "do"
@@ -408,7 +416,7 @@ class LocalNameInserter {
             kwArgKeyEntries.clear();
             kwArgValueEntries.clear();
 
-            original.recv = ast::MK::Constant(original.loc, core::Symbols::Magic());
+            original.recv = ast::MK::Magic(original.loc);
             original.fun = core::Names::callWithBlock();
         } else {
             // No positional splat and we have a "do", so we can synthesize an ordinary send.
@@ -437,53 +445,51 @@ class LocalNameInserter {
         return tree;
     }
 
-    ast::ExpressionPtr walkConstantLit(core::MutableContext ctx, ast::ExpressionPtr tree) {
+    void walkConstantLit(core::MutableContext ctx, ast::ExpressionPtr &tree) {
         if (auto *lit = ast::cast_tree<ast::UnresolvedConstantLit>(tree)) {
-            lit->scope = walkConstantLit(ctx, std::move(lit->scope));
-            return tree;
+            walkConstantLit(ctx, lit->scope);
         } else if (ast::isa_tree<ast::EmptyTree>(tree) || ast::isa_tree<ast::ConstantLit>(tree)) {
-            return tree;
+            // Do nothing.
         } else {
             // Uncommon case. Will result in "Dynamic constant references are not allowed" eventually.
             // Still want to do our best to recover (for e.g., LSP queries)
-            return ast::TreeMap::apply(ctx, *this, std::move(tree));
+            ast::TreeWalk::apply(ctx, *this, tree);
         }
     }
 
 public:
-    ast::ExpressionPtr preTransformClassDef(core::MutableContext ctx, ast::ExpressionPtr tree) {
+    void preTransformClassDef(core::MutableContext ctx, ast::ExpressionPtr &tree) {
+        auto &klass = ast::cast_tree_nonnull<ast::ClassDef>(tree);
+        for (auto &ancestor : klass.ancestors) {
+            ast::TreeWalk::apply(ctx, *this, ancestor);
+        }
+
         enterClass();
-        return tree;
     }
 
-    ast::ExpressionPtr postTransformClassDef(core::MutableContext ctx, ast::ExpressionPtr tree) {
+    void postTransformClassDef(core::MutableContext ctx, ast::ExpressionPtr &tree) {
         exitScope();
-        return tree;
     }
 
-    ast::ExpressionPtr preTransformMethodDef(core::MutableContext ctx, ast::ExpressionPtr tree) {
+    void preTransformMethodDef(core::MutableContext ctx, ast::ExpressionPtr &tree) {
         enterMethod();
 
         auto &method = ast::cast_tree_nonnull<ast::MethodDef>(tree);
         method.args = fillInArgs(nameArgs(ctx, method.args));
-        return tree;
     }
 
-    ast::ExpressionPtr postTransformMethodDef(core::MutableContext ctx, ast::ExpressionPtr tree) {
+    void postTransformMethodDef(core::MutableContext ctx, ast::ExpressionPtr &tree) {
         exitScope();
-        return tree;
     }
 
-    ast::ExpressionPtr postTransformSend(core::MutableContext ctx, ast::ExpressionPtr tree) {
+    void postTransformSend(core::MutableContext ctx, ast::ExpressionPtr &tree) {
         auto &original = ast::cast_tree_nonnull<ast::Send>(tree);
         if (original.numPosArgs() == 1 && ast::isa_tree<ast::ZSuperArgs>(original.getPosArg(0))) {
-            return lowerZSuperArgs(ctx, std::move(tree));
+            tree = lowerZSuperArgs(ctx, std::move(tree));
         }
-
-        return tree;
     }
 
-    ast::ExpressionPtr preTransformBlock(core::MutableContext ctx, ast::ExpressionPtr tree) {
+    void preTransformBlock(core::MutableContext ctx, ast::ExpressionPtr &tree) {
         auto &blk = ast::cast_tree_nonnull<ast::Block>(tree);
         auto outerArgs = scopeStack.back().args;
         auto &frame = enterBlock();
@@ -498,16 +504,13 @@ public:
         // If any of our arguments shadow our parent, fillInArgs will overwrite
         // them in `frame.locals`
         blk.args = fillInArgs(nameArgs(ctx, blk.args));
-
-        return tree;
     }
 
-    ast::ExpressionPtr postTransformBlock(core::MutableContext ctx, ast::ExpressionPtr tree) {
+    void postTransformBlock(core::MutableContext ctx, ast::ExpressionPtr &tree) {
         exitScope();
-        return tree;
     }
 
-    ast::ExpressionPtr postTransformUnresolvedIdent(core::MutableContext ctx, ast::ExpressionPtr tree) {
+    void postTransformUnresolvedIdent(core::MutableContext ctx, ast::ExpressionPtr &tree) {
         auto &nm = ast::cast_tree_nonnull<ast::UnresolvedIdent>(tree);
         if (nm.kind == ast::UnresolvedIdent::Kind::Local) {
             auto &frame = scopeStack.back();
@@ -516,14 +519,12 @@ public:
                 cur = enterLocal(nm.name);
             }
             ENFORCE(cur.exists());
-            return ast::make_expression<ast::Local>(nm.loc, cur);
-        } else {
-            return tree;
+            tree = ast::make_expression<ast::Local>(nm.loc, cur);
         }
     }
 
-    ast::ExpressionPtr postTransformUnresolvedConstantLit(core::MutableContext ctx, ast::ExpressionPtr tree) {
-        return walkConstantLit(ctx, std::move(tree));
+    void postTransformUnresolvedConstantLit(core::MutableContext ctx, ast::ExpressionPtr &tree) {
+        walkConstantLit(ctx, tree);
     }
 
 private:
@@ -537,7 +538,7 @@ private:
 ast::ParsedFile LocalVars::run(core::GlobalState &gs, ast::ParsedFile tree) {
     LocalNameInserter localNameInserter;
     sorbet::core::MutableContext ctx(gs, core::Symbols::root(), tree.file);
-    tree.tree = ast::TreeMap::apply(ctx, localNameInserter, move(tree.tree));
+    ast::TreeWalk::apply(ctx, localNameInserter, tree.tree);
     return tree;
 }
 

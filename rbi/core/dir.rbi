@@ -12,7 +12,7 @@ class Dir < Object
   include Enumerable
 
   extend T::Generic
-  Elem = type_member(:out, fixed: String)
+  Elem = type_member(:out) {{fixed: String}}
 
   # Changes the current working directory of the process to the given string.
   # When called without an argument, changes the directory to the value of the
@@ -400,6 +400,7 @@ class Dir < Object
   def self.rmdir(arg0); end
 
   # Returns the operating system's temporary file path.
+  sig {returns(String)}
   def self.tmpdir; end
 
   # Deletes the named directory. Raises a subclass of

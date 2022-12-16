@@ -48,6 +48,9 @@ string NameRef::showRaw(const GlobalState &gs) const {
                 case UniqueNameKind::MangleRename:
                     kind = "M";
                     break;
+                case UniqueNameKind::MangleRenameOverload:
+                    kind = "V";
+                    break;
                 case UniqueNameKind::Singleton:
                     kind = "S";
                     break;
@@ -71,9 +74,6 @@ string NameRef::showRaw(const GlobalState &gs) const {
                     break;
                 case UniqueNameKind::Packager:
                     kind = "G";
-                    break;
-                case UniqueNameKind::PackagerPrivate:
-                    kind = "V";
                     break;
             }
             if (gs.censorForSnapshotTests && unique->uniqueNameKind == UniqueNameKind::Namer &&
@@ -125,7 +125,8 @@ string NameRef::show(const GlobalState &gs) const {
                 return fmt::format("<Class:{}>", unique->original.show(gs));
             } else if (unique->uniqueNameKind == UniqueNameKind::Overload) {
                 return absl::StrCat(unique->original.show(gs), " (overload.", unique->num, ")");
-            } else if (unique->uniqueNameKind == UniqueNameKind::MangleRename) {
+            } else if (unique->uniqueNameKind == UniqueNameKind::MangleRename ||
+                       unique->uniqueNameKind == UniqueNameKind::MangleRenameOverload) {
                 return unique->original.show(gs);
             } else if (unique->uniqueNameKind == UniqueNameKind::TEnum) {
                 // The entire goal of UniqueNameKind::TEnum is to have Name::show print the name as if on the
@@ -183,11 +184,11 @@ bool NameRef::isClassName(const GlobalState &gs) const {
             switch (dataUnique(gs)->uniqueNameKind) {
                 case UniqueNameKind::Singleton:
                 case UniqueNameKind::MangleRename:
+                case UniqueNameKind::MangleRenameOverload:
                 case UniqueNameKind::TEnum:
                     return dataUnique(gs)->original.isClassName(gs);
                 case UniqueNameKind::ResolverMissingClass:
                 case UniqueNameKind::Packager:
-                case UniqueNameKind::PackagerPrivate:
                 case UniqueNameKind::Parser:
                 case UniqueNameKind::Desugar:
                 case UniqueNameKind::Namer:
@@ -211,25 +212,6 @@ bool NameRef::isTEnumName(const GlobalState &gs) const {
     return original.kind() == NameKind::UNIQUE && original.dataUnique(gs)->uniqueNameKind == UniqueNameKind::TEnum;
 }
 
-bool NameRef::isPackagerName(const GlobalState &gs) const {
-    if (kind() != NameKind::CONSTANT) {
-        return false;
-    }
-    auto original = dataCnst(gs)->original;
-    return original.kind() == NameKind::UNIQUE &&
-           (original.dataUnique(gs)->uniqueNameKind == UniqueNameKind::Packager ||
-            original.dataUnique(gs)->uniqueNameKind == UniqueNameKind::PackagerPrivate);
-}
-
-bool NameRef::isPackagerPrivateName(const GlobalState &gs) const {
-    if (kind() != NameKind::CONSTANT) {
-        return false;
-    }
-    auto original = dataCnst(gs)->original;
-    return original.kind() == NameKind::UNIQUE &&
-           original.dataUnique(gs)->uniqueNameKind == UniqueNameKind::PackagerPrivate;
-}
-
 bool NameRef::isValidConstantName(const GlobalState &gs) const {
     switch (kind()) {
         case NameKind::UTF8:
@@ -239,12 +221,12 @@ bool NameRef::isValidConstantName(const GlobalState &gs) const {
                 case UniqueNameKind::ResolverMissingClass:
                 case UniqueNameKind::TEnum:
                 case UniqueNameKind::Packager:
-                case UniqueNameKind::PackagerPrivate:
                     return true;
                 case UniqueNameKind::Parser:
                 case UniqueNameKind::Desugar:
                 case UniqueNameKind::Namer:
                 case UniqueNameKind::MangleRename:
+                case UniqueNameKind::MangleRenameOverload:
                 case UniqueNameKind::Singleton:
                 case UniqueNameKind::Overload:
                 case UniqueNameKind::TypeVarName:
@@ -253,6 +235,36 @@ bool NameRef::isValidConstantName(const GlobalState &gs) const {
                     return false;
             }
         case NameKind::CONSTANT:
+            return false;
+    }
+}
+
+bool NameRef::isAnyStaticInitName(const GlobalState &gs) const {
+    if (*this == core::Names::staticInit()) {
+        return true;
+    } else if (this->kind() != core::NameKind::UNIQUE) {
+        return false;
+    } else {
+        return this->dataUnique(gs)->original == core::Names::staticInit();
+    }
+}
+
+bool NameRef::isUpdateKnowledgeName() const {
+    switch (this->rawId()) {
+        case Names::bang().rawId():
+        case Names::blank_p().rawId():
+        case Names::eqeq().rawId():
+        case Names::equal_p().rawId():
+        case Names::isA_p().rawId():
+        case Names::kindOf_p().rawId():
+        case Names::leq().rawId():
+        case Names::lessThan().rawId():
+        case Names::neq().rawId():
+        case Names::nil_p().rawId():
+        case Names::present_p().rawId():
+        case Names::tripleEq().rawId():
+            return true;
+        default:
             return false;
     }
 }
@@ -367,6 +379,21 @@ NameRef NameRef::lookupWithEq(const GlobalState &gs) const {
     return gs.lookupNameUTF8(nameEq);
 }
 
+bool NameRef::isSetter(const GlobalState &gs) const {
+    if (this->kind() != NameKind::UTF8) {
+        return false;
+    }
+    const string_view rawName = this->dataUtf8(gs)->utf8;
+    if (rawName.size() < 2) {
+        return false;
+    }
+    if (rawName.back() == '=') {
+        return !(*this == Names::leq() || *this == Names::geq() || *this == Names::tripleEq() ||
+                 *this == Names::eqeq() || *this == Names::neq());
+    }
+    return false;
+}
+
 NameRef NameRef::addQuestion(GlobalState &gs) const {
     auto name = this->dataUtf8(gs);
     string nameEq = absl::StrCat(name->utf8, "?");
@@ -389,24 +416,6 @@ NameRef NameRef::prepend(GlobalState &gs, string_view s) const {
     auto name = this->dataUtf8(gs);
     string nameEq = absl::StrCat(s, name->utf8);
     return gs.enterNameUTF8(nameEq);
-}
-
-NameRef NameRef::lookupMangledPrivatePackageName(const GlobalState &gs) const {
-    auto name = this->dataUtf8(gs);
-    auto parts = absl::StrSplit(name->utf8, "::");
-    string mangledName = absl::StrCat(absl::StrJoin(parts, "_"), core::PACKAGE_PRIVATE_SUFFIX);
-
-    auto utf8Name = gs.lookupNameUTF8(mangledName);
-    if (!utf8Name.exists()) {
-        return utf8Name;
-    }
-
-    auto packagerName = gs.lookupNameUnique(core::UniqueNameKind::PackagerPrivate, utf8Name, 1);
-    if (!packagerName.exists()) {
-        return packagerName;
-    }
-
-    return gs.lookupNameConstant(packagerName);
 }
 
 UTF8Name UTF8Name::deepCopy(const GlobalState &to) const {

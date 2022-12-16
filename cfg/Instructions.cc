@@ -44,6 +44,7 @@ string spacesForTabLevel(int tabs) {
         CASE_STATEMENT(body, YieldLoadArg)        \
         CASE_STATEMENT(body, Cast)                \
         CASE_STATEMENT(body, TAbsurd)             \
+        CASE_STATEMENT(body, KeepAlive)           \
     }
 
 std::string InstructionPtr::toString(const core::GlobalState &gs, const CFG &cfg) const {
@@ -110,11 +111,11 @@ LoadSelf::LoadSelf(shared_ptr<core::SendAndBlockLink> link, LocalRef fallback)
 }
 
 string LoadSelf::toString(const core::GlobalState &gs, const CFG &cfg) const {
-    return "loadSelf";
+    return fmt::format("loadSelf({})", this->link->fun.toString(gs));
 }
 
 string LoadSelf::showRaw(const core::GlobalState &gs, const CFG &cfg, int tabs) const {
-    return fmt::format("LoadSelf {{}}", spacesForTabLevel(tabs));
+    return fmt::format("LoadSelf {{ link = {} }}", this->link->fun.showRaw(gs));
 }
 
 Send::Send(LocalRef recv, core::LocOffsets receiverLoc, core::NameRef fun, core::LocOffsets funLoc, uint16_t numPosArgs,
@@ -125,14 +126,31 @@ Send::Send(LocalRef recv, core::LocOffsets receiverLoc, core::NameRef fun, core:
     ENFORCE(numPosArgs <= args.size(), "Expected {} positional arguments, but only have {} args", numPosArgs,
             args.size());
 
-    this->args.resize(args.size());
-    int i = 0;
+    this->args.reserve(args.size());
     for (const auto &e : args) {
-        this->args[i].variable = e;
-        i++;
+        this->args.emplace_back(e);
     }
     categoryCounterInc("cfg", "send");
     histogramInc("cfg.send.args", this->args.size());
+}
+
+core::LocOffsets Send::locWithoutBlock(core::LocOffsets bindLoc) {
+    if (this->link == nullptr) {
+        // This location is slightly better, because it will include the last `)` if that exists,
+        // which means that queries for things like
+        //
+        //     foo()
+        //     #   ^ completion: ...
+        //
+        // will match.
+        return bindLoc;
+    }
+
+    if (!this->argLocs.empty()) {
+        return this->receiverLoc.join(this->argLocs.back());
+    }
+
+    return this->receiverLoc.join(this->funLoc);
 }
 
 Literal::Literal(const core::TypePtr &value) : value(move(value)) {
@@ -142,7 +160,9 @@ Literal::Literal(const core::TypePtr &value) : value(move(value)) {
 string Literal::toString(const core::GlobalState &gs, const CFG &cfg) const {
     string res;
     typecase(
-        this->value, [&](const core::LiteralType &l) { res = l.showValue(gs); },
+        this->value, [&](const core::NamedLiteralType &l) { res = l.showValue(gs); },
+        [&](const core::IntegerLiteralType &i) { res = i.showValue(gs); },
+        [&](const core::FloatLiteralType &i) { res = i.showValue(gs); },
         [&](const core::ClassType &l) {
             if (l.symbol == core::Symbols::NilClass()) {
                 res = "nil";
@@ -250,11 +270,12 @@ string YieldParamPresent::showRaw(const core::GlobalState &gs, const CFG &cfg, i
 }
 
 string YieldLoadArg::toString(const core::GlobalState &gs, const CFG &cfg) const {
-    return fmt::format("yield_load_arg({})", this->argId);
+    return fmt::format("yield_load_arg({}, {})", this->argId, this->yieldParam.toString(gs, cfg));
 }
 
 string YieldLoadArg::showRaw(const core::GlobalState &gs, const CFG &cfg, int tabs) const {
-    return fmt::format("YieldLoadArg {{ argId = {} }}", this->argId);
+    return fmt::format("YieldLoadArg {{ argId = {}, yieldParam = {} }}", this->argId,
+                       this->yieldParam.showRaw(gs, cfg));
 }
 
 string GetCurrentException::toString(const core::GlobalState &gs, const CFG &cfg) const {
@@ -282,6 +303,15 @@ string TAbsurd::toString(const core::GlobalState &gs, const CFG &cfg) const {
 string TAbsurd::showRaw(const core::GlobalState &gs, const CFG &cfg, int tabs) const {
     return fmt::format("TAbsurd {{\n{0}&nbsp;what = {1},\n{0}}}", spacesForTabLevel(tabs),
                        this->what.showRaw(gs, cfg, tabs + 1));
+}
+
+string KeepAlive::toString(const core::GlobalState &gs, const CFG &cfg) const {
+    return fmt::format("<keep-alive> {}", this->what.toString(gs, cfg));
+}
+
+string KeepAlive::showRaw(const core::GlobalState &gs, const CFG &cfg, int tabs) const {
+    return fmt::format("KeepAlive {{\n{0}&nbsp;what = {1},\n{0}}}", spacesForTabLevel(tabs),
+                       this->what.showRaw(gs, cfg));
 }
 
 string VariableUseSite::toString(const core::GlobalState &gs, const CFG &cfg) const {

@@ -22,6 +22,7 @@ class KeyValueStore final {
     const std::string flavor;
     struct DBState;
     const std::unique_ptr<DBState> dbState;
+    const std::shared_ptr<spdlog::logger> logger;
 
 public:
     /**
@@ -41,7 +42,8 @@ public:
      * `KeyValueStore`s opened with different `flavor`s will not share
      * any entries, but each will see their own set of values.
      */
-    KeyValueStore(std::string version, std::string path, std::string flavor);
+    KeyValueStore(std::shared_ptr<spdlog::logger> logger, std::string version, std::string path, std::string flavor,
+                  size_t maxSize);
     ~KeyValueStore() noexcept(false);
 
     // Used in tests to assert that OwnedKeyValueStore cleans up reader transactions.
@@ -66,10 +68,12 @@ class OwnedKeyValueStore final {
     mutable absl::Mutex readers_mtx;
 
     void writeInternal(std::string_view key, void *value, size_t len);
-    void clear();
+    void checkVersions();
     void refreshMainTransaction();
     int commit();
     void abort() const;
+
+    std::string_view kvstorePath() const;
 
 public:
     OwnedKeyValueStore(std::unique_ptr<KeyValueStore> kvstore);
@@ -79,7 +83,7 @@ public:
     KeyValueStoreValue read(std::string_view key) const;
     /** Reads a string from the key value store. Lifetime of string is tied to the lifetime of the database. Returns an
      * empty string_view if the key does not exist. */
-    std::string_view readString(std::string_view key) const;
+    std::optional<std::string_view> readString(std::string_view key) const;
     void writeString(std::string_view key, std::string_view value);
     /** can only be called from owning thread */
     void write(std::string_view key, const std::vector<uint8_t> &value);
@@ -93,6 +97,14 @@ public:
      * be re-owned if more writes are desired.  Must be called by the owning thread. */
     static std::unique_ptr<KeyValueStore> bestEffortCommit(spdlog::logger &logger,
                                                            std::unique_ptr<OwnedKeyValueStore> ownedKvstore);
+
+    /**
+     * Computes how full the cache is, in bytes.
+     *
+     * Computes size by summing all used pages (not free pages) across all named databases and the unnamed database,
+     * and then multiplying by the page size.
+     */
+    size_t cacheSize() const;
 };
 
 } // namespace sorbet

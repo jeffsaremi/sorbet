@@ -5,8 +5,6 @@
 #include <memory>
 #include <string>
 
-#include "location.hh"
-
 // these token values are mirrored in src/grammars/*.y
 // any changes *must* be applied to the grammars as well.
 #define RUBY_PARSER_TOKEN_TYPES(XX) \
@@ -157,7 +155,8 @@
     XX(tRATIONAL_IMAGINARY, 1143)   \
     XX(tFLOAT_IMAGINARY, 1144)      \
     XX(tBDOT2, 1145)                \
-    XX(tBDOT3, 1146)
+    XX(tBDOT3, 1146)                \
+    XX(tBEFORE_EOF, 1147)
 
 namespace ruby_parser {
 enum class token_type : int {
@@ -168,29 +167,44 @@ enum class token_type : int {
 #endif
 };
 
-// TODO(jez) Worth using location here?
 class token {
     token_type _type;
     size_t _start;
     size_t _end;
     std::string_view _string;
+    size_t _lineStart;
 
 public:
-    token(token_type type, size_t start, size_t end, std::string_view str);
+    token(token_type type, size_t start, size_t end, std::string_view str, size_t line);
     // Don't allow people to rely on implicit conversion to std::string_view:
     // they should make sure their string views live in storage that will outlive
     // the lexer.
-    token(token_type type, size_t start, size_t end, const std::string &str) = delete;
+    token(token_type type, size_t start, size_t end, const std::string &str, size_t lineStart) = delete;
 
     token_type type() const;
     size_t start() const;
     size_t end() const;
     void setEnd(size_t end);
+    size_t lineStart() const;
     std::string_view view() const;
     std::string asString() const;
+
+    static std::string_view tokenTypeName(token_type type) {
+#ifndef YYBISON
+        switch (type) {
+#define XX(name, value)    \
+    case token_type::name: \
+        return std::string_view(#name);
+            RUBY_PARSER_TOKEN_TYPES(XX)
+#undef XX
+        }
+#endif
+    }
 };
 
 using token_t = token *;
 } // namespace ruby_parser
+
+std::ostream &operator<<(std::ostream &o, const ruby_parser::token &token);
 
 #endif

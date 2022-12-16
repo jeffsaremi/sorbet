@@ -73,6 +73,24 @@ public:
         counterInc("basicblocks");
     };
 
+    struct BlockExitCondInfo {
+        VariableUseSite recv;
+        core::LocOffsets loc;
+        core::NameRef fun;
+        BlockExitCondInfo(VariableUseSite &&recv, core::LocOffsets loc, core::NameRef fun)
+            : recv(std::move(recv)), loc(loc), fun(fun) {}
+    };
+    // If the `BlockExit::cond` was initialized by a `Send` to a method with a name that
+    // updateKnowledge is aware of, return information about the receiver of that `Send`.
+    //
+    // Should only be used to *improve* existing error messages, not as a reliable source of truth,
+    // because the implemention is only a heuristic, and may fail to find a receiver even when it
+    // might be otherwise expected to.
+    //
+    // More specifically, Sorbet's CFG is not SSA, so finding the `Send` that computes the variable
+    // used in `BasicBlock::cond` 100% of the time is not easy (maybe not even possible).
+    std::optional<BlockExitCondInfo> maybeGetUpdateKnowledgeReceiver(const cfg::CFG &inWhat) const;
+
     std::string toString(const core::GlobalState &gs, const CFG &cfg) const;
     std::string toTextualString(const core::GlobalState &gs, const CFG &cfg) const;
     std::string showRaw(const core::GlobalState &gs, const CFG &cfg) const;
@@ -107,7 +125,11 @@ public:
      */
     int numLocalVariables() const;
 
-    core::FileRef file;
+    // Stores MethodDef::loc (not the MethodDef::declLoc).
+    //
+    // Thus, this usually spans the full body of the method def (recall that sometime methods are
+    // created synthetically, not from method defs written in the source).
+    core::LocOffsets loc;
     std::vector<std::unique_ptr<BasicBlock>> basicBlocks;
 
     // Special loc that corresponds to implicit method return.
@@ -141,7 +163,7 @@ public:
 
     // special minLoops
     static constexpr int MIN_LOOP_FIELD = -1;
-    static constexpr int MIN_LOOP_GLOBAL = -2;
+    // static constexpr int MIN_LOOP_GLOBAL = -2;
     static constexpr int MIN_LOOP_LET = -3;
 
     // special ruby region id offsets for exception handling

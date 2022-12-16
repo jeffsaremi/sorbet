@@ -45,6 +45,9 @@ class CompletionTask final : public LSPRequestTask {
     std::vector<std::unique_ptr<CompletionItem>> getCompletionItems(LSPTypecheckerDelegate &typechecker,
                                                                     SearchParams &params);
 
+    std::unique_ptr<CompletionItem> getCompletionItemForUntyped(const core::GlobalState &gs, core::Loc queryLoc,
+                                                                size_t sortIdx, std::string_view message);
+
     std::unique_ptr<CompletionItem> getCompletionItemForMethod(LSPTypecheckerDelegate &typechecker,
                                                                core::DispatchResult &dispatchResult,
                                                                core::MethodRef what, const core::TypePtr &receiverType,

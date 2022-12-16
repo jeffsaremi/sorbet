@@ -5,6 +5,7 @@
 #include "absl/strings/str_join.h"
 #include "absl/strings/str_split.h"
 #include "common/FileOps.h"
+#include "common/concurrency/WorkerPool.h"
 #include "common/formatting.h"
 #include "common/sort.h"
 #include "main/lsp/LSPConfiguration.h"
@@ -21,7 +22,7 @@ namespace {
 
 // Matches '    #    ^^^^^ label: dafhdsjfkhdsljkfh*&#&*%'
 // and '    # label: foobar'.
-const regex rangeAssertionRegex("(#[ ]*)(\\^*)[ ]*([a-zA-Z-]+): (.*)$");
+const regex rangeAssertionRegex("(#[ ]*)(\\^*)[ ]*([a-zA-Z0-9-]+): (.*)$");
 
 const regex whitespaceRegex("^[ ]*$");
 
@@ -32,6 +33,8 @@ const UnorderedMap<
         {"error", ErrorAssertion::make},
         {"error-with-dupes", ErrorAssertion::make},
         {"usage", UsageAssertion::make},
+        {"import", ImportAssertion::make},
+        {"importusage", ImportUsageAssertion::make},
         {"def", DefAssertion::make},
         {"type", TypeAssertion::make},
         {"type-def", TypeDefAssertion::make},
@@ -39,8 +42,11 @@ const UnorderedMap<
         {"disable-stress-incremental", BooleanPropertyAssertion::make},
         {"enable-packager", BooleanPropertyAssertion::make},
         {"enable-experimental-requires-ancestor", BooleanPropertyAssertion::make},
+        {"experimental-ruby3-keyword-args", BooleanPropertyAssertion::make},
         {"enable-suggest-unsafe", BooleanPropertyAssertion::make},
-        {"exhaustive-apply-code-action", BooleanPropertyAssertion::make},
+        {"selective-apply-code-action", StringPropertyAssertions::make},
+        {"use-code-action-resolve", BooleanPropertyAssertion::make},
+        {"assert-no-code-action", StringPropertyAssertions::make},
         {"assert-fast-path", FastPathAssertion::make},
         {"assert-slow-path", BooleanPropertyAssertion::make},
         {"hover", HoverAssertion::make},
@@ -50,15 +56,21 @@ const UnorderedMap<
         {"no-stdlib", BooleanPropertyAssertion::make},
         {"symbol-search", SymbolSearchAssertion::make},
         {"apply-rename", ApplyRenameAssertion::make},
-        {"extra-package-files-directory-prefix", StringPropertyAssertion::make},
+        {"extra-package-files-directory-prefix-underscore", StringPropertyAssertion::make},
+        {"extra-package-files-directory-prefix-slash", StringPropertyAssertion::make},
         {"implementation", ImplementationAssertion::make},
         {"find-implementation", FindImplementationAssertion::make},
         {"show-symbol", ShowSymbolAssertion::make},
 };
 
 // Ignore any comments that have these labels (e.g. `# typed: true`).
-const UnorderedSet<string> ignoredAssertionLabels = {"typed", "TODO", "linearization", "commented-out-error",
-                                                     "Note",  "See"};
+const UnorderedSet<string> ignoredAssertionLabels = {
+    "typed",         "TODO",
+    "linearization", "commented-out-error",
+    "Note",          "See",
+    "packaged",      "rubyfmt-force-exit",
+    "compiled",      "exclude-from-file-update",
+};
 
 constexpr string_view NOTHING_LABEL = "(nothing)"sv;
 constexpr string_view NULL_LABEL = "null"sv;
@@ -234,6 +246,14 @@ int RangeAssertion::matches(string_view otherFilename, const Range &otherRange) 
             return cmp;
         }
     }
+    if (otherRange.start->cmp(*otherRange.end) == 0) {
+        // zero-width error message. Allow single `^` to match this
+        // (VS Code will still show a red squiggle for a diagnostic that is zero-width)
+        if (range->start->cmp(*otherRange.start) == 0 && range->end->line == otherRange.end->line &&
+            range->end->character - 1 == otherRange.end->character) {
+            return 0;
+        }
+    }
     return range->cmp(otherRange);
 }
 
@@ -304,7 +324,7 @@ vector<shared_ptr<RangeAssertion>> parseAssertionsForFile(const shared_ptr<core:
     int lastSourceLineNum = 0;
 
     auto source = file->source();
-    auto filename = string(file->path().begin(), file->path().end());
+    auto filename = string(file->path());
     auto &lineBreaks = file->lineBreaks();
 
     for (auto lineBreak : lineBreaks) {
@@ -313,7 +333,7 @@ vector<shared_ptr<RangeAssertion>> parseAssertionsForFile(const shared_ptr<core:
             continue;
         }
         string_view lineView = source.substr(nextChar, lineBreak - nextChar);
-        string line = string(lineView.begin(), lineView.end());
+        auto line = string(lineView);
         nextChar = lineBreak + 1;
 
         // Groups: Line up until first caret, carets, assertion type, assertion contents.
@@ -343,11 +363,18 @@ vector<shared_ptr<RangeAssertion>> parseAssertionsForFile(const shared_ptr<core:
                 lastSourceLineNum = lineNum;
             }
 
+            string assertionType = matches[3].str();
+            string assertionContents = matches[4].str();
+
             unique_ptr<Range> range;
             if (numCarets > 0) {
                 int caretBeginPos = textBeforeComment.size() + matches[1].str().size();
                 int caretEndPos = caretBeginPos + numCarets;
                 range = RangeAssertion::makeRange(lastSourceLineNum, caretBeginPos, caretEndPos);
+            } else if (assertionContents == "unexpected token tNL") {
+                range = RangeAssertion::makeRange(lineNum);
+            } else if (assertionContents == "unexpected token \"end of file\"") {
+                range = RangeAssertion::makeRange(lineNum);
             } else {
                 range = RangeAssertion::makeRange(lastSourceLineNum);
             }
@@ -357,9 +384,6 @@ vector<shared_ptr<RangeAssertion>> parseAssertionsForFile(const shared_ptr<core:
                 // next line could point to code on this line.
                 lastSourceLineNum = lineNum;
             }
-
-            string assertionType = matches[3].str();
-            string assertionContents = matches[4].str();
 
             const auto &findConstructor = assertionConstructors.find(assertionType);
             if (findConstructor != assertionConstructors.end()) {
@@ -372,7 +396,7 @@ vector<shared_ptr<RangeAssertion>> parseAssertionsForFile(const shared_ptr<core:
                                 "regular comment that just happens to be formatted like an assertion comment, you "
                                 "can add the label to `ignoredAssertionLabels`.",
                                 assertionType,
-                                fmt::map_join(assertionConstructors.begin(), assertionConstructors.end(), ", ",
+                                fmt::map_join(assertionConstructors, ", ",
                                               [](const auto &entry) -> string { return entry.first; })));
             }
         } else {
@@ -493,7 +517,25 @@ void DefAssertion::check(const UnorderedMap<string, shared_ptr<core::File>> &sou
     auto responses = getLSPResponsesFor(lspWrapper, makeDefinitionRequest(id, queryLoc.uri, line, character));
     {
         INFO("Unexpected number of responses to a `textDocument/definition` request.");
-        REQUIRE_EQ(1, responses.size());
+        const auto numResponses = absl::c_count_if(responses, [](const auto &m) { return m->isResponse(); });
+        REQUIRE_EQ(1, numResponses);
+        const auto numRequests = absl::c_count_if(responses, [](const auto &m) { return m->isRequest(); });
+        REQUIRE_EQ(0, numRequests);
+        // Ensure the lone response is at the front.
+        absl::c_partition(responses, [](const auto &m) { return m->isResponse(); });
+        // We would like to verify the number of notifications here, but the number
+        // of notifications depends on the typed-ness of the file as well as the
+        // particular kind of query we're running, and we don't have access to the
+        // latter here.  We can definitely assert that typed files have no notifications,
+        // though.
+        auto foundFile = sourceFileContents.find(locFilename);
+        REQUIRE_NE(sourceFileContents.end(), foundFile);
+        auto &file = foundFile->second;
+        if (file->strictLevel >= core::StrictLevel::True) {
+            const auto numNotifications =
+                absl::c_count_if(responses, [](const auto &m) { return m->isNotification(); });
+            REQUIRE_EQ(0, numNotifications);
+        }
     }
     assertResponseMessage(id, *responses.at(0));
 
@@ -568,10 +610,27 @@ void UsageAssertion::check(const UnorderedMap<string, shared_ptr<core::File>> &s
     auto responses =
         getLSPResponsesFor(lspWrapper, make_unique<LSPMessage>(make_unique<RequestMessage>(
                                            "2.0", id, LSPMethod::TextDocumentReferences, move(referenceParams))));
-    if (responses.size() != 1) {
+    {
         INFO("Unexpected number of responses to a `textDocument/references` request.");
-        CHECK_EQ(1, responses.size());
-        return;
+        const auto numResponses = absl::c_count_if(responses, [](const auto &m) { return m->isResponse(); });
+        REQUIRE_EQ(1, numResponses);
+        const auto numRequests = absl::c_count_if(responses, [](const auto &m) { return m->isRequest(); });
+        REQUIRE_EQ(0, numRequests);
+        // Ensure the lone response is at the front.
+        absl::c_partition(responses, [](const auto &m) { return m->isResponse(); });
+        // We would like to verify the number of notifications here, but the number
+        // of notifications depends on the typed-ness of the file as well as the
+        // particular kind of query we're running, and we don't have access to the
+        // latter here.  We can definitely assert that typed files have no notifications,
+        // though.
+        auto foundFile = sourceFileContents.find(locFilename);
+        REQUIRE_NE(sourceFileContents.end(), foundFile);
+        auto &file = foundFile->second;
+        if (file->strictLevel >= core::StrictLevel::True) {
+            const auto numNotifications =
+                absl::c_count_if(responses, [](const auto &m) { return m->isNotification(); });
+            REQUIRE_EQ(0, numNotifications);
+        }
     }
 
     assertResponseMessage(id, *responses.at(0));
@@ -672,6 +731,35 @@ shared_ptr<UsageAssertion> UsageAssertion::make(string_view filename, unique_ptr
                           fmt::format("Unexpected usage assertion option: `{}`", option));
     }
     return make_shared<UsageAssertion>(filename, range, assertionLine, symbol, versions);
+}
+
+ImportAssertion::ImportAssertion(string_view filename, unique_ptr<Range> &range, int assertionLine, string_view symbol,
+                                 vector<int> versions)
+    : UsageAssertion(filename, range, assertionLine, symbol, versions) {}
+
+shared_ptr<ImportAssertion> ImportAssertion::make(string_view filename, unique_ptr<Range> &range, int assertionLine,
+                                                  string_view assertionContents, string_view assertionType) {
+    auto [symbol, versions, option] = getSymbolVersionAndOption(assertionContents);
+    if (!option.empty()) {
+        ADD_FAIL_CHECK_AT(string(filename).c_str(), assertionLine + 1,
+                          fmt::format("Unexpected import assertion option: `{}`", option));
+    }
+    return make_shared<ImportAssertion>(filename, range, assertionLine, symbol, versions);
+}
+
+ImportUsageAssertion::ImportUsageAssertion(string_view filename, unique_ptr<Range> &range, int assertionLine,
+                                           string_view symbol, vector<int> versions)
+    : UsageAssertion(filename, range, assertionLine, symbol, versions) {}
+
+shared_ptr<ImportUsageAssertion> ImportUsageAssertion::make(string_view filename, unique_ptr<Range> &range,
+                                                            int assertionLine, string_view assertionContents,
+                                                            string_view assertionType) {
+    auto [symbol, versions, option] = getSymbolVersionAndOption(assertionContents);
+    if (!option.empty()) {
+        ADD_FAIL_CHECK_AT(string(filename).c_str(), assertionLine + 1,
+                          fmt::format("Unexpected importusage assertion option: `{}`", option));
+    }
+    return make_shared<ImportUsageAssertion>(filename, range, assertionLine, symbol, versions);
 }
 
 string UsageAssertion::toString() const {
@@ -793,6 +881,10 @@ void reportUnexpectedError(const string &filename, const Diagnostic &diagnostic,
 
 string getSourceLine(const UnorderedMap<string, shared_ptr<core::File>> &sourceFileContents, const string &filename,
                      int line) {
+    if (absl::StartsWith(filename, core::File::URL_PREFIX)) {
+        return "";
+    }
+
     auto it = sourceFileContents.find(filename);
     if (it == sourceFileContents.end()) {
         FAIL_CHECK(fmt::format("Unable to find referenced source file `{}`", filename));
@@ -806,7 +898,7 @@ string getSourceLine(const UnorderedMap<string, shared_ptr<core::File>> &sourceF
     } else {
         // Note: line is a 0-indexed line number, but file uses 1-indexed line numbers.
         auto lineView = file->getLine(line + 1);
-        return string(lineView.begin(), lineView.end());
+        return string(lineView);
     }
 }
 
@@ -934,6 +1026,11 @@ bool ErrorAssertion::checkAll(const UnorderedMap<string, shared_ptr<core::File>>
 shared_ptr<BooleanPropertyAssertion> BooleanPropertyAssertion::make(string_view filename, unique_ptr<Range> &range,
                                                                     int assertionLine, string_view assertionContents,
                                                                     string_view assertionType) {
+    {
+        INFO("Unrecognized boolean property assertion value: " << assertionContents);
+        auto trueOrFalse = assertionContents == "true" || assertionContents == "false";
+        CHECK(trueOrFalse);
+    }
     return make_shared<BooleanPropertyAssertion>(filename, range, assertionLine, assertionContents == "true",
                                                  assertionType);
 }
@@ -997,6 +1094,12 @@ shared_ptr<FastPathAssertion> FastPathAssertion::make(string_view filename, uniq
                                                       string_view assertionContents, string_view assertionType) {
     optional<vector<string>> expectedFiles;
     if (!assertionContents.empty()) {
+        if (assertionContents == "true") {
+            auto filenameStr = string(filename);
+            ADD_FAIL_CHECK_AT(filenameStr.c_str(), assertionLine,
+                              "Unlike assert-slow-path, assert-fast-path takes a comma-separated list of file "
+                              "basenames which should be typechecked on the fast path");
+        }
         expectedFiles = absl::StrSplit(assertionContents, ',');
         fast_sort(*expectedFiles);
     }
@@ -1019,23 +1122,33 @@ FastPathAssertion::FastPathAssertion(string_view filename, unique_ptr<Range> &ra
 void FastPathAssertion::check(SorbetTypecheckRunInfo &info, string_view folder, int updateVersion,
                               string_view errorPrefix) {
     string updateFile = fmt::format("{}.{}.rbupdate", filename.substr(0, -3), updateVersion);
-    if (!info.fastPath) {
+    if (info.typecheckingPath != TypecheckingPath::Fast) {
         ADD_FAIL_CHECK_AT(updateFile.c_str(), assertionLine,
                           errorPrefix << "Expected file update to take fast path, but it took the slow path.");
     }
     if (expectedFiles.has_value()) {
         vector<string> expectedFilePaths;
         for (auto &f : *expectedFiles) {
-            expectedFilePaths.push_back(absl::StrCat(folder, f));
+            if (absl::StartsWith(f, core::File::URL_PREFIX)) {
+                expectedFilePaths.push_back(f);
+            } else {
+                expectedFilePaths.push_back(absl::StrCat(folder, f));
+            }
         }
+        fast_sort(expectedFilePaths);
         fast_sort(info.filesTypechecked);
         vector<string> unTypecheckedFiles;
-        set_difference(expectedFilePaths.begin(), expectedFilePaths.end(), info.filesTypechecked.begin(),
-                       info.filesTypechecked.end(), back_inserter(unTypecheckedFiles));
+        absl::c_set_difference(expectedFilePaths, info.filesTypechecked, back_inserter(unTypecheckedFiles));
         for (auto &f : unTypecheckedFiles) {
             ADD_FAIL_CHECK_AT(updateFile.c_str(), assertionLine,
                               errorPrefix
                                   << fmt::format("Expected file update to cause {} to also be typechecked.", f));
+        }
+        vector<string> extraFiles;
+        absl::c_set_difference(info.filesTypechecked, expectedFilePaths, back_inserter(extraFiles));
+        for (auto &f : extraFiles) {
+            ADD_FAIL_CHECK_AT(updateFile.c_str(), assertionLine,
+                              errorPrefix << fmt::format("File update caused {} to be typechecked unexpectedly.", f));
         }
     }
 }
@@ -1099,7 +1212,7 @@ void HoverAssertion::check(const UnorderedMap<string, shared_ptr<core::File>> &s
     auto &responseMsg = responses.at(0);
     REQUIRE(responseMsg->isResponse());
     auto &response = responseMsg->asResponse();
-    REQUIRE(response.result.has_value());
+    REQUIRE_MESSAGE(response.result.has_value(), response.error.value()->message);
     auto &hoverResponse = get<variant<JSONNullObject, unique_ptr<Hover>>>(*response.result);
     auto hoverContents = hoverToString(hoverResponse);
 
@@ -1148,7 +1261,7 @@ void CompletionAssertion::check(const UnorderedMap<string, shared_ptr<core::File
     string actualMessage =
         completionList->items.empty()
             ? "(nothing)"
-            : fmt::format("{}", fmt::map_join(completionList->items.begin(), completionList->items.end(), ", ",
+            : fmt::format("{}", fmt::map_join(completionList->items, ", ",
                                               [](const auto &item) -> string { return item->label; }));
 
     auto partial = absl::EndsWith(this->message, ", ...");
@@ -1251,10 +1364,9 @@ void ApplyCompletionAssertion::check(const UnorderedMap<std::string, std::shared
     auto actualEditedFileContents = applyEdit(file->source(), *file, *textEdit->range, textEdit->newText);
 
     {
-        INFO(fmt::format("The expected (rbedited) file contents for this completion did not match the actual file "
-                         "contents post-edit",
-                         expectedUpdatedFilePath));
-        CHECK_EQ(expectedEditedFileContents, actualEditedFileContents);
+        CHECK_EQ_DIFF(expectedEditedFileContents, actualEditedFileContents,
+                      "The expected (rbedited) file contents for this completion did not match the actual file "
+                      "contents post-edit");
     }
 }
 
@@ -1266,23 +1378,31 @@ shared_ptr<ApplyRenameAssertion> ApplyRenameAssertion::make(string_view filename
                                                             int assertionLine, string_view assertionContents,
                                                             string_view assertionType) {
     static const regex newNameRegex(
-        R"(^\[(\w+)\]\s+(?:(?:newName:\s+(\w+))?\s?(?:invalid:\s+(true))??\s?(?:expectedErrorMessage:\s+(.+))?)$)");
+        R"(^\[(\w+)\]\s+(?:(?:newName:\s+([a-zA-Z0-9_@]+))?\s?(?:placeholderText:\s+([^ ]+))?\s?(?:invalid:\s+(true))?\s?(?:expectedErrorMessage:\s+(.+))?)$)");
 
     smatch matches;
     string assertionContentsString = string(assertionContents);
     if (regex_search(assertionContentsString, matches, newNameRegex)) {
         auto version = matches[1].str();
         auto newName = matches[2].str();
-        auto invalid = !matches[3].str().empty();
-        auto expectedErrorMessage = matches[4].str();
-        if (!newName.empty() || invalid) {
-            return make_shared<ApplyRenameAssertion>(filename, range, assertionLine, version, newName, invalid,
-                                                     expectedErrorMessage);
+        auto placeholderText = matches[3].str();
+        if (!newName.empty() && placeholderText.empty()) {
+            ADD_FAIL_CHECK_AT(string(filename).c_str(), assertionLine + 1,
+                              "placeholderText must be provided if newName is provided");
+            return nullptr;
+        }
+
+        auto invalid = !matches[4].str().empty();
+        auto expectedErrorMessage = matches[5].str();
+        if ((!newName.empty() && !placeholderText.empty()) || invalid) {
+            return make_shared<ApplyRenameAssertion>(filename, range, assertionLine, version, newName, placeholderText,
+                                                     invalid, expectedErrorMessage);
         }
     }
 
     ADD_FAIL_CHECK_AT(string(filename).c_str(), assertionLine + 1,
                       fmt::format("Improperly formatted apply-rename assertion. Expected '[<version>] newName: <name> "
+                                  "placeholderText: <name> "
                                   "(invalid: true) (expectedErrorMessage: <message>)'. Found '{}' in file {}",
                                   assertionContents, filename));
 
@@ -1290,10 +1410,10 @@ shared_ptr<ApplyRenameAssertion> ApplyRenameAssertion::make(string_view filename
 }
 
 ApplyRenameAssertion::ApplyRenameAssertion(string_view filename, unique_ptr<Range> &range, int assertionLine,
-                                           string_view version, string newName, bool invalid,
+                                           string_view version, string newName, string placeholderText, bool invalid,
                                            string expectedErrorMessage)
-    : RangeAssertion(filename, range, assertionLine), version(string(version)), newName(newName), invalid(invalid),
-      expectedErrorMessage(expectedErrorMessage) {}
+    : RangeAssertion(filename, range, assertionLine), version(string(version)), newName(newName),
+      placeholderText(placeholderText), invalid(invalid), expectedErrorMessage(expectedErrorMessage) {}
 
 void ApplyRenameAssertion::checkAll(const vector<shared_ptr<RangeAssertion>> &assertions,
                                     const UnorderedMap<string, shared_ptr<core::File>> &sourceFileContents,
@@ -1308,19 +1428,30 @@ void ApplyRenameAssertion::checkAll(const vector<shared_ptr<RangeAssertion>> &as
 void ApplyRenameAssertion::check(const UnorderedMap<std::string, std::shared_ptr<core::File>> &sourceFileContents,
                                  LSPWrapper &wrapper, int &nextId, std::string errorPrefix) {
     auto prepareRenameResponse = doTextDocumentPrepareRename(wrapper, *this->range, nextId, this->filename);
-    // TODO: test placeholder in prepareRenameResponse
 
     // A rename at an invalid position
     if (newName.empty() && invalid) {
+        if (prepareRenameResponse != nullptr) {
+            ADD_FAIL_CHECK_AT(this->filename.c_str(), this->assertionLine + 1,
+                              "Received a prepareRenameResponse for an invalid rename position");
+        }
         REQUIRE_EQ(prepareRenameResponse, nullptr);
     } else {
         REQUIRE_NE(prepareRenameResponse, nullptr);
+        auto &optPlaceholder = prepareRenameResponse->placeholder;
+        REQUIRE(optPlaceholder.has_value());
+        auto &placeholder = *optPlaceholder;
+        REQUIRE_EQ(this->placeholderText, placeholder);
     }
 
     auto workspaceEdits =
         doTextDocumentRename(wrapper, *this->range, nextId, this->filename, newName, expectedErrorMessage);
     // A rename at a valid position but with an invalid new name
     if (invalid) {
+        if (workspaceEdits != nullptr) {
+            ADD_FAIL_CHECK_AT(this->filename.c_str(), this->assertionLine + 1,
+                              "Received workspaceEdits for an invalid rename position");
+        }
         REQUIRE_EQ(workspaceEdits, nullptr);
         return;
     }
@@ -1345,7 +1476,9 @@ void ApplyRenameAssertion::check(const UnorderedMap<std::string, std::shared_ptr
     UnorderedMap<string, string> actualEditedFiles;
     // map of all .rbedited files whose version equals `this->version`
     UnorderedMap<string, string> expectedEditedFiles;
-    for (auto filePath : FileOps::listFilesInDir(testDataPath, {".rb", ".rbi", ".rbedited"}, false, {}, {})) {
+    unique_ptr<WorkerPool> workerPool = WorkerPool::create(0, *spdlog::default_logger());
+    for (auto filePath :
+         FileOps::listFilesInDir(testDataPath, {".rb", ".rbi", ".rbedited"}, *workerPool, false, {}, {})) {
         auto extension = FileOps::getExtension(filePath);
         if (extension == "rbedited") {
             auto extensionIndex = filePath.rfind(".rbedited", filePath.length());
@@ -1378,7 +1511,7 @@ void ApplyRenameAssertion::check(const UnorderedMap<std::string, std::shared_ptr
         // First, sort the edits by increasing starting location
         fast_sort(edits, [](const auto &l, const auto &r) -> bool { return l->range->cmp(*r->range) < 0; });
         // Apply the edits in the reverse order so that the indices don't change.
-        reverse(edits.begin(), edits.end());
+        absl::c_reverse(edits);
 
         string actualEditedFileContents = string(sourceFiles[sourceFilePath]);
         for (auto &edit : edits) {
@@ -1433,58 +1566,115 @@ shared_ptr<ApplyCodeActionAssertion> ApplyCodeActionAssertion::make(string_view 
 }
 ApplyCodeActionAssertion::ApplyCodeActionAssertion(string_view filename, unique_ptr<Range> &range, int assertionLine,
                                                    string_view title, string_view version)
-    : RangeAssertion(filename, range, assertionLine), title(string(title)), version(string(version)) {}
+    : RangeAssertion(filename, range, assertionLine), title(string(title)), version(string(version)), kind(nullopt) {}
 
 string ApplyCodeActionAssertion::toString() const {
     return fmt::format("apply-code-action: [{}] {}", version, title);
 }
+optional<pair<string, string>> ApplyCodeActionAssertion::expectedFile() {
+    auto expectedUpdatedFilePath = updatedFilePath(this->filename, this->version);
+    string expectedEditedFileContents;
+    try {
+        expectedEditedFileContents = FileOps::read(expectedUpdatedFilePath);
+    } catch (FileNotFoundException e) {
+        ADD_FAIL_CHECK_AT(filename.c_str(), assertionLine + 1,
+                          fmt::format("Missing {} which should contain test file after applying code actions.",
+                                      expectedUpdatedFilePath));
+        return nullopt;
+    }
+    return make_pair(expectedUpdatedFilePath, expectedEditedFileContents);
+}
+
+void ApplyCodeActionAssertion::assertResults(std::string expectedPath, std::string expectedContents,
+                                             std::string actualContents) {
+    CHECK_EQ_DIFF(
+        expectedContents, actualContents,
+        fmt::format(
+            "Invalid quick fix result. Expected edited result ({}) to be:\n{}\n...but actually resulted in:\n{}",
+            expectedPath, expectedContents, actualContents));
+}
+
+std::unique_ptr<TextDocumentEdit> ApplyCodeActionAssertion::sortEdits(std::unique_ptr<TextDocumentEdit> changes) {
+    // First, sort the edits by increasing starting location and verify that none overlap.
+    fast_sort(changes->edits, [](const auto &l, const auto &r) -> bool { return l->range->cmp(*r->range) < 0; });
+    for (uint32_t i = 1; i < changes->edits.size(); i++) {
+        INFO(fmt::format("Received quick fix edit\n{}\nthat overlaps edit\n{}\nThe test runner does not support "
+                         "overlapping autocomplete edits, and it's likely that this is a bug.",
+                         changes->edits[i - 1]->toJSON(), changes->edits[i]->toJSON()));
+        REQUIRE_LT(changes->edits[i - 1]->range->end->cmp(*changes->edits[i]->range->start), 0);
+    }
+
+    // Now, apply the edits in the reverse order so that the indices don't change.
+    absl::c_reverse(changes->edits);
+    return changes;
+}
+
+namespace {
+shared_ptr<sorbet::core::File>
+getFileByUri(const LSPConfiguration &config,
+             const UnorderedMap<std::string, std::shared_ptr<core::File>> &sourceFileContents, string uri) {
+    auto filename = uriToFilePath(config, uri);
+    auto it = sourceFileContents.find(filename);
+    {
+        INFO(fmt::format("Unable to find referenced source file `{}`", filename));
+        REQUIRE_NE(it, sourceFileContents.end());
+    }
+    return it->second;
+}
+} // namespace
 
 void ApplyCodeActionAssertion::check(const UnorderedMap<std::string, std::shared_ptr<core::File>> &sourceFileContents,
                                      LSPWrapper &wrapper, const CodeAction &codeAction) {
+    auto maybeFile = expectedFile();
+    if (!maybeFile.has_value()) {
+        return;
+    }
+    auto [expectedUpdatedFilePath, expectedEditedFileContents] = maybeFile.value();
     const auto &config = wrapper.config();
     for (auto &c : *codeAction.edit.value()->documentChanges) {
-        auto filename = uriToFilePath(config, c->textDocument->uri);
-        auto it = sourceFileContents.find(filename);
-        {
-            INFO(fmt::format("Unable to find referenced source file `{}`", filename));
-            REQUIRE_NE(it, sourceFileContents.end());
-        }
-        auto &file = it->second;
-
-        auto expectedUpdatedFilePath = updatedFilePath(this->filename, this->version);
-        string expectedEditedFileContents;
-        try {
-            expectedEditedFileContents = FileOps::read(expectedUpdatedFilePath);
-        } catch (FileNotFoundException e) {
-            ADD_FAIL_CHECK_AT(filename.c_str(), assertionLine + 1,
-                              fmt::format("Missing {} which should contain test file after applying code actions.",
-                                          expectedUpdatedFilePath));
-            return;
-        }
+        auto file = getFileByUri(config, sourceFileContents, c->textDocument->uri);
 
         string actualEditedFileContents = string(file->source());
+        c = sortEdits(move(c));
 
-        // First, sort the edits by increasing starting location and verify that none overlap.
-        fast_sort(c->edits, [](const auto &l, const auto &r) -> bool { return l->range->cmp(*r->range) < 0; });
-        for (uint32_t i = 1; i < c->edits.size(); i++) {
-            INFO(fmt::format("Received quick fix edit\n{}\nthat overlaps edit\n{}\nThe test runner does not support "
-                             "overlapping autocomplete edits, and it's likely that this is a bug.",
-                             c->edits[i - 1]->toJSON(), c->edits[i]->toJSON()));
-            REQUIRE_LT(c->edits[i - 1]->range->end->cmp(*c->edits[i]->range->start), 0);
-        }
-
-        // Now, apply the edits in the reverse order so that the indices don't change.
-        reverse(c->edits.begin(), c->edits.end());
         for (auto &e : c->edits) {
             actualEditedFileContents = applyEdit(actualEditedFileContents, *file, *e->range, e->newText);
         }
-        INFO(fmt::format(
-            "Invalid quick fix result. Expected edited result ({}) to be:\n{}\n...but actually resulted in:\n{}",
-            expectedUpdatedFilePath, expectedEditedFileContents, actualEditedFileContents));
-        CHECK_EQ(actualEditedFileContents, expectedEditedFileContents);
+        assertResults(expectedUpdatedFilePath, expectedEditedFileContents, actualEditedFileContents);
+    }
+};
+
+void ApplyCodeActionAssertion::checkAll(
+    const UnorderedMap<std::string, std::shared_ptr<core::File>> &sourceFileContents, LSPWrapper &wrapper,
+    const CodeAction &codeAction) {
+    const auto &config = wrapper.config();
+    UnorderedMap<string, string> accumulatedOriginalEditedContents{};
+    string actualEditedFileContents;
+    auto maybeFile = expectedFile();
+    if (!maybeFile.has_value()) {
+        return;
+    }
+    auto [expectedUpdatedFilePath, expectedEditedFileContents] = maybeFile.value();
+    for (auto &c : *codeAction.edit.value()->documentChanges) {
+        auto file = getFileByUri(config, sourceFileContents, c->textDocument->uri);
+
+        c = sortEdits(move(c));
+        actualEditedFileContents = string(file->source());
+
+        for (auto &e : c->edits) {
+            string oldSource = accumulatedOriginalEditedContents.contains(actualEditedFileContents)
+                                   ? accumulatedOriginalEditedContents[actualEditedFileContents]
+                                   : actualEditedFileContents;
+
+            auto newSource = applyEdit(oldSource, *file, *e->range, e->newText);
+            accumulatedOriginalEditedContents.insert_or_assign(actualEditedFileContents, newSource);
+        }
+    }
+
+    for (auto pair : accumulatedOriginalEditedContents) {
+        assertResults(expectedUpdatedFilePath, expectedEditedFileContents, pair.second);
     }
 }
-
 SymbolSearchAssertion::SymbolSearchAssertion(string_view filename, unique_ptr<Range> &range, int assertionLine,
                                              string_view query, optional<std::string> name, optional<string> container,
                                              std::optional<int> rank, optional<string> uri)
@@ -1922,4 +2112,46 @@ string ShowSymbolAssertion::toString() const {
     return fmt::format("show-symbol: {}", message);
 }
 
+namespace {
+string_view trimString(std::string_view s) {
+    const char *whitespace = " \t";
+    size_t begin = s.find_first_not_of(whitespace);
+    if (begin == std::string::npos) {
+        return "";
+    }
+    size_t end = s.find_last_not_of(whitespace);
+    return s.substr(begin, end - begin + 1);
+}
+} // namespace
+
+std::shared_ptr<StringPropertyAssertions>
+StringPropertyAssertions::make(std::string_view filename, std::unique_ptr<Range> &range, int assertionLine,
+                               std::string_view assertionContents, std::string_view assertionType) {
+    std::vector<std::string> values = absl::StrSplit(assertionContents, ',');
+    transform(values.begin(), values.end(), values.begin(), [](auto val) { return trimString(val); });
+
+    return make_shared<StringPropertyAssertions>(filename, range, assertionLine, values, assertionType);
+}
+
+StringPropertyAssertions::StringPropertyAssertions(std::string_view filename, std::unique_ptr<Range> &range,
+                                                   int assertionLine, std::vector<std::string> values,
+                                                   std::string_view assertionType)
+    : RangeAssertion(filename, range, assertionLine), assertionType(string(assertionType)), values(values){};
+
+std::optional<std::vector<std::string>>
+StringPropertyAssertions::getValues(std::string_view type,
+                                    const std::vector<std::shared_ptr<RangeAssertion>> &assertions) {
+    for (auto &assertion : assertions) {
+        if (auto codeActionAssertion = dynamic_pointer_cast<StringPropertyAssertions>(assertion)) {
+            if (codeActionAssertion->assertionType == type) {
+                return codeActionAssertion->values;
+            }
+        }
+    }
+    return nullopt;
+}
+
+string StringPropertyAssertions::toString() const {
+    return fmt::format("selective-apply-code-action: {}", fmt::join(values, ", "));
+}
 } // namespace sorbet::test

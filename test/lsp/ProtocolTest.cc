@@ -19,11 +19,13 @@ bool isTypecheckRun(const LSPMessage &msg) {
 }
 } // namespace
 
-void ProtocolTest::resetState() {
+void ProtocolTest::resetState(std::shared_ptr<realmain::options::Options> opts) {
     fs = make_shared<MockFileSystem>(rootPath);
     diagnostics.clear();
     sourceFileContents.clear();
-    auto opts = make_shared<realmain::options::Options>();
+    if (opts == nullptr) {
+        opts = make_shared<realmain::options::Options>();
+    }
     opts->disableWatchman = true;
     if (useCache) {
         // Only recreate the cacheDir if we haven't created one before.
@@ -32,6 +34,7 @@ void ProtocolTest::resetState() {
         }
         opts->cacheDir = cacheDir;
     }
+    opts->lspExperimentalFastPathEnabled = true;
 
     if (useMultithreading) {
         lspWrapper = MultiThreadedLSPWrapper::create(rootPath, opts);
@@ -56,9 +59,10 @@ ProtocolTest::~ProtocolTest() {
     }
 }
 
-vector<unique_ptr<LSPMessage>> ProtocolTest::initializeLSP(bool supportsMarkdown,
+vector<unique_ptr<LSPMessage>> ProtocolTest::initializeLSP(bool supportsMarkdown, bool supportsCodeActionResolve,
                                                            optional<unique_ptr<SorbetInitializationOptions>> opts) {
-    auto responses = sorbet::test::initializeLSP(rootPath, rootUri, *lspWrapper, nextId, supportsMarkdown, move(opts));
+    auto responses = sorbet::test::initializeLSP(rootPath, rootUri, *lspWrapper, nextId, supportsMarkdown,
+                                                 supportsCodeActionResolve, move(opts));
     updateDiagnostics(responses);
     return responses;
 }
@@ -77,7 +81,7 @@ unique_ptr<LSPMessage> ProtocolTest::closeFile(string_view path) {
     // File is closed, so update contents from mock FS.
     try {
         sourceFileContents[string(path)] =
-            make_shared<core::File>(string(path), string(fs->readFile(path)), core::File::Type::Normal);
+            make_shared<core::File>(string(path), fs->readFile(string(path)), core::File::Type::Normal);
     } catch (FileNotFoundException e) {
         auto it = sourceFileContents.find(path);
         if (it != sourceFileContents.end()) {
@@ -106,6 +110,10 @@ unique_ptr<LSPMessage> ProtocolTest::workspaceSymbol(string_view query) {
 
 unique_ptr<LSPMessage> ProtocolTest::hover(string_view path, int line, int character) {
     return makeHover(nextId++, getUri(path), line, character);
+}
+
+unique_ptr<LSPMessage> ProtocolTest::codeAction(string_view path, int line, int character) {
+    return makeCodeAction(nextId++, getUri(path), line, character);
 }
 
 unique_ptr<LSPMessage> ProtocolTest::completion(string_view path, int line, int character) {

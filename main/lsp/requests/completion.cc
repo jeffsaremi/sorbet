@@ -8,10 +8,13 @@
 #include "common/sort.h"
 #include "common/typecase.h"
 #include "core/lsp/QueryResponse.h"
+#include "main/lsp/FieldFinder.h"
+#include "main/lsp/LSPLoop.h"
+#include "main/lsp/LSPQuery.h"
 #include "main/lsp/LocalVarFinder.h"
 #include "main/lsp/NextMethodFinder.h"
 #include "main/lsp/json_types.h"
-#include "main/lsp/lsp.h"
+#include "rapidjson/writer.h"
 
 using namespace std;
 
@@ -29,6 +32,8 @@ struct RubyKeyword {
                 optional<string> detail = nullopt)
         : keyword(move(keyword)), documentation(move(documentation)), snippet(move(snippet)), detail(move(detail)){};
 };
+
+using KeywordLikeSnippet = RubyKeyword;
 
 // Taken from https://docs.ruby-lang.org/en/2.6.0/keywords_rdoc.html
 // We might want to put this somewhere shareable if there are more places that want to use it.
@@ -83,10 +88,17 @@ const RubyKeyword rubyKeywords[] = {
     {"yield", "Starts execution of the block sent to the current method."},
 };
 
+// Since these are not technically Ruby keywords but will be treated as such we store
+// these separately for hygiene.
+const KeywordLikeSnippet keywordLikeSnippets[] = {
+    {"enum", "Creates an enum class", "class ${1:EnumName} < T::Enum\n  enums do\n    $0\n  end\nend"},
+    {"struct", "Creates a new struct class", "class ${1:StructName} < T::Struct\n  $0\nend"},
+};
+
 vector<core::ClassOrModuleRef> ancestorsImpl(const core::GlobalState &gs, core::ClassOrModuleRef sym,
                                              vector<core::ClassOrModuleRef> &&acc) {
     // The implementation here is similar to Symbols::derivesFrom.
-    ENFORCE(sym.data(gs)->isClassOrModuleLinearizationComputed());
+    ENFORCE(sym.data(gs)->flags.isLinearizationComputed);
     acc.emplace_back(sym);
 
     for (auto mixin : sym.data(gs)->mixins()) {
@@ -125,6 +137,11 @@ bool hasSimilarName(const core::GlobalState &gs, core::NameRef name, string_view
     string_view view = name.shortName(gs);
     auto fnd = view.find(pattern);
     return fnd != string_view::npos;
+}
+
+bool hasPrefixedName(const core::GlobalState &gs, core::NameRef name, string_view pattern) {
+    string_view view = name.shortName(gs);
+    return absl::StartsWith(view, pattern);
 }
 
 using SimilarMethodsByName = UnorderedMap<core::NameRef, vector<SimilarMethod>>;
@@ -186,6 +203,10 @@ SimilarMethodsByName similarMethodsForReceiver(const core::GlobalState &gs, cons
             result = mergeSimilarMethods(similarMethodsForReceiver(gs, type.left, prefix),
                                          similarMethodsForReceiver(gs, type.right, prefix));
         },
+        [&](const core::LambdaParam &type) { result = similarMethodsForReceiver(gs, type.upperBound, prefix); },
+        [&](const core::SelfTypeParam &type) {
+            result = similarMethodsForReceiver(gs, type.definition.resultType(gs), prefix);
+        },
         [&](const core::TypePtr &type) {
             if (is_proxy_type(receiver)) {
                 result = similarMethodsForReceiver(gs, receiver.underlying(gs), prefix);
@@ -196,20 +217,16 @@ SimilarMethodsByName similarMethodsForReceiver(const core::GlobalState &gs, cons
 }
 
 // Walk a core::DispatchResult to find methods similar to `prefix` on any of its DispatchComponents' receivers.
-SimilarMethodsByName allSimilarMethods(const core::GlobalState &gs, core::DispatchResult &dispatchResult,
+SimilarMethodsByName allSimilarMethods(const core::GlobalState &gs, const core::DispatchResult &dispatchResult,
                                        string_view prefix) {
-    auto result = similarMethodsForReceiver(gs, dispatchResult.main.receiver, prefix);
+    ENFORCE(!dispatchResult.main.receiver.isUntyped())
 
-    // Convert to shared_ptr and take ownership
-    shared_ptr<core::TypeConstraint> constr = move(dispatchResult.main.constr);
+    auto result = similarMethodsForReceiver(gs, dispatchResult.main.receiver, prefix);
 
     for (auto &[methodName, similarMethods] : result) {
         for (auto &similarMethod : similarMethods) {
             ENFORCE(similarMethod.receiverType == nullptr, "About to overwrite non-null receiverType");
             similarMethod.receiverType = dispatchResult.main.receiver;
-
-            ENFORCE(similarMethod.constr == nullptr, "About to overwrite non-null constr");
-            similarMethod.constr = constr;
         }
     }
 
@@ -242,16 +259,37 @@ vector<RubyKeyword> allSimilarKeywords(string_view prefix) {
     return result;
 }
 
-vector<core::LocalVariable> allSimilarLocals(const core::GlobalState &gs, const vector<core::LocalVariable> &locals,
-                                             string_view prefix) {
-    auto result = vector<core::LocalVariable>{};
+vector<KeywordLikeSnippet> allSimilarLikeKeywords(string_view prefix) {
+    ENFORCE(
+        absl::c_is_sorted(keywordLikeSnippets, [](auto &left, auto &right) { return left.keyword < right.keyword; }),
+        "keywordLikeSnippets is not sorted by keyword; completion results will be out of order");
+
+    if (prefix == "") {
+        // Since we suggest keyword snippets first, they're just noise when the prefix is empty
+        return {};
+    }
+
+    auto result = vector<KeywordLikeSnippet>{};
+    for (const auto &keywordSnippet : keywordLikeSnippets) {
+        if (absl::StartsWith(keywordSnippet.keyword, prefix)) {
+            result.emplace_back(keywordSnippet);
+        }
+    }
+
+    // The result is trivially sorted because we walked keywordLikeSnippets (which is sorted) in order.
+    return result;
+}
+
+vector<core::NameRef> allSimilarLocalNames(const core::GlobalState &gs, const vector<core::NameRef> &locals,
+                                           string_view prefix) {
+    auto result = vector<core::NameRef>{};
     for (const auto &local : locals) {
-        if (hasAngleBrackets(local._name.shortName(gs))) {
+        if (hasAngleBrackets(local.shortName(gs))) {
             // Gets rid of locals like <blk>
             continue;
         }
 
-        if (hasSimilarName(gs, local._name, prefix)) {
+        if (hasSimilarName(gs, local, prefix)) {
             result.emplace_back(local);
         }
     }
@@ -262,7 +300,13 @@ vector<core::LocalVariable> allSimilarLocals(const core::GlobalState &gs, const 
 string methodSnippet(const core::GlobalState &gs, core::DispatchResult &dispatchResult, core::MethodRef method,
                      const core::TypePtr &receiverType, const core::TypeConstraint *constraint, uint16_t totalArgs) {
     fmt::memory_buffer result;
-    fmt::format_to(std::back_inserter(result), "{}", method.data(gs)->name.shortName(gs));
+    auto shortName = method.data(gs)->name.shortName(gs);
+    auto isSetter = method.data(gs)->name.isSetter(gs);
+    if (isSetter) {
+        fmt::format_to(std::back_inserter(result), "{}", string_view(shortName.data(), shortName.size() - 1));
+    } else {
+        fmt::format_to(std::back_inserter(result), "{}", shortName);
+    }
     auto nextTabstop = 1;
 
     /* If we are completing an existing send that either has some arguments
@@ -271,6 +315,11 @@ string methodSnippet(const core::GlobalState &gs, core::DispatchResult &dispatch
      */
     if (totalArgs > 0 || dispatchResult.main.blockReturnType != nullptr) {
         fmt::format_to(std::back_inserter(result), "${{0}}");
+        return to_string(result);
+    }
+
+    if (isSetter) {
+        fmt::format_to(std::back_inserter(result), " = ${{0}}");
         return to_string(result);
     }
 
@@ -411,14 +460,14 @@ unique_ptr<CompletionItem> getCompletionItemForConstant(const core::GlobalState 
 
     if (what.isClassOrModule()) {
         auto whatKlass = what.asClassOrModuleRef();
-        if (whatKlass.data(gs)->isClassOrModuleClass()) {
+        if (whatKlass.data(gs)->isClass()) {
             if (whatKlass.data(gs)->derivesFrom(gs, core::Symbols::T_Enum())) {
                 item->kind = CompletionItemKind::Enum;
             } else {
                 item->kind = CompletionItemKind::Class;
             }
         } else {
-            if (whatKlass.data(gs)->isClassOrModuleAbstract() || whatKlass.data(gs)->isClassOrModuleInterface()) {
+            if (whatKlass.data(gs)->flags.isAbstract || whatKlass.data(gs)->flags.isInterface) {
                 item->kind = CompletionItemKind::Interface;
             } else {
                 item->kind = CompletionItemKind::Module;
@@ -459,13 +508,13 @@ unique_ptr<CompletionItem> getCompletionItemForConstant(const core::GlobalState 
     return item;
 }
 
-unique_ptr<CompletionItem> getCompletionItemForLocal(const core::GlobalState &gs, const LSPConfiguration &config,
-                                                     const core::LocalVariable &local, const core::Loc queryLoc,
-                                                     string_view prefix, size_t sortIdx) {
-    auto label = string(local._name.shortName(gs));
+unique_ptr<CompletionItem> getCompletionItemForLocalName(const core::GlobalState &gs, const LSPConfiguration &config,
+                                                         const core::NameRef local, const core::Loc queryLoc,
+                                                         string_view prefix, size_t sortIdx) {
+    auto label = string(local.shortName(gs));
     auto item = make_unique<CompletionItem>(label);
     item->sortText = formatSortIndex(sortIdx);
-    item->kind = CompletionItemKind::Variable;
+    item->kind = absl::StartsWith(prefix, "@") ? CompletionItemKind::Field : CompletionItemKind::Variable;
 
     auto replacementText = label;
     if (auto replacementRange = replacementRangeForQuery(gs, queryLoc, prefix)) {
@@ -478,8 +527,102 @@ unique_ptr<CompletionItem> getCompletionItemForLocal(const core::GlobalState &gs
     return item;
 }
 
-vector<core::LocalVariable> localsForMethod(LSPTypecheckerDelegate &typechecker, const core::MethodRef method,
-                                            const core::Loc queryLoc) {
+vector<core::NameRef> allSimilarFields(const core::GlobalState &gs, core::ClassOrModuleRef klass, string_view prefix) {
+    vector<core::NameRef> result;
+
+    // `ancestors` already includes klass, so we don't have to handle klass specially
+    // as we do in allSimilarConstantItems.
+    for (auto ancestor : ancestors(gs, klass)) {
+        for (auto [name, sym] : ancestor.data(gs)->members()) {
+            if (!sym.isFieldOrStaticField()) {
+                continue;
+            }
+
+            // TODO: this does prefix matching for instance/class variables, but our
+            // completion for locals matches anywhere in the name
+            if (hasPrefixedName(gs, name, prefix)) {
+                result.emplace_back(name);
+            }
+        }
+    }
+
+    fast_sort(result, [&gs](const auto &left, const auto &right) {
+        // Sort by actual name, not by NameRef id
+        if (left != right) {
+            return left.shortName(gs) < right.shortName(gs);
+        } else {
+            return left.rawId() < right.rawId();
+        }
+    });
+
+    auto it = unique(result.begin(), result.end());
+    result.erase(it, result.end());
+
+    return result;
+}
+
+vector<core::NameRef> allSimilarFieldsForClass(LSPTypecheckerDelegate &typechecker, const core::ClassOrModuleRef klass,
+                                               const core::Loc queryLoc, ast::UnresolvedIdent::Kind kind,
+                                               string_view prefix) {
+    const auto &gs = typechecker.state();
+    auto files = vector<core::FileRef>{};
+    for (auto loc : klass.data(gs)->locs()) {
+        files.emplace_back(loc.file());
+    }
+
+    // We have an interesting problem here: the symbol table already stores
+    // information about all the fields in a class, but we only populate the
+    // symbol table with this information when the fields are typed in some
+    // way.  But we would like to provide completion for all fields, typed
+    // or not.
+    //
+    // The compromise we take is this: for each file that is < StrictLevel::Strict,
+    // we walk the AST to discover the fields in that class and we add those
+    // results to the symbol table results.  We might discover duplicate information
+    // (people might have declared instance variables as typed in StrictLevel::True
+    // files, but that's OK, since we can't know apriori what fields we would get
+    // from which source.
+    auto result = allSimilarFields(gs, klass, prefix);
+
+    files.erase(remove_if(files.begin(), files.end(),
+                          [&gs](auto f) { return f.data(gs).strictLevel >= core::StrictLevel::Strict; }),
+                files.end());
+
+    if (!files.empty()) {
+        auto resolved = typechecker.getResolved(files);
+
+        // Instantiate fieldFinder outside loop so that result accumulates over every time we TreeWalk::apply
+        FieldFinder fieldFinder(klass, kind);
+        for (auto &t : resolved) {
+            auto ctx = core::Context(gs, core::Symbols::root(), t.file);
+            ast::TreeWalk::apply(ctx, fieldFinder, t.tree);
+        }
+        auto fields = fieldFinder.result();
+
+        // TODO: this does prefix matching for instance/class variables, but our
+        // completion for locals matches anywhere in the name
+        auto it = remove_if(fields.begin(), fields.end(),
+                            [&gs, &prefix](auto name) { return !hasPrefixedName(gs, name, prefix); });
+        result.insert(result.end(), fields.begin(), it);
+    }
+
+    fast_sort(result, [&gs](const auto &left, const auto &right) {
+        // Sort by actual name, not by NameRef id
+        if (left != right) {
+            return left.shortName(gs) < right.shortName(gs);
+        } else {
+            return left.rawId() < right.rawId();
+        }
+    });
+
+    // Dedup
+    auto it = unique(result.begin(), result.end());
+    result.erase(it, result.end());
+    return result;
+}
+
+vector<core::NameRef> localNamesForMethod(LSPTypecheckerDelegate &typechecker, const core::MethodRef method,
+                                          const core::Loc queryLoc) {
     const auto &gs = typechecker.state();
     auto files = vector<core::FileRef>{};
     for (auto loc : method.data(gs)->locs()) {
@@ -487,20 +630,20 @@ vector<core::LocalVariable> localsForMethod(LSPTypecheckerDelegate &typechecker,
     }
     auto resolved = typechecker.getResolved(files);
 
-    // Instantiate localVarFinder outside loop so that result accumualates over every time we TreeMap::apply
+    // Instantiate localVarFinder outside loop so that result accumualates over every time we TreeWalk::apply
     LocalVarFinder localVarFinder(method, queryLoc);
     for (auto &t : resolved) {
         auto ctx = core::Context(gs, core::Symbols::root(), t.file);
-        t.tree = ast::TreeMap::apply(ctx, localVarFinder, move(t.tree));
+        ast::TreeWalk::apply(ctx, localVarFinder, t.tree);
     }
 
     auto result = localVarFinder.result();
     fast_sort(result, [&gs](const auto &left, const auto &right) {
         // Sort by actual name, not by NameRef id
-        if (left._name != right._name) {
-            return left._name.shortName(gs) < right._name.shortName(gs);
+        if (left != right) {
+            return left.shortName(gs) < right.shortName(gs);
         } else {
-            return left < right;
+            return left.rawId() < right.rawId();
         }
     });
 
@@ -518,7 +661,7 @@ core::MethodRef firstMethodAfterQuery(LSPTypecheckerDelegate &typechecker, const
     NextMethodFinder nextMethodFinder(queryLoc);
     for (auto &t : resolved) {
         auto ctx = core::Context(gs, core::Symbols::root(), t.file);
-        t.tree = ast::TreeMap::apply(ctx, nextMethodFinder, move(t.tree));
+        ast::TreeWalk::apply(ctx, nextMethodFinder, t.tree);
     }
 
     return nextMethodFinder.result();
@@ -572,28 +715,6 @@ unique_ptr<CompletionItem> trySuggestSig(LSPTypecheckerDelegate &typechecker,
         return nullptr;
     }
 
-    core::ClassOrModuleRef receiverSym;
-    if (core::isa_type<core::ClassType>(receiverType)) {
-        auto classType = core::cast_type_nonnull<core::ClassType>(receiverType);
-        receiverSym = classType.symbol;
-    } else if (auto appliedType = core::cast_type<core::AppliedType>(receiverType)) {
-        receiverSym = appliedType->klass;
-    } else {
-        // receiverType is not a simple type. This can happen for any number of strange and uncommon reasons, like:
-        // x = T.let(self, T.nilable(T::Sig));  x.sig {void}
-        return nullptr;
-    }
-
-    if (receiverSym == core::Symbols::rootSingleton()) {
-        receiverSym = core::Symbols::Object().data(gs)->lookupSingletonClass(gs);
-    }
-    auto methodOwner = targetMethod.data(gs)->owner;
-
-    if (!(methodOwner == receiverSym || methodOwner == receiverSym.data(gs)->attachedClass(gs))) {
-        // The targetMethod we were going to suggest a sig for is not actually in the same scope as this sig.
-        return nullptr;
-    }
-
     auto queryFiles = vector<core::FileRef>{queryLoc.file()};
     auto queryResult = typechecker.query(core::lsp::Query::createSuggestSigQuery(targetMethod), queryFiles);
     if (queryResult.error) {
@@ -640,6 +761,86 @@ unique_ptr<CompletionItem> trySuggestSig(LSPTypecheckerDelegate &typechecker,
     }
 
     item->documentation = formatRubyMarkup(markupKind, suggestedSig, suggestSigDocs);
+
+    return item;
+}
+
+unique_ptr<CompletionItem> trySuggestYardSnippet(LSPTypecheckerDelegate &typechecker,
+                                                 const LSPClientConfiguration &clientConfig, core::Loc queryLoc) {
+    const auto &gs = typechecker.state();
+
+    auto method = firstMethodAfterQuery(typechecker, queryLoc);
+    if (!method.exists()) {
+        return nullptr;
+    }
+
+    auto item = make_unique<CompletionItem>("##");
+    item->kind = CompletionItemKind::Snippet;
+    item->detail = fmt::format("YARD doc snippet for {}", method.data(gs)->name.shortName(gs));
+    auto insertRange = Range::fromLoc(gs, queryLoc);
+
+    const auto supportSnippets = clientConfig.clientCompletionItemSnippetSupport;
+    if (supportSnippets) {
+        item->insertTextFormat = InsertTextFormat::Snippet;
+    } else {
+        item->insertTextFormat = InsertTextFormat::PlainText;
+    }
+
+    string yardSnippetText = "\n";
+
+    if (supportSnippets) {
+        yardSnippetText += "# ${1:Summary}";
+    } else {
+        yardSnippetText += "# Summary";
+    }
+    bool firstAfterSummary = true;
+
+    const auto &arguments = method.data(gs)->arguments;
+    auto resultType = method.data(gs)->resultType;
+
+    // 0 is final tabstop. 1 is initial tabstop (for summary)
+    auto tabStop = 1;
+    for (const auto &arg : arguments) {
+        auto argumentName = arg.argumentName(gs);
+        if (hasAngleBrackets(argumentName)) {
+            continue;
+        }
+
+        tabStop++;
+
+        if (firstAfterSummary) {
+            firstAfterSummary = false;
+            yardSnippetText += "\n#";
+        }
+
+        // TODO(jez) Might be nice to use @yieldparam / @yieldreturn for the block arg.
+        if (supportSnippets) {
+            yardSnippetText += fmt::format("\n# @param {} ${{{}:TODO}}", argumentName, tabStop);
+        } else {
+            yardSnippetText += fmt::format("\n# @param {} TODO", argumentName);
+        }
+    }
+
+    if (resultType != core::Types::void_()) {
+        if (firstAfterSummary) {
+            firstAfterSummary = false;
+            yardSnippetText += "\n#";
+        }
+
+        tabStop++;
+
+        if (supportSnippets) {
+            yardSnippetText += fmt::format("\n# @return ${{{}:TODO}}", tabStop);
+        } else {
+            yardSnippetText += fmt::format("\n# @return TODO");
+        }
+    }
+
+    if (insertRange != nullptr) {
+        item->textEdit = make_unique<TextEdit>(std::move(insertRange), string(yardSnippetText));
+    } else {
+        item->insertText = yardSnippetText;
+    }
 
     return item;
 }
@@ -729,10 +930,82 @@ vector<unique_ptr<CompletionItem>> allSimilarConstantItems(const core::GlobalSta
     return items;
 }
 
+vector<SimilarMethod> computeDedupedMethods(const core::GlobalState &gs, const core::DispatchResult &dispatchResult,
+                                            bool isPrivateOk, string_view prefix) {
+    ENFORCE(!dispatchResult.main.receiver.isUntyped());
+
+    vector<SimilarMethod> dedupedSimilarMethods;
+
+    Timer timeit(gs.tracer(), LSP_COMPLETION_METRICS_PREFIX ".determine_methods");
+    SimilarMethodsByName similarMethodsByName = allSimilarMethods(gs, dispatchResult, prefix);
+    for (auto &[methodName, similarMethods] : similarMethodsByName) {
+        fast_sort(similarMethods, [&](const auto &left, const auto &right) -> bool {
+            if (left.depth != right.depth) {
+                return left.depth < right.depth;
+            }
+
+            return left.method.id() < right.method.id();
+        });
+    }
+
+    for (auto &[methodName, similarMethods] : similarMethodsByName) {
+        if (methodName.kind() == core::NameKind::UNIQUE &&
+            (methodName.dataUnique(gs)->uniqueNameKind == core::UniqueNameKind::MangleRename ||
+             methodName.dataUnique(gs)->uniqueNameKind == core::UniqueNameKind::MangleRenameOverload)) {
+            // It's possible we want to ignore more things here. But note that we *don't* want to ignore all
+            // unique names, because we want each overload to show up but those use unique names.
+            continue;
+        }
+
+        // Since each list is sorted by depth, taking the first elem dedups by depth within each name.
+        auto similarMethod = similarMethods[0];
+
+        if (similarMethod.method.data(gs)->flags.isPrivate && !isPrivateOk) {
+            continue;
+        }
+
+        dedupedSimilarMethods.emplace_back(similarMethod);
+    }
+
+    fast_sort(dedupedSimilarMethods, [&](const auto &left, const auto &right) -> bool {
+        if (left.depth != right.depth) {
+            return left.depth < right.depth;
+        }
+
+        auto leftShortName = left.method.data(gs)->name.shortName(gs);
+        auto rightShortName = right.method.data(gs)->name.shortName(gs);
+        if (leftShortName != rightShortName) {
+            if (absl::StartsWith(leftShortName, prefix) && !absl::StartsWith(rightShortName, prefix)) {
+                return true;
+            }
+            if (!absl::StartsWith(leftShortName, prefix) && absl::StartsWith(rightShortName, prefix)) {
+                return false;
+            }
+
+            return leftShortName < rightShortName;
+        }
+
+        return left.method.id() < right.method.id();
+    });
+
+    return dedupedSimilarMethods;
+}
+
 } // namespace
 
 CompletionTask::CompletionTask(const LSPConfiguration &config, MessageId id, unique_ptr<CompletionParams> params)
     : LSPRequestTask(config, move(id), LSPMethod::TextDocumentCompletion), params(move(params)) {}
+
+unique_ptr<CompletionItem> CompletionTask::getCompletionItemForUntyped(const core::GlobalState &gs, core::Loc queryLoc,
+                                                                       size_t sortIdx, std::string_view message) {
+    string label(message);
+    auto item = make_unique<CompletionItem>(label);
+    item->sortText = formatSortIndex(sortIdx);
+    item->kind = CompletionItemKind::Method;
+    item->insertTextFormat = InsertTextFormat::PlainText;
+    item->textEdit = make_unique<TextEdit>(Range::fromLoc(gs, queryLoc.copyWithZeroLength()), "");
+    return item;
+}
 
 unique_ptr<CompletionItem>
 CompletionTask::getCompletionItemForMethod(LSPTypecheckerDelegate &typechecker, core::DispatchResult &dispatchResult,
@@ -832,92 +1105,109 @@ vector<unique_ptr<CompletionItem>> CompletionTask::getCompletionItems(LSPTypeche
 
     // ----- locals -----
 
-    vector<core::LocalVariable> similarLocals;
+    vector<core::NameRef> similarLocals;
     if (params.enclosingMethod.exists()) {
-        auto locals = localsForMethod(typechecker, params.enclosingMethod, params.queryLoc);
-        similarLocals = allSimilarLocals(gs, locals, params.prefix);
+        Timer timeit(gs.tracer(), LSP_COMPLETION_METRICS_PREFIX ".determine_locals");
+
+        // Slyly reuse `UnresolvedIdent::Kind` to both determine what kind of
+        // thing we're going to find and to determine the search space for
+        // `fieldsForClass`.
+        //
+        // TODO: for empty prefixes, we would like to complete instance/class
+        // variables along with locals.
+        //
+        // TODO: for a prefix of just "@", we should provide class variables
+        // along with instance variables.
+        auto kind = ast::UnresolvedIdent::Kind::Local;
+        if (params.prefix.size() >= 2 && absl::StartsWith(params.prefix, "@@")) {
+            kind = ast::UnresolvedIdent::Kind::Class;
+        } else if (params.prefix.size() >= 1 && absl::StartsWith(params.prefix, "@")) {
+            kind = ast::UnresolvedIdent::Kind::Instance;
+        }
+
+        if (kind == ast::UnresolvedIdent::Kind::Local) {
+            vector<core::NameRef> locals = localNamesForMethod(typechecker, params.enclosingMethod, params.queryLoc);
+            similarLocals = allSimilarLocalNames(gs, locals, params.prefix);
+        } else {
+            auto klass = params.enclosingMethod.data(gs)->owner;
+            ENFORCE(klass.exists());
+            similarLocals = allSimilarFieldsForClass(typechecker, klass, params.queryLoc, kind, params.prefix);
+        }
     }
 
     // ----- keywords -----
 
     auto similarKeywords = params.suggestKeywords ? allSimilarKeywords(params.prefix) : vector<RubyKeyword>{};
+    auto similarLikeKeywords =
+        params.suggestKeywords ? allSimilarLikeKeywords(params.prefix) : vector<KeywordLikeSnippet>{};
 
     // ----- methods -----
 
-    SimilarMethodsByName similarMethodsByName;
+    vector<SimilarMethod> dedupedSimilarMethods;
+    bool receiverIsUntyped = false;
+
     if (params.forMethods != nullopt) {
-        similarMethodsByName = allSimilarMethods(gs, *params.forMethods->dispatchResult, params.prefix);
-        for (auto &[methodName, similarMethods] : similarMethodsByName) {
-            fast_sort(similarMethods, [&](const auto &left, const auto &right) -> bool {
-                if (left.depth != right.depth) {
-                    return left.depth < right.depth;
-                }
-
-                return left.method.id() < right.method.id();
-            });
+        auto &forMethods = params.forMethods.value();
+        if (forMethods.dispatchResult->main.receiver.isUntyped()) {
+            receiverIsUntyped = true;
+        } else {
+            dedupedSimilarMethods =
+                computeDedupedMethods(gs, *forMethods.dispatchResult, forMethods.isPrivateOk, params.prefix);
         }
     }
-
-    auto dedupedSimilarMethods = vector<SimilarMethod>{};
-    for (auto &[methodName, similarMethods] : similarMethodsByName) {
-        if (methodName.kind() == core::NameKind::UNIQUE &&
-            methodName.dataUnique(gs)->uniqueNameKind == core::UniqueNameKind::MangleRename) {
-            // It's possible we want to ignore more things here. But note that we *don't* want to ignore all
-            // unique names, because we want each overload to show up but those use unique names.
-            continue;
-        }
-
-        // Since each list is sorted by depth, taking the first elem dedups by depth within each name.
-        auto similarMethod = similarMethods[0];
-
-        if (similarMethod.method.data(gs)->flags.isPrivate && !params.forMethods->isPrivateOk) {
-            continue;
-        }
-
-        dedupedSimilarMethods.emplace_back(similarMethod);
-    }
-
-    fast_sort(dedupedSimilarMethods, [&](const auto &left, const auto &right) -> bool {
-        if (left.depth != right.depth) {
-            return left.depth < right.depth;
-        }
-
-        auto leftShortName = left.method.data(gs)->name.shortName(gs);
-        auto rightShortName = right.method.data(gs)->name.shortName(gs);
-        if (leftShortName != rightShortName) {
-            if (absl::StartsWith(leftShortName, params.prefix) && !absl::StartsWith(rightShortName, params.prefix)) {
-                return true;
-            }
-            if (!absl::StartsWith(leftShortName, params.prefix) && absl::StartsWith(rightShortName, params.prefix)) {
-                return false;
-            }
-
-            return leftShortName < rightShortName;
-        }
-
-        return left.method.id() < right.method.id();
-    });
 
     // ----- final sort -----
 
     // TODO(jez) Do something smarter here than "all keywords then all locals then all methods then all constants"
 
     vector<unique_ptr<CompletionItem>> items;
-    for (auto &similarKeyword : similarKeywords) {
-        items.push_back(getCompletionItemForKeyword(gs, this->config, similarKeyword, params.queryLoc, params.prefix,
-                                                    items.size()));
+    {
+        Timer timeit(gs.tracer(), LSP_COMPLETION_METRICS_PREFIX ".keyword_items");
+        for (auto &similarKeyword : similarKeywords) {
+            items.push_back(getCompletionItemForKeyword(gs, this->config, similarKeyword, params.queryLoc,
+                                                        params.prefix, items.size()));
+        }
     }
-    for (auto &similarLocal : similarLocals) {
-        items.push_back(
-            getCompletionItemForLocal(gs, this->config, similarLocal, params.queryLoc, params.prefix, items.size()));
+    {
+        Timer timeit(gs.tracer(), LSP_COMPLETION_METRICS_PREFIX ".local_items");
+        for (auto &similarLocal : similarLocals) {
+            items.push_back(getCompletionItemForLocalName(gs, this->config, similarLocal, params.queryLoc,
+                                                          params.prefix, items.size()));
+        }
     }
-    for (auto &similarMethod : dedupedSimilarMethods) {
-        items.push_back(getCompletionItemForMethod(
-            typechecker, *params.forMethods->dispatchResult, similarMethod.method, similarMethod.receiverType,
-            similarMethod.constr.get(), params.queryLoc, params.prefix, items.size(), params.forMethods->totalArgs));
+    // since these are not actually keywords, clashing local names are valid, and we prefer those
+    // hence, this is placed after local names
+    {
+        Timer timeit(gs.tracer(), LSP_COMPLETION_METRICS_PREFIX ".like_keyword_items");
+        for (auto &similarLikeKeywords : similarLikeKeywords) {
+            items.push_back(getCompletionItemForKeyword(gs, this->config, similarLikeKeywords, params.queryLoc,
+                                                        params.prefix, items.size()));
+        }
+    }
+    {
+        Timer timeit(gs.tracer(), LSP_COMPLETION_METRICS_PREFIX ".method_items");
+        if (receiverIsUntyped) {
+            items.push_back(getCompletionItemForUntyped(gs, params.queryLoc, items.size(), "(call site is T.untyped)"));
+        } else {
+            for (auto &similarMethod : dedupedSimilarMethods) {
+                // Even though we might have one or more TypeConstraints on the DispatchResult that triggered this
+                // completion request, those constraints are the result of solving the current method. These new methods
+                // we're about to suggest are their own methods with their own type variables, so it doesn't make sense
+                // to use the old constraint for the new methods.
+                //
+                // What this means in practice is that the prettified `sig` in the completion documentation will show
+                // `T.type_parameter(:U)` instead of a solved type.
+                auto constr = nullptr;
+
+                items.push_back(getCompletionItemForMethod(
+                    typechecker, *params.forMethods->dispatchResult, similarMethod.method, similarMethod.receiverType,
+                    constr, params.queryLoc, params.prefix, items.size(), params.forMethods->totalArgs));
+            }
+        }
     }
 
     if (!params.scopes.empty()) {
+        Timer timeit(gs.tracer(), LSP_COMPLETION_METRICS_PREFIX ".constant_items");
         auto similarConsts =
             allSimilarConstantItems(gs, this->config, params.prefix, params.scopes, params.queryLoc, items.size());
         move(similarConsts.begin(), similarConsts.end(), back_inserter(items));
@@ -938,12 +1228,14 @@ unique_ptr<ResponseMessage> CompletionTask::runRequest(LSPTypecheckerDelegate &t
         return response;
     }
     auto pos = *params->position;
-    auto queryLoc = config.lspPos2Loc(fref, pos, gs);
-    if (!queryLoc.exists()) {
+    auto maybeQueryLoc = pos.toLoc(gs, fref);
+    if (!maybeQueryLoc.has_value()) {
         response->result = std::move(emptyResult);
         return response;
     }
-    auto result = queryByLoc(typechecker, uri, pos, LSPMethod::TextDocumentCompletion);
+    auto queryLoc = maybeQueryLoc.value();
+
+    auto result = LSPQuery::byLoc(config, typechecker, uri, pos, LSPMethod::TextDocumentCompletion);
 
     if (result.error) {
         // An error happened while setting up the query.
@@ -954,6 +1246,24 @@ unique_ptr<ResponseMessage> CompletionTask::runRequest(LSPTypecheckerDelegate &t
     auto &queryResponses = result.responses;
     vector<unique_ptr<CompletionItem>> items;
     if (queryResponses.empty()) {
+        auto prevTwoChars = queryLoc.adjust(gs, -2, 0);
+        if (prevTwoChars.source(gs) == "##") {
+            auto item = trySuggestYardSnippet(typechecker, config.getClientConfig(), queryLoc);
+            if (item != nullptr) {
+                items.emplace_back(std::move(item));
+                response->result = make_unique<CompletionList>(false, move(items));
+                return response;
+            }
+        }
+
+        ENFORCE(fref.exists());
+        auto level = fref.data(gs).strictLevel;
+        if (!fref.data(gs).hasParseErrors() && level < core::StrictLevel::True) {
+            items.emplace_back(getCompletionItemForUntyped(gs, queryLoc, 0, "(file is not `# typed: true` or higher)"));
+            response->result = make_unique<CompletionList>(false, move(items));
+            return response;
+        }
+
         response->result = std::move(emptyResult);
         return response;
     }
@@ -991,19 +1301,27 @@ unique_ptr<ResponseMessage> CompletionTask::runRequest(LSPTypecheckerDelegate &t
             };
             items = this->getCompletionItems(typechecker, params);
         } else {
-            // isPrivateOk means that there is no syntactic receiver. This check prevents completing `x.de` to `x.def`
-            // (If there is a method whose name overlaps with a keyword, it will still show up as a _method_ item.)
-            auto suggestKeywords = sendResp->isPrivateOk;
+            // isPrivateOk indicates that we are calling (and therefore completing) a method on `self`.  In such a
+            // case, it matters whether or not there is a syntactic receiver involved in the call.  In the latter
+            // case, we want to include locals and keywords, since we may be completing a (zero-argument) "send"
+            // and the user's intent might have been to complete a local or a keyword.  In the former case, we
+            // know that the user doesn't want such completion results, since they have already written something
+            // prefixed with `self.`.
+            auto explicitSelfReceiver = sendResp->receiverLoc.source(gs) == "self";
+            auto wantLocalsAndKeywords = sendResp->isPrivateOk && !explicitSelfReceiver;
+            auto suggestKeywords = wantLocalsAndKeywords;
+            // `enclosingMethod` existing indicates whether we want local variable completion results.
+            auto enclosingMethod = wantLocalsAndKeywords ? sendResp->enclosingMethod : core::MethodRef{};
             auto params = SearchParams{
-                queryLoc, prefix,
+                queryLoc,
+                prefix,
                 MethodSearchParams{
                     sendResp->dispatchResult,
                     sendResp->totalArgs,
                     sendResp->isPrivateOk,
                 },
                 suggestKeywords,
-                // No receiver means that local variables are allowed here.
-                sendResp->isPrivateOk ? sendResp->enclosingMethod : core::MethodRef{},
+                enclosingMethod,
                 core::lsp::ConstantResponse::Scopes{}, // constants don't make sense here
             };
             items = this->getCompletionItems(typechecker, params);
@@ -1039,15 +1357,23 @@ unique_ptr<ResponseMessage> CompletionTask::runRequest(LSPTypecheckerDelegate &t
         }
         items = this->getCompletionItems(typechecker, params);
     } else if (auto identResp = resp->isIdent()) {
-        auto varName = identResp->variable._name.shortName(gs);
-        auto nameLen = static_cast<int32_t>(varName.size());
+        auto varName = identResp->variable._name;
+        auto prefix = varName.shortName(gs);
+        switch (varName.rawId()) {
+            case core::Names::ivarNameMissing().rawId():
+                prefix = "@";
+                break;
+            case core::Names::cvarNameMissing().rawId():
+                prefix = "@@";
+                break;
+        }
+        auto nameLen = static_cast<int32_t>(prefix.size());
 
         auto termLocPrefix = identResp->termLoc.adjustLen(gs, 0, nameLen);
 
-        if (queryLoc.adjustLen(gs, -1 * nameLen, nameLen).source(gs) == varName) {
+        if (queryLoc.adjustLen(gs, -1 * nameLen, nameLen).source(gs) == prefix) {
             // Cursor at end of variable name
             auto suggestKeywords = true;
-            auto prefix = varName;
             auto params = SearchParams{
                 queryLoc,
                 prefix,
@@ -1057,7 +1383,7 @@ unique_ptr<ResponseMessage> CompletionTask::runRequest(LSPTypecheckerDelegate &t
                 core::lsp::ConstantResponse::Scopes{identResp->enclosingMethod.data(gs)->owner},
             };
             items = this->getCompletionItems(typechecker, params);
-        } else if (termLocPrefix.source(gs) == varName && !termLocPrefix.contains(queryLoc)) {
+        } else if (termLocPrefix.source(gs) == prefix && !termLocPrefix.contains(queryLoc)) {
             // This is *probably* (but not definitely necessarily) an IdentResponse for an
             // assignment, with the cursor somewhere on the RHS of the `=` but before having typed
             // anything. This case is super common for code like this (cursor is `|`):

@@ -25,12 +25,13 @@ unique_ptr<cfg::CFG> Inference::run(core::Context ctx, unique_ptr<cfg::CFG> cfg)
     if (cfg->symbol.data(ctx)->flags.isGenericMethod) {
         _constr = make_unique<core::TypeConstraint>();
         constr = _constr.get();
-        for (core::SymbolRef typeArgument : cfg->symbol.data(ctx)->typeArguments) {
-            constr->rememberIsSubtype(ctx, typeArgument.asTypeArgumentRef().data(ctx)->resultType,
+        for (auto typeArgument : cfg->symbol.data(ctx)->typeArguments()) {
+            constr->rememberIsSubtype(ctx, typeArgument.data(ctx)->resultType,
                                       core::make_type<core::SelfTypeParam>(typeArgument));
         }
         if (!constr->solve(ctx)) {
-            Exception::raise("should never happen");
+            Exception::raise("Constraint should always solve after creating empty TypeConstraint with all upper bounds "
+                             "set to to SelfTypeParam of itself");
         }
         guessTypes = false;
     }
@@ -82,10 +83,37 @@ unique_ptr<cfg::CFG> Inference::run(core::Context ctx, unique_ptr<cfg::CFG> cfg)
     for (auto it = cfg->forwardsTopoSort.rbegin(); it != cfg->forwardsTopoSort.rend(); ++it) {
         cfg::BasicBlock *bb = *it;
         if (bb == cfg->deadBlock()) {
+            for (const auto &bind : bb->exprs) {
+                if (bind.value.isSynthetic() || bind.loc.empty()) {
+                    continue;
+                }
+
+                if (auto e = ctx.beginError(bind.loc, core::errors::Infer::DeadBranchInferencer)) {
+                    e.setHeader("This expression appears after an unconditional return");
+                }
+
+                // Only report the expression expression in the dead block
+                break;
+            }
             continue;
         }
         Environment &current = outEnvironments[bb->id];
         current.initializeBasicBlockArgs(*bb);
+
+        // We very much want to limit access to "global" data structures downstream.
+        // In particular, processBinding should only need to know about the current binding (nothing
+        // about the surrounding BasicBlock, and definitely nothing about BasicBlocks that don't
+        // contain the current binding being processed).
+        //
+        // That means that only here in inference do we know about the structure of the CFG.
+        // But we want to pluck some limited information about the parent block and pass it into
+        // processBinding, only so that some errors that would already be reported can be improved.
+        // parentUpdateKnowledgeReceiver is such a thing.
+        //
+        // In general we should carefully limit the set of information that processBinding requires,
+        // to make it easy to reason about correctness.
+        optional<cfg::BasicBlock::BlockExitCondInfo> parentUpdateKnowledgeReceiver;
+
         if (bb->backEdges.size() == 1) {
             auto *parent = bb->backEdges[0];
             bool isTrueBranch = parent->bexit.thenb == bb;
@@ -94,6 +122,8 @@ unique_ptr<cfg::CFG> Inference::run(core::Context ctx, unique_ptr<cfg::CFG> cfg)
                 auto &envAsSeenFromBranch =
                     Environment::withCond(ctx, outEnvironments[parent->id], tempEnv, isTrueBranch, current.vars());
                 current.populateFrom(ctx, envAsSeenFromBranch);
+
+                parentUpdateKnowledgeReceiver = parent->maybeGetUpdateKnowledgeReceiver(*cfg);
             } else {
                 current.isDead = true;
             }
@@ -140,12 +170,12 @@ unique_ptr<cfg::CFG> Inference::run(core::Context ctx, unique_ptr<cfg::CFG> cfg)
                 //      (non-synthetic, non-"T.absurd") instruction in the block as the loc of the
                 //      error.
                 cfg::InstructionPtr *unreachableInstruction = nullptr;
-                core::LocOffsets locForUnreachable;
+                core::Loc locForUnreachable;
                 bool dueToSafeNavigation = false;
 
                 if (absl::c_any_of(bb->backEdges, [&](const auto &bb) { return !outEnvironments[bb->id].isDead; })) {
                     for (auto &expr : bb->exprs) {
-                        if (expr.value->isSynthetic) {
+                        if (expr.value.isSynthetic()) {
                             continue;
                         }
                         if (cfg::isa_instruction<cfg::TAbsurd>(expr.value)) {
@@ -154,16 +184,25 @@ unique_ptr<cfg::CFG> Inference::run(core::Context ctx, unique_ptr<cfg::CFG> cfg)
 
                         auto send = cfg::cast_instruction<cfg::Send>(expr.value);
                         if (send != nullptr && send->fun == core::Names::nilForSafeNavigation()) {
+                            ENFORCE(send->args.size() == 1, "Broken invariant from desugar");
                             unreachableInstruction = &expr.value;
-                            locForUnreachable = expr.loc;
+                            locForUnreachable = core::Loc(ctx.file, send->argLocs[0]);
+
+                            // The arg loc for the synthetic variable created for the purpose of this safe navigation
+                            // check is a bit of a hack. It's intentionally one character too short so that for
+                            // completion requests it doesn't match `x&.|` (which would defeat completion requests.)
+                            auto maybeExpand = locForUnreachable.adjust(ctx, 0, 1);
+                            if (maybeExpand.source(ctx) == "&.") {
+                                locForUnreachable = maybeExpand;
+                            }
                             dueToSafeNavigation = true;
                             break;
                         } else if (unreachableInstruction == nullptr) {
                             unreachableInstruction = &expr.value;
-                            locForUnreachable = expr.loc;
+                            locForUnreachable = ctx.locAt(expr.loc);
                         } else {
                             // Expand the loc to cover the entire dead basic block
-                            locForUnreachable = locForUnreachable.join(expr.loc);
+                            locForUnreachable = locForUnreachable.join(ctx.locAt(expr.loc));
                         }
                     }
                 }
@@ -171,16 +210,36 @@ unique_ptr<cfg::CFG> Inference::run(core::Context ctx, unique_ptr<cfg::CFG> cfg)
                 if (unreachableInstruction != nullptr) {
                     auto *send = cfg::cast_instruction<cfg::Send>(*unreachableInstruction);
                     if (dueToSafeNavigation && send != nullptr) {
-                        if (auto e =
-                                ctx.beginError(locForUnreachable, core::errors::Infer::UnnecessarySafeNavigation)) {
-                            ENFORCE(send->args.size() == 1, "Broken invariant from desugar");
+                        if (auto e = ctx.state.beginError(locForUnreachable,
+                                                          core::errors::Infer::UnnecessarySafeNavigation)) {
                             auto ty = current.getAndFillTypeAndOrigin(ctx, send->args[0]);
 
                             e.setHeader("Used `{}` operator on `{}`, which can never be nil", "&.", ty.type.show(ctx));
                             e.addErrorSection(ty.explainGot(ctx, current.locForUninitialized()));
+                            if (locForUnreachable.source(ctx) == "&.") {
+                                e.replaceWith("Replace with `.`", locForUnreachable, ".");
+                            }
                         }
-                    } else if (auto e = ctx.beginError(locForUnreachable, core::errors::Infer::DeadBranchInferencer)) {
-                        e.setHeader("This code is unreachable");
+                    } else if (auto e =
+                                   ctx.state.beginError(locForUnreachable, core::errors::Infer::DeadBranchInferencer)) {
+                        auto *ident = cfg::cast_instruction<cfg::Ident>(*unreachableInstruction);
+
+                        bool andAndOrOr = false;
+                        if (ident != nullptr) {
+                            auto name = ident->what.data(*cfg)._name;
+                            if (name.kind() == core::NameKind::UNIQUE &&
+                                name.dataUnique(ctx)->original == core::Names::andAnd()) {
+                                e.setHeader("Left side of `{}` condition was always `{}`", "&&", "truthy");
+                                andAndOrOr = true;
+                            } else if (name.kind() == core::NameKind::UNIQUE &&
+                                       name.dataUnique(ctx)->original == core::Names::orOr()) {
+                                e.setHeader("Left side of `{}` condition was always `{}`", "||", "falsy");
+                                andAndOrOr = true;
+                            }
+                        }
+                        if (!andAndOrOr) {
+                            e.setHeader("This code is unreachable");
+                        }
 
                         for (const auto &prevBasicBlock : bb->backEdges) {
                             const auto &prevEnv = outEnvironments[prevBasicBlock->id];
@@ -201,7 +260,7 @@ unique_ptr<cfg::CFG> Inference::run(core::Context ctx, unique_ptr<cfg::CFG> cfg)
                             }
 
                             auto alwaysWhat = prevBasicBlock->bexit.thenb->id == bb->id ? "falsy" : "truthy";
-                            auto bexitLoc = core::Loc(ctx.file, prevBasicBlock->bexit.loc);
+                            auto bexitLoc = ctx.locAt(prevBasicBlock->bexit.loc);
                             e.addErrorLine(bexitLoc, "This condition was always `{}` (`{}`)", alwaysWhat,
                                            cond.type.show(ctx));
 
@@ -212,6 +271,12 @@ unique_ptr<cfg::CFG> Inference::run(core::Context ctx, unique_ptr<cfg::CFG> cfg)
 
                             auto ty = prevEnv.getTypeAndOrigin(ctx, cond.variable);
                             e.addErrorSection(ty.explainGot(ctx, prevEnv.locForUninitialized()));
+                        }
+
+                        if (andAndOrOr) {
+                            e.addErrorNote("If this is intentional, either delete the redundant code or restructure\n"
+                                           "    it to use `{}` so that Sorbet can check for exhaustiveness.",
+                                           "T.absurd");
                         }
                     }
                 }
@@ -224,10 +289,9 @@ unique_ptr<cfg::CFG> Inference::run(core::Context ctx, unique_ptr<cfg::CFG> cfg)
         for (cfg::Binding &bind : bb->exprs) {
             i++;
             if (!current.isDead || !ctx.state.lspQuery.isEmpty()) {
-                current.ensureGoodAssignTarget(ctx, bind.bind.variable);
                 bind.bind.type =
                     current.processBinding(ctx, *cfg, bind, bb->outerLoops, bind.bind.variable.minLoops(*cfg),
-                                           knowledgeFilter, *constr, methodReturnType);
+                                           knowledgeFilter, *constr, methodReturnType, parentUpdateKnowledgeReceiver);
                 if (cfg::isa_instruction<cfg::Send>(bind.value)) {
                     totalSendCount++;
                     if (bind.bind.type && !bind.bind.type.isUntyped()) {
@@ -245,13 +309,13 @@ unique_ptr<cfg::CFG> Inference::run(core::Context ctx, unique_ptr<cfg::CFG> cfg)
                 bind.bind.type.sanityCheck(ctx);
                 if (bind.bind.type.isBottom()) {
                     current.isDead = true;
-                    madeBlockDead = core::Loc(ctx.file, bind.loc);
+                    madeBlockDead = ctx.locAt(bind.loc);
                 }
                 if (current.isDead && bb->firstDeadInstructionIdx == -1) {
                     // this can also be result of evaluating an instruction, e.g. an always false hard_assert
                     bb->firstDeadInstructionIdx = i;
                 }
-            } else if (ctx.state.lspQuery.isEmpty() && current.isDead && !bind.value->isSynthetic) {
+            } else if (ctx.state.lspQuery.isEmpty() && current.isDead && !bind.value.isSynthetic()) {
                 if (auto e = ctx.beginError(bind.loc, core::errors::Infer::DeadBranchInferencer)) {
                     e.setHeader("This code is unreachable");
                     e.addErrorLine(madeBlockDead, "This expression always raises or can never be computed");
@@ -262,7 +326,6 @@ unique_ptr<cfg::CFG> Inference::run(core::Context ctx, unique_ptr<cfg::CFG> cfg)
         if (!current.isDead) {
             ENFORCE(bb->firstDeadInstructionIdx == -1);
             current.getAndFillTypeAndOrigin(ctx, bb->bexit.cond);
-            current.ensureGoodCondition(ctx, bb->bexit.cond.variable);
         } else {
             ENFORCE(bb->firstDeadInstructionIdx != -1);
         }
@@ -277,10 +340,14 @@ unique_ptr<cfg::CFG> Inference::run(core::Context ctx, unique_ptr<cfg::CFG> cfg)
 
     if (missingReturnType && guessTypes) {
         if (auto e = ctx.state.beginError(cfg->symbol.data(ctx)->loc(), core::errors::Infer::UntypedMethod)) {
-            e.setHeader("This function does not have a `{}`", "sig");
+            e.setHeader("The method `{}` does not have a `{}`", cfg->symbol.data(ctx)->name.show(ctx), "sig");
             auto maybeAutocorrect = SigSuggestion::maybeSuggestSig(ctx, cfg, methodReturnType, *constr);
             if (maybeAutocorrect.has_value()) {
                 e.addAutocorrect(move(maybeAutocorrect.value()));
+            } else if (cfg->symbol.data(ctx)->owner.data(ctx)->derivesFrom(ctx, core::Symbols::Struct())) {
+                e.addErrorNote("Struct classes defined with `{}` are hard to use in `{}` files.\n"
+                               "    Consider using `{}` instead.",
+                               "Struct", "# typed: strict", "T::Struct");
             }
         } else if (ctx.state.lspQuery.matchesSuggestSig(cfg->symbol)) {
             // Force maybeSuggestSig to run just to respond to the query (discard the result)

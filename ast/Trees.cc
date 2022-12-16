@@ -18,37 +18,38 @@ namespace sorbet::ast {
         break;                       \
     }
 
-#define GENERATE_TAG_SWITCH(tag, CASE_BODY)              \
-    switch (tag) {                                       \
-        CASE_STATEMENT(CASE_BODY, EmptyTree)             \
-        CASE_STATEMENT(CASE_BODY, Send)                  \
-        CASE_STATEMENT(CASE_BODY, ClassDef)              \
-        CASE_STATEMENT(CASE_BODY, MethodDef)             \
-        CASE_STATEMENT(CASE_BODY, If)                    \
-        CASE_STATEMENT(CASE_BODY, While)                 \
-        CASE_STATEMENT(CASE_BODY, Break)                 \
-        CASE_STATEMENT(CASE_BODY, Retry)                 \
-        CASE_STATEMENT(CASE_BODY, Next)                  \
-        CASE_STATEMENT(CASE_BODY, Return)                \
-        CASE_STATEMENT(CASE_BODY, RescueCase)            \
-        CASE_STATEMENT(CASE_BODY, Rescue)                \
-        CASE_STATEMENT(CASE_BODY, Local)                 \
-        CASE_STATEMENT(CASE_BODY, UnresolvedIdent)       \
-        CASE_STATEMENT(CASE_BODY, RestArg)               \
-        CASE_STATEMENT(CASE_BODY, KeywordArg)            \
-        CASE_STATEMENT(CASE_BODY, OptionalArg)           \
-        CASE_STATEMENT(CASE_BODY, BlockArg)              \
-        CASE_STATEMENT(CASE_BODY, ShadowArg)             \
-        CASE_STATEMENT(CASE_BODY, Assign)                \
-        CASE_STATEMENT(CASE_BODY, Cast)                  \
-        CASE_STATEMENT(CASE_BODY, Hash)                  \
-        CASE_STATEMENT(CASE_BODY, Array)                 \
-        CASE_STATEMENT(CASE_BODY, Literal)               \
-        CASE_STATEMENT(CASE_BODY, UnresolvedConstantLit) \
-        CASE_STATEMENT(CASE_BODY, ConstantLit)           \
-        CASE_STATEMENT(CASE_BODY, ZSuperArgs)            \
-        CASE_STATEMENT(CASE_BODY, Block)                 \
-        CASE_STATEMENT(CASE_BODY, InsSeq)                \
+#define GENERATE_TAG_SWITCH(tag, CASE_BODY)                \
+    switch (tag) {                                         \
+        CASE_STATEMENT(CASE_BODY, EmptyTree)               \
+        CASE_STATEMENT(CASE_BODY, Send)                    \
+        CASE_STATEMENT(CASE_BODY, ClassDef)                \
+        CASE_STATEMENT(CASE_BODY, MethodDef)               \
+        CASE_STATEMENT(CASE_BODY, If)                      \
+        CASE_STATEMENT(CASE_BODY, While)                   \
+        CASE_STATEMENT(CASE_BODY, Break)                   \
+        CASE_STATEMENT(CASE_BODY, Retry)                   \
+        CASE_STATEMENT(CASE_BODY, Next)                    \
+        CASE_STATEMENT(CASE_BODY, Return)                  \
+        CASE_STATEMENT(CASE_BODY, RescueCase)              \
+        CASE_STATEMENT(CASE_BODY, Rescue)                  \
+        CASE_STATEMENT(CASE_BODY, Local)                   \
+        CASE_STATEMENT(CASE_BODY, UnresolvedIdent)         \
+        CASE_STATEMENT(CASE_BODY, RestArg)                 \
+        CASE_STATEMENT(CASE_BODY, KeywordArg)              \
+        CASE_STATEMENT(CASE_BODY, OptionalArg)             \
+        CASE_STATEMENT(CASE_BODY, BlockArg)                \
+        CASE_STATEMENT(CASE_BODY, ShadowArg)               \
+        CASE_STATEMENT(CASE_BODY, Assign)                  \
+        CASE_STATEMENT(CASE_BODY, Cast)                    \
+        CASE_STATEMENT(CASE_BODY, Hash)                    \
+        CASE_STATEMENT(CASE_BODY, Array)                   \
+        CASE_STATEMENT(CASE_BODY, Literal)                 \
+        CASE_STATEMENT(CASE_BODY, UnresolvedConstantLit)   \
+        CASE_STATEMENT(CASE_BODY, ConstantLit)             \
+        CASE_STATEMENT(CASE_BODY, ZSuperArgs)              \
+        CASE_STATEMENT(CASE_BODY, Block)                   \
+        CASE_STATEMENT(CASE_BODY, InsSeq)                  \
+        CASE_STATEMENT(CASE_BODY, RuntimeMethodDefinition) \
     }
 
 void ExpressionPtr::deleteTagged(Tag tag, void *ptr) noexcept {
@@ -74,7 +75,7 @@ string ExpressionPtr::nodeName() const {
 #undef NODE_NAME
 }
 
-string ExpressionPtr::showRaw(const core::GlobalState &gs, int tabs) {
+string ExpressionPtr::showRaw(const core::GlobalState &gs, int tabs) const {
     auto *ptr = get();
 
     ENFORCE(ptr != nullptr);
@@ -109,6 +110,11 @@ bool ExpressionPtr::isSelfReference() const {
         return local->localVariable == core::LocalVariable::selfVariable();
     }
     return false;
+}
+
+void ExpressionPtr::resetToEmpty(EmptyTree *expr) noexcept {
+    ENFORCE(expr != nullptr);
+    resetTagged(tagPtr(ExpressionToTag<EmptyTree>::value, expr));
 }
 
 bool isa_reference(const ExpressionPtr &what) {
@@ -154,6 +160,7 @@ ClassDef::ClassDef(core::LocOffsets loc, core::LocOffsets declLoc, core::ClassOr
     categoryCounterInc("trees", "classdef");
     histogramInc("trees.classdef.kind", (int)kind);
     histogramInc("trees.classdef.ancestors", this->ancestors.size());
+    histogramInc("trees.classdef.rhs", this->rhs.size());
     _sanityCheck();
 }
 
@@ -243,8 +250,8 @@ Send::Send(core::LocOffsets loc, ExpressionPtr recv, core::NameRef fun, core::Lo
     _sanityCheck();
 }
 
-Cast::Cast(core::LocOffsets loc, core::TypePtr ty, ExpressionPtr arg, core::NameRef cast)
-    : loc(loc), cast(cast), type(std::move(ty)), arg(std::move(arg)) {
+Cast::Cast(core::LocOffsets loc, core::TypePtr ty, ExpressionPtr arg, core::NameRef cast, ExpressionPtr typeExpr)
+    : loc(loc), cast(cast), type(std::move(ty)), arg(std::move(arg)), typeExpr(std::move(typeExpr)) {
     categoryCounterInc("trees", "cast");
     _sanityCheck();
 }
@@ -304,12 +311,6 @@ ConstantLit::fullUnresolvedPath(const core::GlobalState &gs) const {
     }
     ENFORCE(this->resolutionScopes != nullptr && !this->resolutionScopes->empty());
 
-    // TODO: investigate why this is necessary, it being after the ENFORCE suggests that it only happens in a release
-    // build
-    if (this->resolutionScopes == nullptr) {
-        return nullopt;
-    }
-
     vector<core::NameRef> namesFailedToResolve;
     auto *nested = this;
     {
@@ -334,6 +335,7 @@ ConstantLit::fullUnresolvedPath(const core::GlobalState &gs) const {
 Block::Block(core::LocOffsets loc, MethodDef::ARGS_store args, ExpressionPtr body)
     : loc(loc), args(std::move(args)), body(std::move(body)) {
     categoryCounterInc("trees", "block");
+    histogramInc("trees.block.args", this->args.size());
     _sanityCheck();
 };
 
@@ -357,6 +359,12 @@ InsSeq::InsSeq(core::LocOffsets loc, STATS_store stats, ExpressionPtr expr)
     _sanityCheck();
 }
 
+RuntimeMethodDefinition::RuntimeMethodDefinition(core::LocOffsets loc, core::NameRef name, bool isSelfMethod)
+    : loc(loc), name(name), isSelfMethod(isSelfMethod) {
+    categoryCounterInc("trees", "runtimemethoddefinition");
+    _sanityCheck();
+}
+
 EmptyTree::EmptyTree() : loc(core::LocOffsets::none()) {
     categoryCounterInc("trees", "emptytree");
     _sanityCheck();
@@ -370,7 +378,7 @@ EmptyTree singletonEmptyTree{};
 
 template <> ExpressionPtr make_expression<EmptyTree>() {
     ExpressionPtr result = nullptr;
-    result.reset(&singletonEmptyTree);
+    result.resetToEmpty(&singletonEmptyTree);
     return result;
 }
 
@@ -438,14 +446,15 @@ string ClassDef::toStringWithTabs(const core::GlobalState &gs, int tabs) const {
     return fmt::to_string(buf);
 }
 
-string ClassDef::showRaw(const core::GlobalState &gs, int tabs) {
+string ClassDef::showRaw(const core::GlobalState &gs, int tabs) const {
     fmt::memory_buffer buf;
     fmt::format_to(std::back_inserter(buf), "{}{{\n", nodeName());
     printTabs(buf, tabs + 1);
     fmt::format_to(std::back_inserter(buf), "kind = {}\n", kind == ClassDef::Kind::Module ? "module" : "class");
     printTabs(buf, tabs + 1);
-    fmt::format_to(std::back_inserter(buf), "name = {}<{}>\n", name.showRaw(gs, tabs + 1),
-                   this->symbol.dataAllowingNone(gs)->name.showRaw(gs));
+    fmt::format_to(std::back_inserter(buf), "name = {}\n", name.showRaw(gs, tabs + 1));
+    printTabs(buf, tabs + 1);
+    fmt::format_to(std::back_inserter(buf), "symbol = {}\n", this->symbol.dataAllowingNone(gs)->name.showRaw(gs));
     printTabs(buf, tabs + 1);
     fmt::format_to(std::back_inserter(buf), "ancestors = [");
     bool first = true;
@@ -490,7 +499,7 @@ string InsSeq::toStringWithTabs(const core::GlobalState &gs, int tabs) const {
     return fmt::to_string(buf);
 }
 
-string InsSeq::showRaw(const core::GlobalState &gs, int tabs) {
+string InsSeq::showRaw(const core::GlobalState &gs, int tabs) const {
     fmt::memory_buffer buf;
     fmt::format_to(std::back_inserter(buf), "{}{{\n", nodeName());
     printTabs(buf, tabs + 1);
@@ -549,7 +558,7 @@ string MethodDef::toStringWithTabs(const core::GlobalState &gs, int tabs) const 
     return fmt::to_string(buf);
 }
 
-string MethodDef::showRaw(const core::GlobalState &gs, int tabs) {
+string MethodDef::showRaw(const core::GlobalState &gs, int tabs) const {
     fmt::memory_buffer buf;
     fmt::format_to(std::back_inserter(buf), "{}{{\n", nodeName());
     printTabs(buf, tabs + 1);
@@ -609,7 +618,7 @@ string If::toStringWithTabs(const core::GlobalState &gs, int tabs) const {
     return fmt::to_string(buf);
 }
 
-string If::showRaw(const core::GlobalState &gs, int tabs) {
+string If::showRaw(const core::GlobalState &gs, int tabs) const {
     fmt::memory_buffer buf;
 
     fmt::format_to(std::back_inserter(buf), "{}{{\n", nodeName());
@@ -624,7 +633,7 @@ string If::showRaw(const core::GlobalState &gs, int tabs) {
     return fmt::to_string(buf);
 }
 
-string Assign::showRaw(const core::GlobalState &gs, int tabs) {
+string Assign::showRaw(const core::GlobalState &gs, int tabs) const {
     fmt::memory_buffer buf;
 
     fmt::format_to(std::back_inserter(buf), "{}{{\n", nodeName());
@@ -648,7 +657,7 @@ string While::toStringWithTabs(const core::GlobalState &gs, int tabs) const {
     return fmt::to_string(buf);
 }
 
-string While::showRaw(const core::GlobalState &gs, int tabs) {
+string While::showRaw(const core::GlobalState &gs, int tabs) const {
     fmt::memory_buffer buf;
 
     fmt::format_to(std::back_inserter(buf), "{}{{\n", nodeName());
@@ -669,7 +678,7 @@ string UnresolvedConstantLit::toStringWithTabs(const core::GlobalState &gs, int 
     return fmt::format("{}::{}", this->scope.toStringWithTabs(gs, tabs), this->cnst.toString(gs));
 }
 
-string UnresolvedConstantLit::showRaw(const core::GlobalState &gs, int tabs) {
+string UnresolvedConstantLit::showRaw(const core::GlobalState &gs, int tabs) const {
     fmt::memory_buffer buf;
 
     fmt::format_to(std::back_inserter(buf), "{}{{\n", nodeName());
@@ -689,7 +698,7 @@ string ConstantLit::toStringWithTabs(const core::GlobalState &gs, int tabs) cons
     return "Unresolved: " + this->original.toStringWithTabs(gs, tabs);
 }
 
-string ConstantLit::showRaw(const core::GlobalState &gs, int tabs) {
+string ConstantLit::showRaw(const core::GlobalState &gs, int tabs) const {
     fmt::memory_buffer buf;
 
     fmt::format_to(std::back_inserter(buf), "{}{{\n", nodeName());
@@ -704,8 +713,7 @@ string ConstantLit::showRaw(const core::GlobalState &gs, int tabs) {
     if (resolutionScopes != nullptr && !resolutionScopes->empty()) {
         printTabs(buf, tabs + 1);
         fmt::format_to(std::back_inserter(buf), "resolutionScopes = [{}]\n",
-                       fmt::map_join(this->resolutionScopes->begin(), this->resolutionScopes->end(), ", ",
-                                     [&](auto sym) { return sym.showFullName(gs); }));
+                       fmt::map_join(*this->resolutionScopes, ", ", [&](auto sym) { return sym.showFullName(gs); }));
     }
     printTabs(buf, tabs);
 
@@ -717,11 +725,11 @@ string Local::toStringWithTabs(const core::GlobalState &gs, int tabs) const {
     return this->localVariable.toString(gs);
 }
 
-string Local::nodeName() {
+string Local::nodeName() const {
     return "Local";
 }
 
-string Local::showRaw(const core::GlobalState &gs, int tabs) {
+string Local::showRaw(const core::GlobalState &gs, int tabs) const {
     fmt::memory_buffer buf;
     fmt::format_to(std::back_inserter(buf), "{}{{\n", nodeName());
     printTabs(buf, tabs + 1);
@@ -735,7 +743,7 @@ string UnresolvedIdent::toStringWithTabs(const core::GlobalState &gs, int tabs) 
     return this->name.toString(gs);
 }
 
-string UnresolvedIdent::showRaw(const core::GlobalState &gs, int tabs) {
+string UnresolvedIdent::showRaw(const core::GlobalState &gs, int tabs) const {
     fmt::memory_buffer buf;
     fmt::format_to(std::back_inserter(buf), "{}{{\n", nodeName());
     printTabs(buf, tabs + 1);
@@ -763,19 +771,19 @@ string UnresolvedIdent::showRaw(const core::GlobalState &gs, int tabs) {
     return fmt::to_string(buf);
 }
 
-string Return::showRaw(const core::GlobalState &gs, int tabs) {
+string Return::showRaw(const core::GlobalState &gs, int tabs) const {
     return nodeName() + "{ expr = " + this->expr.showRaw(gs, tabs + 1) + " }";
 }
 
-string Next::showRaw(const core::GlobalState &gs, int tabs) {
+string Next::showRaw(const core::GlobalState &gs, int tabs) const {
     return nodeName() + "{ expr = " + this->expr.showRaw(gs, tabs + 1) + " }";
 }
 
-string Break::showRaw(const core::GlobalState &gs, int tabs) {
+string Break::showRaw(const core::GlobalState &gs, int tabs) const {
     return nodeName() + "{ expr = " + this->expr.showRaw(gs, tabs + 1) + " }";
 }
 
-string Retry::showRaw(const core::GlobalState &gs, int tabs) {
+string Retry::showRaw(const core::GlobalState &gs, int tabs) const {
     return nodeName() + "{}";
 }
 
@@ -795,14 +803,16 @@ string Retry::toStringWithTabs(const core::GlobalState &gs, int tabs) const {
     return "retry";
 }
 
-string Literal::showRaw(const core::GlobalState &gs, int tabs) {
+string Literal::showRaw(const core::GlobalState &gs, int tabs) const {
     return nodeName() + "{ value = " + this->toStringWithTabs(gs, 0) + " }";
 }
 
 string Literal::toStringWithTabs(const core::GlobalState &gs, int tabs) const {
     string res;
     typecase(
-        this->value, [&](const core::LiteralType &l) { res = l.showValue(gs); },
+        this->value, [&](const core::NamedLiteralType &l) { res = l.showValue(gs); },
+        [&](const core::IntegerLiteralType &i) { res = i.showValue(gs); },
+        [&](const core::FloatLiteralType &i) { res = i.showValue(gs); },
         [&](const core::ClassType &l) {
             if (l.symbol == core::Symbols::NilClass()) {
                 res = "nil";
@@ -841,7 +851,7 @@ string RescueCase::toStringWithTabs(const core::GlobalState &gs, int tabs) const
     return fmt::to_string(buf);
 }
 
-string RescueCase::showRaw(const core::GlobalState &gs, int tabs) {
+string RescueCase::showRaw(const core::GlobalState &gs, int tabs) const {
     fmt::memory_buffer buf;
     fmt::format_to(std::back_inserter(buf), "{}{{\n", nodeName());
     printTabs(buf, tabs + 1);
@@ -886,7 +896,7 @@ string Rescue::toStringWithTabs(const core::GlobalState &gs, int tabs) const {
     return fmt::to_string(buf);
 }
 
-string Rescue::showRaw(const core::GlobalState &gs, int tabs) {
+string Rescue::showRaw(const core::GlobalState &gs, int tabs) const {
     fmt::memory_buffer buf;
     fmt::format_to(std::back_inserter(buf), "{}{{\n", nodeName());
     printTabs(buf, tabs + 1);
@@ -919,7 +929,7 @@ string Send::toStringWithTabs(const core::GlobalState &gs, int tabs) const {
     return fmt::to_string(buf);
 }
 
-string Send::showRaw(const core::GlobalState &gs, int tabs) {
+string Send::showRaw(const core::GlobalState &gs, int tabs) const {
     fmt::memory_buffer buf;
     fmt::format_to(std::back_inserter(buf), "{}{{\n", nodeName());
 
@@ -961,6 +971,15 @@ string Send::showRaw(const core::GlobalState &gs, int tabs) {
     fmt::format_to(std::back_inserter(buf), "}}");
 
     return fmt::to_string(buf);
+}
+
+std::string RuntimeMethodDefinition::toStringWithTabs(const core::GlobalState &gs, int tabs) const {
+    string prefix = this->isSelfMethod ? "self." : "";
+    return fmt::format("<runtime method definition of {}{}>", prefix, this->name.toString(gs));
+}
+
+std::string RuntimeMethodDefinition::showRaw(const core::GlobalState &gs, int tabs) const {
+    return this->toStringWithTabs(gs, tabs);
 }
 
 const ast::Block *Send::block() const {
@@ -1088,14 +1107,14 @@ ExpressionPtr Send::withNewBody(core::LocOffsets loc, ExpressionPtr recv, core::
 
 string Cast::toStringWithTabs(const core::GlobalState &gs, int tabs) const {
     fmt::memory_buffer buf;
-    fmt::format_to(std::back_inserter(buf), "T.{}", this->cast.toString(gs));
-    fmt::format_to(std::back_inserter(buf), "({}, {})", this->arg.toStringWithTabs(gs, tabs),
-                   this->type.toStringWithTabs(gs, tabs));
+    fmt::format_to(std::back_inserter(buf), "<cast:{}>", this->cast.toString(gs));
+    fmt::format_to(std::back_inserter(buf), "({}, {}, {})", this->arg.toStringWithTabs(gs, tabs),
+                   this->type.toStringWithTabs(gs, tabs), this->typeExpr.toStringWithTabs(gs, tabs));
 
     return fmt::to_string(buf);
 }
 
-string Cast::showRaw(const core::GlobalState &gs, int tabs) {
+string Cast::showRaw(const core::GlobalState &gs, int tabs) const {
     fmt::memory_buffer buf;
     fmt::format_to(std::back_inserter(buf), "{}{{\n", nodeName());
     printTabs(buf, tabs + 2);
@@ -1103,18 +1122,20 @@ string Cast::showRaw(const core::GlobalState &gs, int tabs) {
     printTabs(buf, tabs + 2);
     fmt::format_to(std::back_inserter(buf), "arg = {}\n", this->arg.showRaw(gs, tabs + 2));
     printTabs(buf, tabs + 2);
-    fmt::format_to(std::back_inserter(buf), "type = {},\n", this->type.toString(gs));
+    fmt::format_to(std::back_inserter(buf), "type = {},\n", this->type.showWithMoreInfo(gs));
+    printTabs(buf, tabs + 2);
+    fmt::format_to(std::back_inserter(buf), "typeExpr = {},\n", this->typeExpr.showRaw(gs, tabs + 2));
     printTabs(buf, tabs);
     fmt::format_to(std::back_inserter(buf), "}}\n");
 
     return fmt::to_string(buf);
 }
 
-string ZSuperArgs::showRaw(const core::GlobalState &gs, int tabs) {
+string ZSuperArgs::showRaw(const core::GlobalState &gs, int tabs) const {
     return nodeName() + "{ }";
 }
 
-string Hash::showRaw(const core::GlobalState &gs, int tabs) {
+string Hash::showRaw(const core::GlobalState &gs, int tabs) const {
     fmt::memory_buffer buf;
     fmt::format_to(std::back_inserter(buf), "{}{{\n", nodeName());
     printTabs(buf, tabs + 1);
@@ -1141,7 +1162,7 @@ string Hash::showRaw(const core::GlobalState &gs, int tabs) {
     return fmt::to_string(buf);
 }
 
-string Array::showRaw(const core::GlobalState &gs, int tabs) {
+string Array::showRaw(const core::GlobalState &gs, int tabs) const {
     fmt::memory_buffer buf;
     fmt::format_to(std::back_inserter(buf), "{}{{\n", nodeName());
     printTabs(buf, tabs + 1);
@@ -1202,7 +1223,7 @@ string Block::toStringWithTabs(const core::GlobalState &gs, int tabs) const {
     return fmt::to_string(buf);
 }
 
-string Block::showRaw(const core::GlobalState &gs, int tabs) {
+string Block::showRaw(const core::GlobalState &gs, int tabs) const {
     fmt::memory_buffer buf;
     fmt::format_to(std::back_inserter(buf), "{} {{\n", nodeName());
     printTabs(buf, tabs + 1);
@@ -1245,95 +1266,97 @@ string BlockArg::toStringWithTabs(const core::GlobalState &gs, int tabs) const {
     return "&" + this->expr.toStringWithTabs(gs, tabs);
 }
 
-string RescueCase::nodeName() {
+string RescueCase::nodeName() const {
     return "RescueCase";
 }
-string Rescue::nodeName() {
+string Rescue::nodeName() const {
     return "Rescue";
 }
-string Next::nodeName() {
+string Next::nodeName() const {
     return "Next";
 }
-string ClassDef::nodeName() {
+string ClassDef::nodeName() const {
     return "ClassDef";
 }
 
-string MethodDef::nodeName() {
+string MethodDef::nodeName() const {
     return "MethodDef";
 }
-string If::nodeName() {
+string If::nodeName() const {
     return "If";
 }
-string While::nodeName() {
+string While::nodeName() const {
     return "While";
 }
-string UnresolvedIdent::nodeName() {
+string UnresolvedIdent::nodeName() const {
     return "UnresolvedIdent";
 }
-string Return::nodeName() {
+string Return::nodeName() const {
     return "Return";
 }
-string Break::nodeName() {
+string Break::nodeName() const {
     return "Break";
 }
-string Retry::nodeName() {
+string Retry::nodeName() const {
     return "Retry";
 }
 
-string Assign::nodeName() {
+string Assign::nodeName() const {
     return "Assign";
 }
 
-string Send::nodeName() {
+string Send::nodeName() const {
     return "Send";
 }
 
-string Cast::nodeName() {
+string Cast::nodeName() const {
     return "Cast";
 }
 
-string ZSuperArgs::nodeName() {
+string ZSuperArgs::nodeName() const {
     return "ZSuperArgs";
 }
 
-string Hash::nodeName() {
+string Hash::nodeName() const {
     return "Hash";
 }
 
-string Array::nodeName() {
+string Array::nodeName() const {
     return "Array";
 }
 
-string Literal::nodeName() {
+string Literal::nodeName() const {
     return "Literal";
 }
 
-core::NameRef Literal::asString(const core::GlobalState &gs) const {
-    ENFORCE(isString(gs));
-    auto t = core::cast_type_nonnull<core::LiteralType>(value);
-    core::NameRef res = t.asName(gs);
+core::NameRef Literal::asString() const {
+    ENFORCE(isString());
+    auto t = core::cast_type_nonnull<core::NamedLiteralType>(value);
+    core::NameRef res = t.asName();
     return res;
 }
 
-core::NameRef Literal::asSymbol(const core::GlobalState &gs) const {
-    ENFORCE(isSymbol(gs));
-    auto t = core::cast_type_nonnull<core::LiteralType>(value);
-    core::NameRef res = t.asName(gs);
+core::NameRef Literal::asSymbol() const {
+    ENFORCE(isSymbol());
+    auto t = core::cast_type_nonnull<core::NamedLiteralType>(value);
+    core::NameRef res = t.asName();
     return res;
 }
 
-bool Literal::isSymbol(const core::GlobalState &gs) const {
-    return core::isa_type<core::LiteralType>(value) &&
-           core::cast_type_nonnull<core::LiteralType>(value).derivesFrom(gs, core::Symbols::Symbol());
+bool Literal::isSymbol() const {
+    return core::isa_type<core::NamedLiteralType>(value) &&
+           core::cast_type_nonnull<core::NamedLiteralType>(value).literalKind ==
+               core::NamedLiteralType::LiteralTypeKind::Symbol;
 }
 
 bool Literal::isNil(const core::GlobalState &gs) const {
     return value.derivesFrom(gs, core::Symbols::NilClass());
 }
 
-bool Literal::isString(const core::GlobalState &gs) const {
-    return core::isa_type<core::LiteralType>(value) &&
-           core::cast_type_nonnull<core::LiteralType>(value).derivesFrom(gs, core::Symbols::String());
+bool Literal::isString() const {
+    return core::isa_type<core::NamedLiteralType>(value) &&
+           core::cast_type_nonnull<core::NamedLiteralType>(value).literalKind ==
+               core::NamedLiteralType::LiteralTypeKind::String;
 }
 
 bool Literal::isTrue(const core::GlobalState &gs) const {
@@ -1344,47 +1367,47 @@ bool Literal::isFalse(const core::GlobalState &gs) const {
     return value.derivesFrom(gs, core::Symbols::FalseClass());
 }
 
-string UnresolvedConstantLit::nodeName() {
+string UnresolvedConstantLit::nodeName() const {
     return "UnresolvedConstantLit";
 }
 
-string ConstantLit::nodeName() {
+string ConstantLit::nodeName() const {
     return "ConstantLit";
 }
 
-string Block::nodeName() {
+string Block::nodeName() const {
     return "Block";
 }
 
-string InsSeq::nodeName() {
+string InsSeq::nodeName() const {
     return "InsSeq";
 }
 
-string EmptyTree::nodeName() {
+string EmptyTree::nodeName() const {
     return "EmptyTree";
 }
 
-string EmptyTree::showRaw(const core::GlobalState &gs, int tabs) {
+string EmptyTree::showRaw(const core::GlobalState &gs, int tabs) const {
     return nodeName();
 }
 
-string RestArg::showRaw(const core::GlobalState &gs, int tabs) {
+string RestArg::showRaw(const core::GlobalState &gs, int tabs) const {
     return nodeName() + "{ expr = " + expr.showRaw(gs, tabs) + " }";
 }
 
-string RestArg::nodeName() {
+string RestArg::nodeName() const {
     return "RestArg";
 }
 
-string KeywordArg::showRaw(const core::GlobalState &gs, int tabs) {
+string KeywordArg::showRaw(const core::GlobalState &gs, int tabs) const {
     return nodeName() + "{ expr = " + expr.showRaw(gs, tabs) + " }";
 }
 
-string KeywordArg::nodeName() {
+string KeywordArg::nodeName() const {
     return "KeywordArg";
 }
 
-string OptionalArg::showRaw(const core::GlobalState &gs, int tabs) {
+string OptionalArg::showRaw(const core::GlobalState &gs, int tabs) const {
     fmt::memory_buffer buf;
     fmt::format_to(std::back_inserter(buf), "{}{{\n", nodeName());
     printTabs(buf, tabs + 1);
@@ -1399,24 +1422,28 @@ string OptionalArg::showRaw(const core::GlobalState &gs, int tabs) {
     return fmt::to_string(buf);
 }
 
-string OptionalArg::nodeName() {
+string OptionalArg::nodeName() const {
     return "OptionalArg";
 }
 
-string ShadowArg::showRaw(const core::GlobalState &gs, int tabs) {
+string ShadowArg::showRaw(const core::GlobalState &gs, int tabs) const {
     return nodeName() + "{ expr = " + expr.showRaw(gs, tabs) + " }";
 }
 
-string BlockArg::showRaw(const core::GlobalState &gs, int tabs) {
+string BlockArg::showRaw(const core::GlobalState &gs, int tabs) const {
     return nodeName() + "{ expr = " + expr.showRaw(gs, tabs) + " }";
 }
 
-string ShadowArg::nodeName() {
+string ShadowArg::nodeName() const {
     return "ShadowArg";
 }
 
-string BlockArg::nodeName() {
+string BlockArg::nodeName() const {
     return "BlockArg";
+}
+
+string RuntimeMethodDefinition::nodeName() const {
+    return "RuntimeMethodDefinition";
 }
 
 ParsedFilesOrCancelled::ParsedFilesOrCancelled() : trees(nullopt){};

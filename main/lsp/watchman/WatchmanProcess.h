@@ -8,17 +8,19 @@
 
 namespace sorbet::realmain::lsp {
 class WatchmanQueryResponse;
-}
+class WatchmanStateEnter;
+class WatchmanStateLeave;
+} // namespace sorbet::realmain::lsp
 
 namespace sorbet::realmain::lsp::watchman {
 class WatchmanProcess {
-private:
+protected:
     std::shared_ptr<spdlog::logger> logger;
+
+private:
     const std::string watchmanPath;
     const std::string workSpace;
     const std::vector<std::string> extensions;
-    const std::function<void(std::unique_ptr<sorbet::realmain::lsp::WatchmanQueryResponse>)> processUpdate;
-    const std::function<void(int, std::string const &)> processExit;
     const std::unique_ptr<Joinable> thread;
     // Mutex that must be held before reading or writing stopped.
     absl::Mutex mutex;
@@ -30,9 +32,18 @@ private:
      */
     void start();
 
-    void exitWithCode(int code, std::string const &);
+    void exitWithCode(int code, const std::optional<std::string> &);
 
     bool isStopped();
+
+protected:
+    virtual void processQueryResponse(std::unique_ptr<sorbet::realmain::lsp::WatchmanQueryResponse>) = 0;
+
+    virtual void processStateEnter(std::unique_ptr<sorbet::realmain::lsp::WatchmanStateEnter>) = 0;
+
+    virtual void processStateLeave(std::unique_ptr<sorbet::realmain::lsp::WatchmanStateLeave>) = 0;
+
+    virtual void processExit(int core, const std::optional<std::string> &) = 0;
 
 public:
     /**
@@ -40,11 +51,9 @@ public:
      * workspace folder. Passes file updates to `processUpdate` function.
      */
     WatchmanProcess(std::shared_ptr<spdlog::logger> logger, std::string_view watchmanPath, std::string_view workSpace,
-                    std::vector<std::string> extensions,
-                    std::function<void(std::unique_ptr<sorbet::realmain::lsp::WatchmanQueryResponse>)> processUpdate,
-                    std::function<void(int, std::string const &)> processExit);
+                    std::vector<std::string> extensions);
 
-    ~WatchmanProcess();
+    virtual ~WatchmanProcess();
 
     WatchmanProcess(const WatchmanProcess &&) = delete;
     WatchmanProcess(WatchmanProcess &) = delete;

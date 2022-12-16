@@ -4,24 +4,24 @@ begin
     def self.<static-init><<static-init>$CENSORED>(<blk>)
       begin
         begin
-          ::<Magic>.<define-top-class-or-module>(::Parent)
+          <emptyTree>
           ::Sorbet::Private::Static.keep_for_ide(::Parent)
           <emptyTree>
         end
         begin
-          ::<Magic>.<define-top-class-or-module>(::Mixin)
+          <emptyTree>
           ::Sorbet::Private::Static.keep_for_ide(::Mixin)
           <emptyTree>
         end
         begin
-          ::<Magic>.<define-top-class-or-module>(::Child)
+          <emptyTree>
           ::Sorbet::Private::Static.keep_for_ide(::Child)
           ::Sorbet::Private::Static.keep_for_ide(::Parent)
           <emptyTree>
         end
         ::Alias = ::Parent
         begin
-          ::<Magic>.<define-top-class-or-module>(::Child1)
+          <emptyTree>
           ::Sorbet::Private::Static.keep_for_ide(::Child1)
           ::Sorbet::Private::Static.keep_for_ide(::Alias)
           <emptyTree>
@@ -33,14 +33,8 @@ begin
   class ::Parent<<C Parent>> < (::<todo sym>)
     def initialize(<blk>)
       begin
-        @ivar = begin
-          ::Sorbet::Private::Static.keep_for_typechecking(::Integer)
-          T.let(1, Integer)
-        end
-        @ivar2 = begin
-          ::Sorbet::Private::Static.keep_for_typechecking(::Integer)
-          T.let(2, Integer)
-        end
+        @ivar = <cast:let>(1, Integer, ::Integer)
+        @ivar2 = <cast:let>(2, Integer, ::Integer)
       end
     end
 
@@ -53,12 +47,9 @@ begin
 
     def self.<static-init>(<blk>)
       begin
-        ::Sorbet::Private::Static.keep_def(<self>, :initialize, :normal)
-        @@class_var = begin
-          ::Sorbet::Private::Static.keep_for_typechecking(::String)
-          T.let("hi", String)
-        end
-        ::Sorbet::Private::Static.keep_def(<self>, :hi, :normal)
+        <runtime method definition of initialize>
+        @@class_var = <cast:let>("hi", String, ::String)
+        <runtime method definition of hi>
         <emptyTree>
       end
     end
@@ -66,10 +57,7 @@ begin
   module ::Mixin<<C Mixin>> < ()
     def self.<static-init>(<blk>)
       begin
-        @@mixin_cvar = begin
-          ::Sorbet::Private::Static.keep_for_typechecking(::Integer)
-          T.let(3, Integer)
-        end
+        @@mixin_cvar = <cast:let>(3, Integer, ::Integer)
         @@mixin_cvar
         <emptyTree>
       end
@@ -91,7 +79,7 @@ begin
         @@class_var
         @@mixin_cvar
         @@undefined_cvar
-        ::Sorbet::Private::Static.keep_def(<self>, :child_method, :normal)
+        <runtime method definition of child_method>
         <emptyTree>
       end
     end

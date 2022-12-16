@@ -9,6 +9,7 @@
 #include "absl/algorithm/container.h"
 
 #include "definition_validator/variance.h"
+#include "main/sig_finder/sig_finder.h"
 
 using namespace std;
 
@@ -44,20 +45,59 @@ Signature decomposeSignature(const core::GlobalState &gs, core::MethodRef method
     return sig;
 }
 
-// This returns true if `sub` is a subtype of `super`, but it also returns true if either one is `nullptr` or if either
-// one is not fully defined. This is really just a useful helper function for this module: do not use it elsewhere.
-bool checkSubtype(const core::Context ctx, const core::TypePtr &sub, const core::TypePtr &super) {
+// This is really just a useful helper function for this module: do not use it elsewhere.
+//
+// It makes certain assuptions that it is running for the sake of computing overrides that are not
+// going to be true in other situations.
+bool checkSubtype(const core::Context ctx, core::TypeConstraint &constr, const core::TypePtr &sub,
+                  core::MethodRef subMethod, const core::TypePtr &super, core::MethodRef superMethod,
+                  core::Polarity polarity) {
     if (sub == nullptr || super == nullptr) {
+        // nullptr is just "unannotated" which is T.untyped
         return true;
     }
 
-    // type-checking these in the presence of generic type parameters is tricky, so for now we're going to punt on
-    // it. TODO: build up the machinery to type-check in the presence of type parameters!
-    if (!super.isFullyDefined() || !sub.isFullyDefined()) {
-        return true;
-    }
+    auto subOwner = subMethod.data(ctx)->owner;
+    auto superOwner = superMethod.data(ctx)->owner;
 
-    return core::Types::isSubType(ctx, sub, super);
+    // Need this to be true for the sake of resultTypeAsSeenFrom.
+    ENFORCE(subOwner.data(ctx)->derivesFrom(ctx, superOwner));
+
+    // We're only using the TypeConstraint as a way to have an easy way to replace a `TypeVar` with
+    // a "skolem" type variable (type variable representing an unknown but specific type). In
+    // Sorbet, those skolems are SelfTypeParam types that wrap a TypeArgumentRef.
+    //
+    // Types::approximate does this "replace all the TypeVar with SelfTypeParam" naturally and in a
+    // predictable way (i.e., respecting polarity), so it's convenient do to this with approximate
+    // rather than build a dedicated function for this.
+    //
+    // However, it's neither required nor desired to use that constraint to type check the two types
+    // themselves. If we somehow managed to construct the constr incorrectly, there might still be
+    // un-skolemized TypeVar's in either type, which would then record new constraints during the
+    // call to isSubType. To guarantee that never happens, we typecheck the type under the
+    // EmptyFrozenConstraint, instead of this constraint that we should only be using for skolemization.
+    //
+    // Another approach might be to create the constr right here, instead of threading it around
+    // everywhere. We've taken the aprpopach of only constructing the constraint once as an optimization.
+
+    // For the sake of comparison, we always compare the two types as if they were being "observed"
+    // in the child class, so we always instantiate with the sub class types
+    const auto &subSelfTypeArgs = subOwner.data(ctx)->selfTypeArgs(ctx);
+
+    auto subType = core::Types::approximate(ctx, sub, constr);
+    subType = core::Types::resultTypeAsSeenFrom(ctx, subType, subOwner, subOwner, subSelfTypeArgs);
+    auto superType = core::Types::approximate(ctx, super, constr);
+    superType = core::Types::resultTypeAsSeenFrom(ctx, superType, superOwner, subOwner, subSelfTypeArgs);
+
+    switch (polarity) {
+        case core::Polarity::Negative:
+            return core::Types::isSubType(ctx, superType, subType);
+        case core::Polarity::Positive:
+            return core::Types::isSubType(ctx, subType, superType);
+        case core::Polarity::Neutral:
+            Exception::raise("{}: unexpected neutral polarity, did you mean to pass Positive?",
+                             ctx.file.data(ctx).path());
+    }
 }
 
 string supermethodKind(const core::Context ctx, core::MethodRef method) {
@@ -86,7 +126,8 @@ string implementationOf(const core::Context ctx, core::MethodRef method) {
 
 // This walks two positional argument lists to ensure that they're compatibly typed (i.e. that every argument in the
 // implementing method is either the same or a supertype of the abstract or overridable definition)
-void matchPositional(const core::Context ctx, absl::InlinedVector<reference_wrapper<const core::ArgInfo>, 4> &superArgs,
+void matchPositional(const core::Context ctx, core::TypeConstraint &constr,
+                     absl::InlinedVector<reference_wrapper<const core::ArgInfo>, 4> &superArgs,
                      core::MethodRef superMethod,
                      absl::InlinedVector<reference_wrapper<const core::ArgInfo>, 4> &methodArgs,
                      core::MethodRef method) {
@@ -94,10 +135,10 @@ void matchPositional(const core::Context ctx, absl::InlinedVector<reference_wrap
     auto maxLen = min(superArgs.size(), methodArgs.size());
 
     while (idx < maxLen) {
-        auto superArgType = superArgs[idx].get().type;
-        auto methodArgType = methodArgs[idx].get().type;
+        auto &superArgType = superArgs[idx].get().type;
+        auto &methodArgType = methodArgs[idx].get().type;
 
-        if (!checkSubtype(ctx, superArgType, methodArgType)) {
+        if (!checkSubtype(ctx, constr, methodArgType, method, superArgType, superMethod, core::Polarity::Negative)) {
             if (auto e = ctx.state.beginError(method.data(ctx)->loc(), core::errors::Resolver::BadMethodOverride)) {
                 e.setHeader("Parameter `{}` of type `{}` not compatible with type of {} method `{}`",
                             methodArgs[idx].get().show(ctx), methodArgType.show(ctx), supermethodKind(ctx, superMethod),
@@ -105,6 +146,8 @@ void matchPositional(const core::Context ctx, absl::InlinedVector<reference_wrap
                 e.addErrorLine(superMethod.data(ctx)->loc(),
                                "The super method parameter `{}` was declared here with type `{}`",
                                superArgs[idx].get().show(ctx), superArgType.show(ctx));
+                e.addErrorNote(
+                    "A parameter's type must be a supertype of the same parameter's type on the super method.");
             }
         }
         idx++;
@@ -118,6 +161,66 @@ void validateCompatibleOverride(const core::Context ctx, core::MethodRef superMe
         // to match overloads against their superclass definitions. Since we
         // Only permit overloading in the stdlib for now, this is no great loss.
         return;
+    }
+
+    if (superMethod.data(ctx)->flags.isGenericMethod != method.data(ctx)->flags.isGenericMethod &&
+        method.data(ctx)->hasSig()) {
+        if (auto e = ctx.state.beginError(method.data(ctx)->loc(), core::errors::Resolver::BadMethodOverride)) {
+            if (superMethod.data(ctx)->flags.isGenericMethod) {
+                e.setHeader("{} method `{}` must declare the same number of type parameters as the base method",
+                            implementationOf(ctx, superMethod), superMethod.show(ctx));
+            } else {
+                e.setHeader("{} method `{}` must not declare type parameters", implementationOf(ctx, superMethod),
+                            superMethod.show(ctx));
+            }
+            e.addErrorLine(superMethod.data(ctx)->loc(), "Base method defined here");
+        }
+        return;
+    }
+
+    unique_ptr<core::TypeConstraint> _constr;
+    auto *constr = &core::TypeConstraint::EmptyFrozenConstraint;
+    if (method.data(ctx)->flags.isGenericMethod) {
+        ENFORCE(superMethod.data(ctx)->flags.isGenericMethod);
+        const auto &methodTypeArguments = method.data(ctx)->typeArguments();
+        const auto &superMethodTypeArguments = superMethod.data(ctx)->typeArguments();
+        if (methodTypeArguments.size() != superMethodTypeArguments.size()) {
+            if (auto e = ctx.state.beginError(method.data(ctx)->loc(), core::errors::Resolver::BadMethodOverride)) {
+                e.setHeader("{} method `{}` must declare the same number of type parameters as the base method",
+                            implementationOf(ctx, superMethod), superMethod.show(ctx));
+                e.addErrorLine(superMethod.data(ctx)->loc(), "Base method defined here");
+            }
+            return;
+        }
+
+        _constr = make_unique<core::TypeConstraint>();
+        constr = _constr.get();
+
+        // This doesn't allow the type arguments to be declared in a different order, but it does
+        // allow them to be declared with different names.
+        //
+        // The tradeoff is that this provides a cheap way to produce error messages at the
+        // individual arg that is imcompatible (versus only at the end once all constraints have
+        // been collected) at the cost of rejecting compatible overrides.
+        //
+        // (An alternative might be to collect a constraint and then after validating all arguments,
+        // attempt to find a substitution from one method's type params to the other method's type
+        // params, and report an error if no substitution exists, but this tends to result in errors
+        // that look like "it failed" with no further context.)
+        for (size_t i = 0; i < methodTypeArguments.size(); i++) {
+            auto typeArgument = methodTypeArguments[i];
+            auto superTypeArgument = superMethodTypeArguments[i];
+
+            constr->rememberIsSubtype(ctx, typeArgument.data(ctx)->resultType,
+                                      core::make_type<core::SelfTypeParam>(superTypeArgument));
+            constr->rememberIsSubtype(ctx, core::make_type<core::SelfTypeParam>(typeArgument),
+                                      superTypeArgument.data(ctx)->resultType);
+
+            constr->rememberIsSubtype(ctx, core::make_type<core::SelfTypeParam>(typeArgument),
+                                      typeArgument.data(ctx)->resultType);
+            constr->rememberIsSubtype(ctx, superTypeArgument.data(ctx)->resultType,
+                                      core::make_type<core::SelfTypeParam>(superTypeArgument));
+        }
     }
 
     auto left = decomposeSignature(ctx, superMethod);
@@ -154,9 +257,9 @@ void validateCompatibleOverride(const core::Context ctx, core::MethodRef superMe
     }
 
     // match types of required positional arguments
-    matchPositional(ctx, left.pos.required, superMethod, right.pos.required, method);
+    matchPositional(ctx, *constr, left.pos.required, superMethod, right.pos.required, method);
     // match types of optional positional arguments
-    matchPositional(ctx, left.pos.optional, superMethod, right.pos.optional, method);
+    matchPositional(ctx, *constr, left.pos.optional, superMethod, right.pos.optional, method);
 
     if (!right.kw.rest) {
         for (auto req : left.kw.required) {
@@ -169,7 +272,8 @@ void validateCompatibleOverride(const core::Context ctx, core::MethodRef superMe
 
             // if there is a corresponding parameter, make sure it has the right type
             if (corresponding != right.kw.required.end() && corresponding != right.kw.optional.end()) {
-                if (!checkSubtype(ctx, req.get().type, corresponding->get().type)) {
+                if (!checkSubtype(ctx, *constr, corresponding->get().type, method, req.get().type, superMethod,
+                                  core::Polarity::Negative)) {
                     if (auto e =
                             ctx.state.beginError(method.data(ctx)->loc(), core::errors::Resolver::BadMethodOverride)) {
                         e.setHeader("Keyword parameter `{}` of type `{}` not compatible with type of {} method `{}`",
@@ -178,6 +282,8 @@ void validateCompatibleOverride(const core::Context ctx, core::MethodRef superMe
                         e.addErrorLine(superMethod.data(ctx)->loc(),
                                        "The corresponding parameter `{}` was declared here with type `{}`",
                                        req.get().show(ctx), req.get().type.show(ctx));
+                        e.addErrorNote(
+                            "A parameter's type must be a supertype of the same parameter's type on the super method.");
                     }
                 }
             } else {
@@ -196,7 +302,8 @@ void validateCompatibleOverride(const core::Context ctx, core::MethodRef superMe
 
             // if there is a corresponding parameter, make sure it has the right type
             if (corresponding != right.kw.optional.end()) {
-                if (!checkSubtype(ctx, opt.get().type, corresponding->get().type)) {
+                if (!checkSubtype(ctx, *constr, corresponding->get().type, method, opt.get().type, superMethod,
+                                  core::Polarity::Negative)) {
                     if (auto e =
                             ctx.state.beginError(method.data(ctx)->loc(), core::errors::Resolver::BadMethodOverride)) {
                         e.setHeader("Keyword parameter `{}` of type `{}` not compatible with type of {} method `{}`",
@@ -205,6 +312,8 @@ void validateCompatibleOverride(const core::Context ctx, core::MethodRef superMe
                         e.addErrorLine(superMethod.data(ctx)->loc(),
                                        "The super method parameter `{}` was declared here with type `{}`",
                                        opt.get().show(ctx), opt.get().type.show(ctx));
+                        e.addErrorNote(
+                            "A parameter's type must be a supertype of the same parameter's type on the super method.");
                     }
                 }
             }
@@ -218,7 +327,8 @@ void validateCompatibleOverride(const core::Context ctx, core::MethodRef superMe
                             superMethod.show(ctx), leftRest->get().show(ctx));
                 e.addErrorLine(superMethod.data(ctx)->loc(), "Base method defined here");
             }
-        } else if (!checkSubtype(ctx, leftRest->get().type, right.kw.rest->get().type)) {
+        } else if (!checkSubtype(ctx, *constr, right.kw.rest->get().type, method, leftRest->get().type, superMethod,
+                                 core::Polarity::Negative)) {
             if (auto e = ctx.state.beginError(method.data(ctx)->loc(), core::errors::Resolver::BadMethodOverride)) {
                 e.setHeader("Parameter **`{}` of type `{}` not compatible with type of {} method `{}`",
                             right.kw.rest->get().show(ctx), right.kw.rest->get().type.show(ctx),
@@ -226,6 +336,8 @@ void validateCompatibleOverride(const core::Context ctx, core::MethodRef superMe
                 e.addErrorLine(superMethod.data(ctx)->loc(),
                                "The super method parameter **`{}` was declared here with type `{}`",
                                left.kw.rest->get().show(ctx), left.kw.rest->get().type.show(ctx));
+                e.addErrorNote(
+                    "A parameter's type must be a supertype of the same parameter's type on the super method.");
             }
         }
     }
@@ -247,19 +359,37 @@ void validateCompatibleOverride(const core::Context ctx, core::MethodRef superMe
                         superMethod.show(ctx));
             e.addErrorLine(superMethod.data(ctx)->loc(), "Base method defined here");
         }
+    } else {
+        const auto &methodBlkArg = method.data(ctx)->arguments.back();
+        const auto &superMethodBlkArg = superMethod.data(ctx)->arguments.back();
+
+        if (!checkSubtype(ctx, *constr, methodBlkArg.type, method, superMethodBlkArg.type, superMethod,
+                          core::Polarity::Negative)) {
+            if (auto e = ctx.state.beginError(method.data(ctx)->loc(), core::errors::Resolver::BadMethodOverride)) {
+                e.setHeader("Block parameter `{}` of type `{}` not compatible with type of {} method `{}`",
+                            methodBlkArg.argumentName(ctx), methodBlkArg.type.show(ctx),
+                            supermethodKind(ctx, superMethod), superMethod.show(ctx));
+                e.addErrorLine(superMethod.data(ctx)->loc(),
+                               "The super method parameter `{}` was declared here with type `{}`",
+                               superMethodBlkArg.show(ctx), superMethodBlkArg.type.show(ctx));
+                e.addErrorNote(
+                    "A parameter's type must be a supertype of the same parameter's type on the super method.");
+            }
+        }
     }
 
     {
         // make sure the return types are compatible
-        auto superReturn = superMethod.data(ctx)->resultType;
-        auto methodReturn = method.data(ctx)->resultType;
+        auto &superReturn = superMethod.data(ctx)->resultType;
+        auto &methodReturn = method.data(ctx)->resultType;
 
-        if (!checkSubtype(ctx, methodReturn, superReturn)) {
+        if (!checkSubtype(ctx, *constr, methodReturn, method, superReturn, superMethod, core::Polarity::Positive)) {
             if (auto e = ctx.state.beginError(method.data(ctx)->loc(), core::errors::Resolver::BadMethodOverride)) {
                 e.setHeader("Return type `{}` does not match return type of {} method `{}`", methodReturn.show(ctx),
                             supermethodKind(ctx, superMethod), superMethod.show(ctx));
                 e.addErrorLine(superMethod.data(ctx)->loc(), "Super method defined here with return type `{}`",
                                superReturn.show(ctx));
+                e.addErrorNote("A method's return type must be a subtype of the return type on the super method.");
             }
         }
     }
@@ -273,21 +403,21 @@ void validateOverriding(const core::Context ctx, core::MethodRef method) {
 
     // both of these match the behavior of the runtime checks, which will only allow public methods to be defined in
     // interfaces
-    if (klassData->isClassOrModuleInterface() && method.data(ctx)->flags.isPrivate) {
+    if (klassData->flags.isInterface && method.data(ctx)->flags.isPrivate) {
         if (auto e = ctx.state.beginError(method.data(ctx)->loc(), core::errors::Resolver::NonPublicAbstract)) {
             e.setHeader("Interface method `{}` cannot be private", method.show(ctx));
         }
     }
 
-    if (klassData->isClassOrModuleInterface() && method.data(ctx)->flags.isProtected) {
+    if (klassData->flags.isInterface && method.data(ctx)->flags.isProtected) {
         if (auto e = ctx.state.beginError(method.data(ctx)->loc(), core::errors::Resolver::NonPublicAbstract)) {
             e.setHeader("Interface method `{}` cannot be protected", method.show(ctx));
         }
     }
 
-    if (method.data(ctx)->flags.isAbstract && klassData->isClassOrModule() && klassData->isSingletonClass(ctx)) {
+    if (method.data(ctx)->flags.isAbstract && klassData->isSingletonClass(ctx)) {
         auto attached = klassData->attachedClass(ctx);
-        if (attached.exists() && attached.data(ctx)->isClassOrModuleModule()) {
+        if (attached.exists() && attached.data(ctx)->isModule()) {
             if (auto e =
                     ctx.state.beginError(method.data(ctx)->loc(), core::errors::Resolver::StaticAbstractModuleMethod)) {
                 e.setHeader("Static methods in a module cannot be abstract");
@@ -376,7 +506,7 @@ core::LocOffsets getAncestorLoc(const core::GlobalState &gs, const ast::ClassDef
 void validateFinalAncestorHelper(core::Context ctx, const core::ClassOrModuleRef klass, const ast::ClassDef &classDef,
                                  const core::ClassOrModuleRef errMsgClass, const string_view verb) {
     for (const auto &mixin : klass.data(ctx)->mixins()) {
-        if (!mixin.data(ctx)->isClassOrModuleFinal()) {
+        if (!mixin.data(ctx)->flags.isFinal) {
             continue;
         }
         if (auto e = ctx.beginError(getAncestorLoc(ctx, classDef, mixin), core::errors::Resolver::FinalAncestor)) {
@@ -387,137 +517,68 @@ void validateFinalAncestorHelper(core::Context ctx, const core::ClassOrModuleRef
     }
 }
 
-void validateFinalMethodHelper(const core::GlobalState &gs, const core::ClassOrModuleRef klass,
+void validateFinalMethodHelper(core::Context ctx, const core::ClassOrModuleRef klass, ast::ExpressionPtr &tree,
                                const core::ClassOrModuleRef errMsgClass) {
-    if (!klass.data(gs)->isClassOrModuleFinal()) {
+    if (!klass.data(ctx)->flags.isFinal) {
         return;
     }
-    for (const auto [name, sym] : klass.data(gs)->members()) {
+    for (const auto [name, sym] : klass.data(ctx)->members()) {
         // We only care about method symbols that exist.
         if (!sym.exists() || !sym.isMethod() ||
             // Method is 'final', and passes the check.
-            sym.asMethodRef().data(gs)->flags.isFinal ||
+            sym.asMethodRef().data(ctx)->flags.isFinal ||
             // <static-init> is a fake method Sorbet synthesizes for typechecking.
-            sym.name(gs) == core::Names::staticInit() ||
+            sym.name(ctx) == core::Names::staticInit() ||
             // <unresolved-ancestors> is a fake method Sorbet synthesizes to ensure class hierarchy changes in IDE take
             // slow path.
-            sym.name(gs) == core::Names::unresolvedAncestors()) {
+            sym.name(ctx) == core::Names::unresolvedAncestors()) {
             continue;
         }
-        auto defLoc = sym.loc(gs);
-        if (auto e = gs.beginError(defLoc, core::errors::Resolver::FinalModuleNonFinalMethod)) {
+        auto defLoc = sym.loc(ctx);
+        if (auto e = ctx.state.beginError(defLoc, core::errors::Resolver::FinalModuleNonFinalMethod)) {
             e.setHeader("`{}` was declared as final but its method `{}` was not declared as final",
-                        errMsgClass.show(gs), sym.name(gs).show(gs));
+                        errMsgClass.show(ctx), sym.name(ctx).show(ctx));
+            auto queryLoc = defLoc.copyWithZeroLength();
+            auto parsedSig = sig_finder::SigFinder::findSignature(ctx, tree, queryLoc);
 
-            // We don't have a direct link to the signature for the method, so we
-            // heuristically look for the matching signature.
-            auto source = defLoc.file().data(gs).source();
-            core::LocOffsets sigLocOffsets;
-
-            // We only care about everything prior to the definition.
-            auto line_end = defLoc.beginPos();
-            auto prev_line_end = source.rfind('\n', line_end);
-            bool startFromDefinition = true;
-            while (prev_line_end != source.npos) {
-                auto line_start = prev_line_end + 1;
-                auto line = source.substr(line_start, line_end - line_start);
-                line = absl::StripAsciiWhitespace(line);
-                // We do not skip empty lines, contra LSP's documentation finder.
-                // But as we are starting from just before the method definition,
-                // the beginning of that line could look like an empty line, and
-                // we want to move to the previous line in that case.
-                if (line.empty()) {
-                    if (!startFromDefinition) {
-                        break;
-                    }
-                    line_end = prev_line_end;
-                    prev_line_end = source.rfind('\n', line_end - 1);
-                    startFromDefinition = false;
-                    continue;
-                }
-
-                const auto singleLineSig = "sig"sv;
-                const uint32_t singleLineSigSize = singleLineSig.size();
-                const auto alreadyFinalSig = "sig(:final)"sv;
-                const auto multiLineSigEnd = "end"sv;
-                const auto multiLineSigStart = "sig do"sv;
-
-                // If something went wrong, we might find ourselves looking at an
-                // existing `sig(:final)`.  Bail instead of suggesting an autocorrect
-                // to an already final sig.
-                if (absl::StartsWith(line, alreadyFinalSig)) {
-                    break;
-                }
-
-                if (absl::StartsWith(line, singleLineSig)) {
-                    uint32_t offset = line.data() - source.data();
-                    sigLocOffsets = core::LocOffsets{offset, offset + singleLineSigSize};
-                    break;
-                }
-
-                if (absl::StartsWith(line, multiLineSigEnd)) {
-                    // Loop backwards searching for the matching `sig do`.  We're
-                    // going to:
-                    // - Find it;
-                    // - Hit an `end` or an already-final sig;
-                    // - Hit the start of the file.
-                    line_end = prev_line_end;
-                    prev_line_end = source.rfind('\n', line_end - 1);
-                    while (prev_line_end != source.npos) {
-                        auto line_start = prev_line_end + 1;
-                        line = source.substr(line_start, line_end - line_start);
-                        line = absl::StripAsciiWhitespace(line);
-
-                        // Found the start of the multi-line sig we were looking for.
-                        if (absl::StartsWith(line, multiLineSigStart)) {
-                            uint32_t offset = line.data() - source.data();
-                            sigLocOffsets = core::LocOffsets{offset, offset + singleLineSigSize};
-                            break;
-                        }
-
-                        if (absl::StartsWith(line, alreadyFinalSig)) {
-                            break;
-                        }
-
-                        // We hit an `end` in a place we didn't expect.  Bail.
-                        if (absl::StartsWith(line, multiLineSigEnd)) {
-                            break;
-                        }
-
-                        line_end = prev_line_end;
-                        prev_line_end = source.rfind('\n', line_end - 1);
-                    }
-
-                    // However we exited the above loop, we are done.
-                    break;
-                }
-
-                // If we find anything else, even a blank line, assume that the heuristic
-                // has failed.
-                break;
-            }
-
-            if (sigLocOffsets.exists()) {
-                e.replaceWith("Mark it as `sig(:final)`", core::Loc{defLoc.file(), sigLocOffsets}, "sig(:final)");
+            if (parsedSig.has_value() && parsedSig->origSend->funLoc.exists()) {
+                auto funLoc = ctx.locAt(parsedSig->origSend->funLoc);
+                e.replaceWith("Mark it as `sig(:final)`", funLoc, "sig(:final)");
             }
         }
     }
 }
 
-void validateFinal(core::Context ctx, const core::ClassOrModuleRef klass, const ast::ClassDef &classDef) {
+void validateFinal(core::Context ctx, const core::ClassOrModuleRef klass, ast::ExpressionPtr &tree) {
+    const ast::ClassDef &classDef = ast::cast_tree_nonnull<ast::ClassDef>(tree);
     const auto superClass = klass.data(ctx)->superClass();
-    if (superClass.exists() && superClass.data(ctx)->isClassOrModuleFinal()) {
-        if (auto e = ctx.beginError(getAncestorLoc(ctx, classDef, superClass), core::errors::Resolver::FinalAncestor)) {
-            e.setHeader("`{}` was declared as final and cannot be inherited by `{}`", superClass.show(ctx),
-                        klass.show(ctx));
-            e.addErrorLine(superClass.data(ctx)->loc(), "`{}` defined here", superClass.show(ctx));
+    if (superClass.exists()) {
+        auto superClassData = superClass.data(ctx);
+        if (superClassData->flags.isFinal) {
+            if (auto e =
+                    ctx.beginError(getAncestorLoc(ctx, classDef, superClass), core::errors::Resolver::FinalAncestor)) {
+                e.setHeader("`{}` was declared as final and cannot be inherited by `{}`", superClass.show(ctx),
+                            klass.show(ctx));
+                e.addErrorLine(superClassData->loc(), "`{}` defined here", superClass.show(ctx));
+            }
+        } else if (superClass != core::Symbols::T_Enum() && superClassData->derivesFrom(ctx, core::Symbols::T_Enum()) &&
+                   !klass.data(ctx)->name.isTEnumName(ctx)) {
+            // We can't have the T::Enum rewriter pretend that the class with `enums do` is `final!` because it
+            // is actually subclassed (for the sake of making a subclass for each enum value). But the runtime
+            // will raise in this situation, so let's add a matching static error.
+            if (auto e =
+                    ctx.beginError(getAncestorLoc(ctx, classDef, superClass), core::errors::Resolver::FinalAncestor)) {
+                e.setHeader("`{}` descends from `{}` and thus cannot be subclassed by `{}`", superClass.show(ctx),
+                            "T::Enum", klass.show(ctx));
+                e.addErrorLine(superClassData->loc(), "`{}` defined here", superClass.show(ctx));
+            }
         }
     }
     validateFinalAncestorHelper(ctx, klass, classDef, klass, "included");
-    validateFinalMethodHelper(ctx, klass, klass);
+    validateFinalMethodHelper(ctx, klass, tree, klass);
     const auto singleton = klass.data(ctx)->lookupSingletonClass(ctx);
     validateFinalAncestorHelper(ctx, singleton, classDef, klass, "extended");
-    validateFinalMethodHelper(ctx, singleton, klass);
+    validateFinalMethodHelper(ctx, singleton, tree, klass);
 }
 
 // Ignore RBI files for the purpose of checking sealed (unless there are no other files).
@@ -554,7 +615,7 @@ core::FileRef bestNonRBIFile(core::Context ctx, const core::ClassOrModuleRef kla
 void validateSealedAncestorHelper(core::Context ctx, const core::ClassOrModuleRef klass, const ast::ClassDef &classDef,
                                   const core::ClassOrModuleRef errMsgClass, const string_view verb) {
     for (const auto &mixin : klass.data(ctx)->mixins()) {
-        if (!mixin.data(ctx)->isClassOrModuleSealed()) {
+        if (!mixin.data(ctx)->flags.isSealed) {
             continue;
         }
 
@@ -581,8 +642,7 @@ void validateSealedAncestorHelper(core::Context ctx, const core::ClassOrModuleRe
 
 void validateSealed(core::Context ctx, const core::ClassOrModuleRef klass, const ast::ClassDef &classDef) {
     const auto superClass = klass.data(ctx)->superClass();
-
-    if (superClass.exists() && superClass.data(ctx)->isClassOrModuleSealed()) {
+    if (superClass.exists() && superClass.data(ctx)->flags.isSealed) {
         auto file = bestNonRBIFile(ctx, klass);
 
         // Normally we would skip RBIs for the purpose of checking `sealed!`, but when running in stripe-packages mode
@@ -611,7 +671,7 @@ void validateSealed(core::Context ctx, const core::ClassOrModuleRef klass, const
 }
 
 void validateSuperClass(core::Context ctx, const core::ClassOrModuleRef sym, const ast::ClassDef &classDef) {
-    if (!sym.data(ctx)->isClassOrModuleClass()) {
+    if (!sym.data(ctx)->isClass()) {
         // In this case, a class with the same name as a module has been defined, and we'll already have raised an error
         // in the namer.
         return;
@@ -666,7 +726,7 @@ void validateUselessRequiredAncestors(core::Context ctx, const core::ClassOrModu
         if (data->derivesFrom(ctx, req.symbol)) {
             if (auto e = ctx.state.beginError(req.loc, core::errors::Resolver::UselessRequiredAncestor)) {
                 e.setHeader("`{}` is already {} by `{}`", req.symbol.show(ctx),
-                            req.symbol.data(ctx)->isClassOrModuleModule() ? "included" : "inherited", sym.show(ctx));
+                            req.symbol.data(ctx)->isModule() ? "included" : "inherited", sym.show(ctx));
             }
         }
     }
@@ -674,14 +734,14 @@ void validateUselessRequiredAncestors(core::Context ctx, const core::ClassOrModu
 
 void validateUnsatisfiedRequiredAncestors(core::Context ctx, const core::ClassOrModuleRef sym) {
     auto data = sym.data(ctx);
-    if (data->isClassOrModuleModule() || data->isClassOrModuleAbstract()) {
+    if (data->isModule() || data->flags.isAbstract) {
         return;
     }
     for (auto req : data->requiredAncestorsTransitive(ctx)) {
         if (sym != req.symbol && !data->derivesFrom(ctx, req.symbol)) {
             if (auto e = ctx.state.beginError(data->loc(), core::errors::Resolver::UnsatisfiedRequiredAncestor)) {
                 e.setHeader("`{}` must {} `{}` (required by `{}`)", sym.show(ctx),
-                            req.symbol.data(ctx)->isClassOrModuleModule() ? "include" : "inherit", req.symbol.show(ctx),
+                            req.symbol.data(ctx)->isModule() ? "include" : "inherit", req.symbol.show(ctx),
                             req.origin.show(ctx));
                 e.addErrorLine(req.loc, "required by `{}` here", req.origin.show(ctx));
             }
@@ -692,13 +752,16 @@ void validateUnsatisfiedRequiredAncestors(core::Context ctx, const core::ClassOr
 void validateUnsatisfiableRequiredAncestors(core::Context ctx, const core::ClassOrModuleRef sym) {
     auto data = sym.data(ctx);
 
-    vector<core::Symbol::RequiredAncestor> requiredClasses;
+    vector<core::ClassOrModule::RequiredAncestor> requiredClasses;
     for (auto ancst : data->requiredAncestorsTransitive(ctx)) {
-        if (ancst.symbol.data(ctx)->isClassOrModuleClass()) {
+        if (ancst.symbol.data(ctx)->isClass()) {
             requiredClasses.emplace_back(ancst);
         }
 
-        if (ancst.symbol.data(ctx)->typeArity(ctx) > 0) {
+        auto isSingletonClass = ancst.symbol.data(ctx)->isSingletonClass(ctx);
+        auto typeArity = ancst.symbol.data(ctx)->typeArity(ctx);
+
+        if ((isSingletonClass && typeArity > 1) || (!isSingletonClass && typeArity > 0)) {
             if (auto e = ctx.state.beginError(data->loc(), core::errors::Resolver::UnsatisfiableRequiredAncestor)) {
                 e.setHeader("`{}` can't require generic ancestor `{}` (unsupported)", sym.show(ctx),
                             ancst.symbol.show(ctx));
@@ -708,7 +771,7 @@ void validateUnsatisfiableRequiredAncestors(core::Context ctx, const core::Class
         }
     }
 
-    if (data->isClassOrModuleClass() && data->isClassOrModuleAbstract()) {
+    if (data->isClass() && data->flags.isAbstract) {
         for (auto ancst : requiredClasses) {
             if (!sym.data(ctx)->derivesFrom(ctx, ancst.symbol) && !ancst.symbol.data(ctx)->derivesFrom(ctx, sym)) {
                 if (auto e = ctx.state.beginError(data->loc(), core::errors::Resolver::UnsatisfiableRequiredAncestor)) {
@@ -734,7 +797,7 @@ void validateUnsatisfiableRequiredAncestors(core::Context ctx, const core::Class
                 if (auto e = ctx.state.beginError(data->loc(), core::errors::Resolver::UnsatisfiableRequiredAncestor)) {
                     e.setHeader("`{}` requires unrelated classes `{}` and `{}` making it impossible to {}",
                                 sym.show(ctx), ra1.symbol.show(ctx), ra2.symbol.show(ctx),
-                                data->isClassOrModuleModule() ? "include" : "inherit");
+                                data->isModule() ? "include" : "inherit");
                     e.addErrorLine(ra1.loc, "`{}` is required by `{}` here", ra1.symbol.show(ctx),
                                    ra1.origin.show(ctx));
                     e.addErrorLine(ra2.loc, "`{}` is required by `{}` here", ra2.symbol.show(ctx),
@@ -776,10 +839,18 @@ private:
             abstract.insert(abstract.end(), fromMixin.begin(), fromMixin.end());
         }
 
-        auto isAbstract = klass.data(gs)->isClassOrModuleAbstract();
+        auto isAbstract = klass.data(gs)->flags.isAbstract;
         if (isAbstract) {
             for (auto [name, sym] : klass.data(gs)->members()) {
-                if (sym.exists() && sym.isMethod() && sym.asMethodRef().data(gs)->flags.isAbstract) {
+                if (!sym.exists() || !sym.isMethod()) {
+                    continue;
+                }
+                const auto &method = sym.asMethodRef().data(gs);
+                if (method->flags.isAbstract &&
+                    // Ignore mangle renames, because users shouldn't have to create *another*
+                    // mangle rename error in order to implement such an abstract method.
+                    !(method->name.kind() == core::NameKind::UNIQUE &&
+                      method->name.dataUnique(gs)->uniqueNameKind == core::UniqueNameKind::MangleRename)) {
                     abstract.emplace_back(sym.asMethodRef());
                 }
             }
@@ -809,7 +880,7 @@ private:
     }
 
     void validateAbstract(const core::GlobalState &gs, core::ClassOrModuleRef sym) {
-        if (sym.data(gs)->isClassOrModuleAbstract()) {
+        if (sym.data(gs)->flags.isAbstract) {
             return;
         }
         auto loc = sym.data(gs)->loc();
@@ -839,7 +910,7 @@ private:
     }
 
 public:
-    ast::ExpressionPtr preTransformClassDef(core::Context ctx, ast::ExpressionPtr tree) {
+    void preTransformClassDef(core::Context ctx, ast::ExpressionPtr &tree) {
         auto &classDef = ast::cast_tree_nonnull<ast::ClassDef>(tree);
         auto sym = classDef.symbol;
         auto singleton = sym.data(ctx)->lookupSingletonClass(ctx);
@@ -854,20 +925,28 @@ public:
             }
         }
         validateAbstract(ctx, singleton);
-        validateFinal(ctx, sym, classDef);
+        validateFinal(ctx, sym, tree);
         validateSealed(ctx, sym, classDef);
         validateSuperClass(ctx, sym, classDef);
 
         if (ctx.state.requiresAncestorEnabled) {
             validateRequiredAncestors(ctx, singleton);
         }
-        return tree;
     }
 
-    ast::ExpressionPtr preTransformMethodDef(core::Context ctx, ast::ExpressionPtr tree) {
+    void preTransformMethodDef(core::Context ctx, ast::ExpressionPtr &tree) {
         auto &methodDef = ast::cast_tree_nonnull<ast::MethodDef>(tree);
         auto methodData = methodDef.symbol.data(ctx);
         auto ownerData = methodData->owner.data(ctx);
+
+        if (methodData->locs().empty()) {
+            Exception::raise("method has no locs! ctx.file=\"{}\" method=\"{}\"", ctx.file.data(ctx).path(),
+                             methodDef.symbol.show(ctx));
+        }
+        if (!methodData->loc().file().exists()) {
+            Exception::raise("file for method does not exist! ctx.file=\"{}\" method=\"{}\"", ctx.file.data(ctx).path(),
+                             methodDef.symbol.show(ctx));
+        }
 
         // Only perform this check if this isn't a module from the stdlib, and
         // if there are type members in the owning context.
@@ -879,7 +958,6 @@ public:
         }
 
         validateOverriding(ctx, methodDef.symbol);
-        return tree;
     }
 };
 } // namespace
@@ -888,7 +966,7 @@ ast::ParsedFile runOne(core::Context ctx, ast::ParsedFile tree) {
     Timer timeit(ctx.state.tracer(), "validateSymbols");
 
     ValidateWalk validate;
-    tree.tree = ast::ShallowMap::apply(ctx, validate, std::move(tree.tree));
+    ast::ShallowWalk::apply(ctx, validate, tree.tree);
     return tree;
 }
 

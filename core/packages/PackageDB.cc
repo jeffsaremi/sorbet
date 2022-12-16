@@ -1,5 +1,6 @@
 #include "core/packages/PackageDB.h"
 #include "absl/strings/match.h"
+#include "absl/strings/str_replace.h"
 #include "common/sort.h"
 #include "core/AutocorrectSuggestion.h"
 #include "core/GlobalState.h"
@@ -31,7 +32,12 @@ public:
         return make_unique<NonePackage>();
     }
 
-    Loc definitionLoc() const {
+    Loc fullLoc() const {
+        notImplemented();
+        return Loc::none();
+    }
+
+    Loc declLoc() const {
         notImplemented();
         return Loc::none();
     }
@@ -42,13 +48,8 @@ public:
         return nullopt;
     }
 
-    vector<MissingExportMatch> findMissingExports(core::Context ctx, core::SymbolRef scope, core::NameRef name) const {
-        notImplemented();
-        return {};
-    }
-
-    std::optional<core::AutocorrectSuggestion> addExport(const core::GlobalState &gs, const core::SymbolRef name,
-                                                         bool isPrivateTestExport) const {
+    std::optional<core::AutocorrectSuggestion> addExport(const core::GlobalState &gs,
+                                                         const core::SymbolRef name) const {
         return {};
     }
 
@@ -57,10 +58,12 @@ public:
         return false;
     }
 
-    std::vector<std::vector<core::NameRef>> exports() const {
-        return vector<vector<core::NameRef>>();
+    bool strictAutoloaderCompatibility() const {
+        notImplemented();
+        return false;
     }
-    std::vector<std::vector<core::NameRef>> testExports() const {
+
+    std::vector<std::vector<core::NameRef>> exports() const {
         return vector<vector<core::NameRef>>();
     }
     std::vector<std::vector<core::NameRef>> imports() const {
@@ -70,7 +73,7 @@ public:
         return vector<vector<core::NameRef>>();
     }
 
-    std::optional<ImportType> importsPackage(const PackageInfo &other) const {
+    std::optional<ImportType> importsPackage(core::NameRef mangledName) const {
         notImplemented();
         return nullopt;
     }
@@ -119,7 +122,7 @@ NameRef PackageDB::enterPackage(unique_ptr<PackageInfo> pkg) {
         // we always run slow-path and fully rebuild the set of packages. In some cases, the LSP
         // fast-path may re-run on an unchanged package file. Sanity check to ensure the loc and
         // prefixes are the same.
-        ENFORCE(prev->second->definitionLoc() == pkg->definitionLoc());
+        ENFORCE(prev->second->declLoc() == pkg->declLoc());
         ENFORCE(prev->second->pathPrefixes() == pkg->pathPrefixes());
     }
     packages_[nr] = move(pkg);
@@ -127,18 +130,39 @@ NameRef PackageDB::enterPackage(unique_ptr<PackageInfo> pkg) {
     return nr;
 }
 
-NameRef PackageDB::lookupPackage(NameRef pkgMangledName) const {
-    ENFORCE(pkgMangledName.exists());
-    auto it = packages_.find(pkgMangledName);
-    if (it == packages_.end()) {
+const NameRef PackageDB::getPackageNameForFile(FileRef file) const {
+    if (this->packageForFile_.size() <= file.id()) {
         return NameRef::noName();
     }
-    return it->first;
+
+    return this->packageForFile_[file.id()];
+}
+
+void PackageDB::setPackageNameForFile(FileRef file, NameRef mangledName) {
+    if (this->packageForFile_.size() <= file.id()) {
+        this->packageForFile_.resize(file.id() + 1, NameRef::noName());
+    }
+
+    this->packageForFile_[file.id()] = mangledName;
 }
 
 const PackageInfo &PackageDB::getPackageForFile(const core::GlobalState &gs, core::FileRef file) const {
     ENFORCE(frozen);
-    auto &fileData = file.data(gs);
+
+    // If we already have the package name cached, we can skip the slow path below. As this function is const, we cannot
+    // update the vector if we fall back on the slow path.
+    auto name = this->getPackageNameForFile(file);
+    if (name.exists()) {
+        return this->getPackageInfo(name);
+    }
+
+    // Note about safety: we're only using the file data for two pieces of information: the file path and the
+    // sourceType. The path is present even on unloaded files, and the sourceType we're interested in is `Package`,
+    // which will have been loaded by a previous step for the packageDB to be valid.
+    //
+    // See https://github.com/sorbet/sorbet/pull/5291 for more information.
+    auto &fileData = file.dataAllowingUnsafe(gs);
+
     string_view path = fileData.path();
     int curPrefixPos = path.find_last_of('/');
     while (curPrefixPos > 0) {
@@ -149,13 +173,32 @@ const PackageInfo &PackageDB::getPackageForFile(const core::GlobalState &gs, cor
             return pkg;
         }
 
-        if (fileData.sourceType == core::File::Type::Package) {
+        if (fileData.isPackage()) {
             // When looking up a `__package.rb` file do not search parent directories
             break;
         }
         curPrefixPos = path.find_last_of('/', curPrefixPos - 1);
     }
     return NONE_PKG;
+}
+
+const PackageInfo &PackageDB::getPackageInfo(const core::GlobalState &gs, std::string_view nameStr) const {
+    auto mangled = absl::StrCat(absl::StrReplaceAll(nameStr, {{"::", "_"}}), core::PACKAGE_SUFFIX);
+    auto utf8Name = gs.lookupNameUTF8(mangled);
+    if (!utf8Name.exists()) {
+        return NONE_PKG;
+    }
+
+    auto packagerName = gs.lookupNameUnique(core::UniqueNameKind::Packager, utf8Name, 1);
+    if (!packagerName.exists()) {
+        return NONE_PKG;
+    }
+
+    auto cnst = gs.lookupNameConstant(packagerName);
+    if (!cnst.exists()) {
+        return NONE_PKG;
+    }
+    return getPackageInfo(cnst);
 }
 
 const PackageInfo &PackageDB::getPackageInfo(core::NameRef mangledName) const {
@@ -178,8 +221,16 @@ const std::vector<core::NameRef> &PackageDB::secondaryTestPackageNamespaceRefs()
     return secondaryTestPackageNamespaceRefs_;
 }
 
-const std::vector<std::string> &PackageDB::extraPackageFilesDirectoryPrefixes() const {
-    return extraPackageFilesDirectoryPrefixes_;
+const std::vector<std::string> &PackageDB::skipRBIExportEnforcementDirs() const {
+    return skipRBIExportEnforcementDirs_;
+}
+
+const std::vector<std::string> &PackageDB::extraPackageFilesDirectoryUnderscorePrefixes() const {
+    return extraPackageFilesDirectoryUnderscorePrefixes_;
+}
+
+const std::vector<std::string> &PackageDB::extraPackageFilesDirectorySlashPrefixes() const {
+    return extraPackageFilesDirectorySlashPrefixes_;
 }
 
 const std::string_view PackageDB::errorHint() const {
@@ -194,7 +245,8 @@ PackageDB PackageDB::deepCopy() const {
         result.packages_[nr] = pkgInfo->deepCopy();
     }
     result.secondaryTestPackageNamespaceRefs_ = this->secondaryTestPackageNamespaceRefs_;
-    result.extraPackageFilesDirectoryPrefixes_ = this->extraPackageFilesDirectoryPrefixes_;
+    result.extraPackageFilesDirectoryUnderscorePrefixes_ = this->extraPackageFilesDirectoryUnderscorePrefixes_;
+    result.extraPackageFilesDirectorySlashPrefixes_ = this->extraPackageFilesDirectorySlashPrefixes_;
     result.packagesByPathPrefix = this->packagesByPathPrefix;
     result.mangledNames = this->mangledNames;
     result.errorHint_ = this->errorHint_;

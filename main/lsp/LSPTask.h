@@ -1,8 +1,10 @@
 #ifndef RUBY_TYPER_LSPTASK_H
 #define RUBY_TYPER_LSPTASK_H
 
+#include "main/lsp/AbstractRenamer.h"
 #include "main/lsp/LSPMessage.h"
 #include "main/lsp/LSPTypechecker.h"
+#include "main/lsp/json_types.h"
 
 namespace absl {
 class Notification;
@@ -37,6 +39,12 @@ protected:
     std::vector<std::unique_ptr<core::lsp::QueryResponse>>
     getReferencesToSymbol(LSPTypecheckerDelegate &typechecker, core::SymbolRef symbol,
                           std::vector<std::unique_ptr<core::lsp::QueryResponse>> &&priorRefs = {}) const;
+
+    std::vector<std::unique_ptr<core::lsp::QueryResponse>>
+    getReferencesToSymbolInPackage(LSPTypecheckerDelegate &typechecker, core::NameRef packageName,
+                                   core::SymbolRef symbol,
+                                   std::vector<std::unique_ptr<core::lsp::QueryResponse>> &&priorRefs = {}) const;
+
     std::vector<std::unique_ptr<core::lsp::QueryResponse>>
     getReferencesToSymbolInFile(LSPTypecheckerDelegate &typechecker, core::FileRef file, core::SymbolRef symbol,
                                 std::vector<std::unique_ptr<core::lsp::QueryResponse>> &&priorRefs = {}) const;
@@ -49,15 +57,6 @@ protected:
     extractLocations(const core::GlobalState &gs,
                      const std::vector<std::unique_ptr<core::lsp::QueryResponse>> &queryResponses,
                      std::vector<std::unique_ptr<Location>> locations = {}) const;
-    std::vector<std::unique_ptr<core::lsp::QueryResponse>>
-    filterAndDedup(const core::GlobalState &gs,
-                   const std::vector<std::unique_ptr<core::lsp::QueryResponse>> &queryResponses) const;
-
-    LSPQueryResult queryByLoc(LSPTypecheckerDelegate &typechecker, std::string_view uri, const Position &pos,
-                              LSPMethod forMethod, bool errorIfFileIsUntyped = true) const;
-    LSPQueryResult queryBySymbolInFiles(LSPTypecheckerDelegate &typechecker, core::SymbolRef symbol,
-                                        std::vector<core::FileRef> frefs) const;
-    LSPQueryResult queryBySymbol(LSPTypecheckerDelegate &typechecker, core::SymbolRef symbol) const;
 
     // Given a method or field symbol, checks if the symbol belongs to a `prop`, `const`, `attr_reader`, `attr_writer`,
     // etc, and populates an AccessorInfo object.
@@ -146,6 +145,10 @@ public:
     bool cancel(const MessageId &id) override;
 };
 
+// Doubles as the `methodString` for a `TextDocumentCompletion` LSPTask and also as
+// the prefix for any metrics collected during completion itself.
+#define LSP_COMPLETION_METRICS_PREFIX "textDocument.completion"
+
 /**
  * A special form of LSPTask that has direct access to the typechecker and controls its own scheduling.
  * Is only used for slow path-related tasks. Do not use for anything else.
@@ -164,20 +167,19 @@ public:
 };
 
 class LSPIndexer;
-struct TaskQueueState;
+class TaskQueue;
 
 /**
- * Represents a preemption task. When run, it will run all tasks at the head of TaskQueueState that can preempt.
+ * Represents a preemption task. When run, it will run all tasks at the head of `taskQueue` that can preempt.
  */
 class LSPQueuePreemptionTask final : public LSPTask {
     absl::Notification &finished;
-    absl::Mutex &taskQueueMutex;
-    TaskQueueState &taskQueue GUARDED_BY(taskQueueMutex);
+    TaskQueue &taskQueue;
     LSPIndexer &indexer;
 
 public:
-    LSPQueuePreemptionTask(const LSPConfiguration &config, absl::Notification &finished, absl::Mutex &taskQueueMutex,
-                           TaskQueueState &taskQueue, LSPIndexer &indexer);
+    LSPQueuePreemptionTask(const LSPConfiguration &config, absl::Notification &finished, TaskQueue &taskQueue,
+                           LSPIndexer &indexer);
 
     void run(LSPTypecheckerDelegate &tc) override;
 };

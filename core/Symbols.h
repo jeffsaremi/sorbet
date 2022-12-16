@@ -2,8 +2,10 @@
 #define SORBET_SYMBOLS_H
 
 #include "common/common.h"
+#include "core/ArityHash.h"
 #include "core/Loc.h"
 #include "core/Names.h"
+#include "core/Polarity.h"
 #include "core/SymbolRef.h"
 #include "core/Types.h"
 #include <memory>
@@ -11,10 +13,9 @@
 #include <vector>
 
 namespace sorbet::core {
-class Symbol;
+class ClassOrModule;
 class GlobalState;
-struct GlobalStateHash;
-class Type;
+struct LocalSymbolTableHashes;
 class MutableContext;
 class Context;
 class TypeAndOrigins;
@@ -27,10 +28,18 @@ class SerializerImpl;
 }
 class IntrinsicMethod {
 public:
+    // A list of method names that this intrinsic dispatches to.
+    // Used to ensure that calls involving intrinsics are correctly typechecked on the fast path.
+    //
+    // If your intrinsic does not dispatch to another method, the default implementation returns an
+    // empty vector, so you can elide an implementation.
+    //
+    // If your intrinsic cannot declare the list of methods it might dispatch to (like
+    // `<call-with-splat>`, etc.), you will have to edit Substitute.cc.
+    virtual std::vector<NameRef> dispatchesTo() const;
+
     virtual void apply(const GlobalState &gs, const DispatchArgs &args, DispatchResult &res) const = 0;
 };
-
-enum class Variance { CoVariant = 1, ContraVariant = -1, Invariant = 0 };
 
 enum class Visibility : uint8_t {
     Public = 1,
@@ -39,11 +48,17 @@ enum class Visibility : uint8_t {
 };
 
 class Method final {
-public:
-    friend class Symbol;
+    friend class ClassOrModule;
+    friend class GlobalState;
     friend class serialize::SerializerImpl;
 
+    // This is to allow updating `GlobalState::methods` in place with a new method,
+    // over top of an existing method
+    Method &operator=(Method &&) = default;
+
+public:
     Method(const Method &) = delete;
+    Method &operator=(const Method &) = delete;
     Method() = default;
     Method(Method &&) noexcept = default;
     class Flags {
@@ -80,11 +95,12 @@ public:
     CheckSize(Flags, 2, 1);
 
     Loc loc() const;
-    const InlinedVector<Loc, 2> &locs() const;
+    const SymbolRef::LOC_store &locs() const;
     void addLoc(const core::GlobalState &gs, core::Loc loc);
+    void removeLocsForFile(core::FileRef file);
     uint32_t hash(const GlobalState &gs) const;
     uint32_t methodShapeHash(const GlobalState &gs) const;
-    std::vector<uint32_t> methodArgumentHash(const GlobalState &gs) const;
+    ArityHash methodArityHash(const GlobalState &gs) const;
 
     inline void setMethodPublic() {
         flags.isPrivate = false;
@@ -138,30 +154,63 @@ public:
     bool ignoreInHashing(const GlobalState &gs) const;
     bool isPrintable(const GlobalState &gs) const;
 
+    // Equivalent to `getIntrinsic() != nullptr`, but potentially more efficient.
+    bool hasIntrinsic() const;
+    // All `IntrinsicMethod`s in sorbet should be statically allocated, which is
+    // why raw pointers are safe.
+    const IntrinsicMethod *getIntrinsic() const;
+
     ClassOrModuleRef owner;
     NameRef name;
     ClassOrModuleRef rebind;
+    Flags flags;
+    // We store an offset into the intrinsic table used by calls.cc; the only
+    // wrinkle is that our offset here is the offset of the intrinsic + 1, so
+    // zero represents "no intrinsic".  This storage system assumes we will
+    // always have < 2^16 intrinsics, which ought to be enough for anybody.
+    const static uint16_t INVALID_INTRINSIC_OFFSET = 0;
+    const static uint16_t FIRST_VALID_INTRINSIC_OFFSET = 1;
+    uint16_t intrinsicOffset = INVALID_INTRINSIC_OFFSET;
     TypePtr resultType;
-    // All `IntrinsicMethod`s in sorbet should be statically-allocated, which is
-    // why raw pointers are safe.
-    const IntrinsicMethod *intrinsic = nullptr;
     ArgumentsStore arguments;
-    InlinedVector<TypeArgumentRef, 4> typeArguments;
+
+    InlinedVector<TypeArgumentRef, 4> &getOrCreateTypeArguments() {
+        if (typeArgs) {
+            return *typeArgs;
+        }
+        typeArgs = std::make_unique<InlinedVector<TypeArgumentRef, 4>>();
+        return *typeArgs;
+    }
+
+    absl::Span<const TypeArgumentRef> typeArguments() const {
+        if (typeArgs) {
+            return *typeArgs;
+        }
+        return {};
+    }
+
+    InlinedVector<TypeArgumentRef, 4> &existingTypeArguments() {
+        ENFORCE(typeArgs != nullptr);
+        return *typeArgs;
+    }
 
 private:
-    InlinedVector<Loc, 2> locs_;
-
-public:
-    Flags flags;
+    SymbolRef::LOC_store locs_;
+    std::unique_ptr<InlinedVector<TypeArgumentRef, 4>> typeArgs;
 };
-CheckSize(Method, 192, 8);
+CheckSize(Method, 136, 8);
 
 // Contains a field or a static field
 class Field final {
+    friend class GlobalState;
     friend class serialize::SerializerImpl;
+
+    // This is to allow updating `GlobalState::fields` in place with a new field, over top of an existing field
+    Field &operator=(Field &&) = default;
 
 public:
     Field(const Field &) = delete;
+    Field &operator=(const Field &) = delete;
     Field() = default;
     Field(Field &&) noexcept = default;
 
@@ -174,11 +223,14 @@ public:
         bool isStaticFieldTypeAlias : 1;
         bool isStaticFieldPrivate : 1;
 
-        constexpr static uint8_t NUMBER_OF_FLAGS = 4;
+        bool isExported : 1;
+
+        constexpr static uint8_t NUMBER_OF_FLAGS = 5;
         constexpr static uint8_t VALID_BITS_MASK = (1 << NUMBER_OF_FLAGS) - 1;
 
         Flags() noexcept
-            : isField(false), isStaticField(false), isStaticFieldTypeAlias(false), isStaticFieldPrivate(false) {}
+            : isField(false), isStaticField(false), isStaticFieldTypeAlias(false), isStaticFieldPrivate(false),
+              isExported(false) {}
 
         uint8_t serialize() const {
             ENFORCE(sizeof(Flags) == sizeof(uint8_t));
@@ -191,10 +243,14 @@ public:
     CheckSize(Flags, 1, 1);
 
     Loc loc() const;
-    const InlinedVector<Loc, 2> &locs() const;
+    const SymbolRef::LOC_store &locs() const;
     void addLoc(const core::GlobalState &gs, core::Loc loc);
+    void removeLocsForFile(core::FileRef file);
+
+    bool isClassAlias() const;
 
     uint32_t hash(const GlobalState &gs) const;
+    uint32_t fieldShapeHash(const GlobalState &gs) const;
 
     void sanityCheck(const GlobalState &gs) const;
 
@@ -211,76 +267,146 @@ public:
     TypePtr resultType;
 
 private:
-    InlinedVector<Loc, 2> locs_;
+    SymbolRef::LOC_store locs_;
 
 public:
     Flags flags;
 };
-CheckSize(Field, 64, 8);
+CheckSize(Field, 56, 8);
 
-class Symbol final {
+class TypeParameter final {
+    friend class GlobalState;
+    friend class serialize::SerializerImpl;
+
+    // This is to allow updating `GlobalState::typeArguments` in place with a new type argument,
+    // over top of an existing method
+    TypeParameter &operator=(TypeParameter &&) = default;
+
 public:
-    Symbol(const Symbol &) = delete;
-    Symbol() = default;
-    Symbol(Symbol &&) noexcept = default;
+    TypeParameter(const TypeParameter &) = delete;
+    TypeParameter() = default;
+    TypeParameter(TypeParameter &&) noexcept = default;
 
     class Flags {
     public:
-        static constexpr uint32_t NONE = 0;
-
-        // We're packing three different kinds of flags into separate ranges with the uint32_t's below:
-        //
-        // 0x0000'0000
-        //   ├▶    ◀┤└─ Applies to all types of symbol
-        //   │      │
-        //   │      └─ For our current symbol type, what flags does it have?
-        //   │         (New flags grow up towards MSB)
-        //   │
-        //   └─ What type of symbol is this?
-        //      (New flags grow down towards LSB)
-        //
-
-        // --- What type of symbol is this? ---
-        static constexpr uint32_t CLASS_OR_MODULE = 0x8000'0000;
-        static constexpr uint32_t TYPE_ARGUMENT = 0x0800'0000;
-        static constexpr uint32_t TYPE_MEMBER = 0x0400'0000;
-
-        // --- Applies to all types of Symbols ---
-
-        // Synthesized by C++ code in a Rewriter pass
-        static constexpr uint32_t REWRITER_SYNTHESIZED = 0x0000'0001;
-
-        // --- For our current symbol type, what flags does it have?
-
-        // Class flags
-        static constexpr uint32_t CLASS_OR_MODULE_CLASS = 0x0000'0010;
-        static constexpr uint32_t CLASS_OR_MODULE_MODULE = 0x0000'0020;
-        static constexpr uint32_t CLASS_OR_MODULE_ABSTRACT = 0x0000'0040;
-        static constexpr uint32_t CLASS_OR_MODULE_INTERFACE = 0x0000'0080;
-        static constexpr uint32_t CLASS_OR_MODULE_LINEARIZATION_COMPUTED = 0x0000'0100;
-        static constexpr uint32_t CLASS_OR_MODULE_FINAL = 0x0000'0200;
-        static constexpr uint32_t CLASS_OR_MODULE_SEALED = 0x0000'0400;
-        static constexpr uint32_t CLASS_OR_MODULE_PRIVATE = 0x0000'0800;
-        static constexpr uint32_t CLASS_OR_MODULE_UNDECLARED = 0x0000'1000;
+        bool isTypeArgument : 1;
+        bool isTypeMember : 1;
 
         // Type flags
-        static constexpr uint32_t TYPE_COVARIANT = 0x0000'0010;
-        static constexpr uint32_t TYPE_INVARIANT = 0x0000'0020;
-        static constexpr uint32_t TYPE_CONTRAVARIANT = 0x0000'0040;
-        static constexpr uint32_t TYPE_FIXED = 0x0000'0080;
+        bool isCovariant : 1;
+        bool isInvariant : 1;
+        bool isContravariant : 1;
+        bool isFixed : 1;
+
+        constexpr static uint8_t NUMBER_OF_FLAGS = 6;
+        constexpr static uint8_t VALID_BITS_MASK = (1 << NUMBER_OF_FLAGS) - 1;
+
+        Flags() noexcept
+            : isTypeArgument(false), isTypeMember(false), isCovariant(false), isInvariant(false),
+              isContravariant(false), isFixed(false) {}
+
+        uint8_t serialize() const {
+            // Can replace this with std::bit_cast in C++20
+            auto rawBits = *reinterpret_cast<const uint8_t *>(this);
+            // Mask the valid bits since uninitialized bits can be any value.
+            return rawBits & VALID_BITS_MASK;
+        }
+
+        bool hasFlags(const Flags other) {
+            const auto otherSerialized = other.serialize();
+            return (this->serialize() & otherSerialized) == otherSerialized;
+        }
     };
+    CheckSize(Flags, 1, 1);
 
     Loc loc() const;
-    const InlinedVector<Loc, 2> &locs() const;
+    const SymbolRef::LOC_store &locs() const;
     void addLoc(const core::GlobalState &gs, core::Loc loc);
+    void removeLocsForFile(core::FileRef file);
+
+    uint32_t hash(const GlobalState &gs) const;
+
+    bool isPrintable(const GlobalState &gs) const;
+
+    SymbolRef ref(const GlobalState &gs) const;
+
+    Variance variance() const {
+        if (flags.isInvariant) {
+            return Variance::Invariant;
+        }
+        if (flags.isCovariant) {
+            return Variance::CoVariant;
+        }
+        if (flags.isContravariant) {
+            return Variance::ContraVariant;
+        }
+        Exception::raise("None of the variance-related flags are set. Call to variance() before resolver?");
+    }
+
+    SymbolRef dealias(const GlobalState &gs, int depthLimit = 42) const;
+
+    void sanityCheck(const GlobalState &gs) const;
+
+    TypeParameter deepCopy(const GlobalState &gs) const;
+
+    Flags flags;
+    // Method for TypeArgument, ClassOrModule for TypeMember.
+    SymbolRef owner;
+    NameRef name;
+    TypePtr resultType;
+
+private:
+    SymbolRef::LOC_store locs_;
+};
+CheckSize(TypeParameter, 56, 8);
+
+class ClassOrModule final {
+public:
+    ClassOrModule(const ClassOrModule &) = delete;
+    ClassOrModule() = default;
+    ClassOrModule(ClassOrModule &&) noexcept = default;
+
+    class Flags {
+    public:
+        bool isClass : 1;
+        bool isModule : 1;
+        bool isAbstract : 1;
+        bool isInterface : 1;
+        bool isLinearizationComputed : 1;
+        bool isFinal : 1;
+        bool isSealed : 1;
+        bool isPrivate : 1;
+        bool isUndeclared : 1;
+        bool isExported : 1;
+
+        constexpr static uint16_t NUMBER_OF_FLAGS = 10;
+        constexpr static uint16_t VALID_BITS_MASK = (1 << NUMBER_OF_FLAGS) - 1;
+
+        Flags() noexcept
+            : isClass(false), isModule(false), isAbstract(false), isInterface(false), isLinearizationComputed(false),
+              isFinal(false), isSealed(false), isPrivate(false), isUndeclared(false), isExported(false) {}
+
+        uint16_t serialize() const {
+            // Can replace this with std::bit_cast in C++20
+            auto rawBits = *reinterpret_cast<const uint16_t *>(this);
+            // Mask the valid bits since uninitialized bits can be any value.
+            return rawBits & VALID_BITS_MASK;
+        }
+    };
+    CheckSize(Flags, 2, 1);
+
+    Loc loc() const;
+    const SymbolRef::LOC_store &locs() const;
+    void addLoc(const core::GlobalState &gs, core::Loc loc);
+    void removeLocsForFile(core::FileRef file);
 
     uint32_t hash(const GlobalState &gs) const;
 
     std::vector<TypePtr> selfTypeArgs(const GlobalState &gs) const;
 
     // selfType and externalType return the type of an instance of this Symbol
-    // (which must be isClassOrModule()), if instantiated without specific type
-    // parameters, as seen from inside or outside of the class, respectively.
+    // if instantiated without specific type parameters, as seen from inside or
+    // outside of the class, respectively.
     TypePtr selfType(const GlobalState &gs) const;
     TypePtr externalType() const;
 
@@ -290,12 +416,10 @@ public:
     TypePtr unsafeComputeExternalType(GlobalState &gs);
 
     inline InlinedVector<ClassOrModuleRef, 4> &mixins() {
-        ENFORCE_NO_TIMER(isClassOrModule());
         return mixins_;
     }
 
     inline const InlinedVector<ClassOrModuleRef, 4> &mixins() const {
-        ENFORCE_NO_TIMER(isClassOrModule());
         return mixins_;
     }
 
@@ -307,14 +431,24 @@ public:
     // Add a placeholder for a mixin and return index in mixins()
     uint16_t addMixinPlaceholder(const GlobalState &gs);
 
-    inline InlinedVector<TypeMemberRef, 4> &typeMembers() {
-        ENFORCE(isClassOrModule());
-        return typeParams;
+    inline InlinedVector<TypeMemberRef, 4> &getOrCreateTypeMembers() {
+        if (typeParams) {
+            return *typeParams;
+        }
+        typeParams = std::make_unique<InlinedVector<TypeMemberRef, 4>>();
+        return *typeParams;
     }
 
-    inline const InlinedVector<TypeMemberRef, 4> &typeMembers() const {
-        ENFORCE(isClassOrModule());
-        return typeParams;
+    inline absl::Span<const TypeMemberRef> typeMembers() const {
+        if (typeParams) {
+            return *typeParams;
+        }
+        return {};
+    }
+
+    inline InlinedVector<TypeMemberRef, 4> &existingTypeMembers() {
+        ENFORCE(typeParams != nullptr);
+        return *typeParams;
     }
 
     // Return the number of type parameters that must be passed to instantiate
@@ -325,205 +459,45 @@ public:
     bool derivesFrom(const GlobalState &gs, ClassOrModuleRef sym) const;
 
     // TODO(dmitry) perf: most calls to this method could be eliminated as part of perf work.
-    SymbolRef ref(const GlobalState &gs) const;
-
-    inline bool isClassOrModule() const {
-        return (flags & Symbol::Flags::CLASS_OR_MODULE) != 0;
-    }
+    ClassOrModuleRef ref(const GlobalState &gs) const;
 
     bool isSingletonClass(const GlobalState &gs) const;
 
-    inline bool isTypeMember() const {
-        return (flags & Symbol::Flags::TYPE_MEMBER) != 0;
-    }
-
-    inline bool isTypeArgument() const {
-        return (flags & Symbol::Flags::TYPE_ARGUMENT) != 0;
-    }
-
-    inline bool isCovariant() const {
-        ENFORCE_NO_TIMER(isTypeArgument() || isTypeMember());
-        return (flags & Symbol::Flags::TYPE_COVARIANT) != 0;
-    }
-
-    inline bool isInvariant() const {
-        ENFORCE_NO_TIMER(isTypeArgument() || isTypeMember());
-        return (flags & Symbol::Flags::TYPE_INVARIANT) != 0;
-    }
-
-    inline bool isContravariant() const {
-        ENFORCE_NO_TIMER(isTypeArgument() || isTypeMember());
-        return (flags & Symbol::Flags::TYPE_CONTRAVARIANT) != 0;
-    }
-
-    inline bool isFixed() const {
-        ENFORCE_NO_TIMER(isTypeArgument() || isTypeMember());
-        return (flags & Symbol::Flags::TYPE_FIXED) != 0;
-    }
-
-    Variance variance() const {
-        if (isInvariant()) {
-            return Variance::Invariant;
-        }
-        if (isCovariant()) {
-            return Variance::CoVariant;
-        }
-        if (isContravariant()) {
-            return Variance::ContraVariant;
-        }
-        Exception::raise("Should not happen");
-    }
-
-    inline bool isClassOrModuleModule() const {
-        ENFORCE_NO_TIMER(isClassOrModule());
-        if (flags & Symbol::Flags::CLASS_OR_MODULE_MODULE) {
+    inline bool isModule() const {
+        if (flags.isModule) {
             return true;
         }
-        if (flags & Symbol::Flags::CLASS_OR_MODULE_CLASS) {
+
+        if (flags.isClass) {
             return false;
         }
-        Exception::raise("Should never happen");
+
+        Exception::raise("isModule() but neither flags.isModule nor flags.isClass. Call to isModule before resolver?");
     }
 
     inline bool isClassModuleSet() const {
-        ENFORCE_NO_TIMER(isClassOrModule());
-        return flags & (Symbol::Flags::CLASS_OR_MODULE_MODULE | Symbol::Flags::CLASS_OR_MODULE_CLASS);
+        return flags.isModule || flags.isClass;
     }
 
-    inline bool isClassOrModuleClass() const {
-        return !isClassOrModuleModule();
-    }
-
-    inline bool isClassOrModuleAbstract() const {
-        ENFORCE(isClassOrModule());
-        return (flags & Symbol::Flags::CLASS_OR_MODULE_ABSTRACT) != 0;
-    }
-
-    inline bool isClassOrModuleInterface() const {
-        ENFORCE_NO_TIMER(isClassOrModule());
-        return (flags & Symbol::Flags::CLASS_OR_MODULE_INTERFACE) != 0;
-    }
-
-    inline bool isClassOrModuleLinearizationComputed() const {
-        ENFORCE_NO_TIMER(isClassOrModule());
-        return (flags & Symbol::Flags::CLASS_OR_MODULE_LINEARIZATION_COMPUTED) != 0;
-    }
-
-    inline bool isClassOrModuleFinal() const {
-        ENFORCE_NO_TIMER(isClassOrModule());
-        return (flags & Symbol::Flags::CLASS_OR_MODULE_FINAL) != 0;
-    }
-
-    inline bool isClassOrModuleSealed() const {
-        ENFORCE_NO_TIMER(isClassOrModule());
-        return (flags & Symbol::Flags::CLASS_OR_MODULE_SEALED) != 0;
-    }
-
-    inline bool isClassOrModulePrivate() const {
-        ENFORCE_NO_TIMER(isClassOrModule());
-        return (flags & Symbol::Flags::CLASS_OR_MODULE_PRIVATE) != 0;
-    }
-
-    inline bool isClassOrModuleUndeclared() const {
-        ENFORCE_NO_TIMER(isClassOrModule());
-
-        // Represents "filler definitions", which are not explicitly declared. Pre-resolver, these have a class/module
-        // type, but neither class or module flag should be set. Post-resolver, we will use the "undeclared" bit to
-        // identify them (this is useful for LSP fast-path checks).
-
-        return ((flags & (Symbol::Flags::CLASS_OR_MODULE_MODULE | Symbol::Flags::CLASS_OR_MODULE_CLASS)) == 0) ||
-               ((flags & Symbol::Flags::CLASS_OR_MODULE_UNDECLARED) != 0);
-    }
-
-    inline void setClassOrModule() {
-        ENFORCE(!isTypeArgument() && !isTypeMember());
-        flags |= Symbol::Flags::CLASS_OR_MODULE;
-    }
-
-    inline void setTypeArgument() {
-        ENFORCE(!isClassOrModule() && !isTypeMember());
-        flags |= Symbol::Flags::TYPE_ARGUMENT;
-    }
-
-    inline void setTypeMember() {
-        ENFORCE(!isClassOrModule() && !isTypeArgument());
-        flags |= Symbol::Flags::TYPE_MEMBER;
+    inline bool isClass() const {
+        return !isModule();
     }
 
     inline void setIsModule(bool isModule) {
-        ENFORCE(isClassOrModule());
         if (isModule) {
-            ENFORCE((flags & Symbol::Flags::CLASS_OR_MODULE_CLASS) == 0);
-            flags |= Symbol::Flags::CLASS_OR_MODULE_MODULE;
+            ENFORCE(!flags.isClass);
+            flags.isModule = true;
         } else {
-            ENFORCE((flags & Symbol::Flags::CLASS_OR_MODULE_MODULE) == 0);
-            flags |= Symbol::Flags::CLASS_OR_MODULE_CLASS;
+            ENFORCE(!flags.isModule);
+            flags.isClass = true;
         }
     }
 
-    inline void setClassModuleUndeclared() {
-        ENFORCE(isClassOrModule());
-        flags |= Symbol::Flags::CLASS_OR_MODULE_UNDECLARED;
-    }
-
-    inline void setCovariant() {
-        ENFORCE(isTypeArgument() || isTypeMember());
-        ENFORCE(!isContravariant() && !isInvariant());
-        flags |= Symbol::Flags::TYPE_COVARIANT;
-    }
-
-    inline void setContravariant() {
-        ENFORCE(isTypeArgument() || isTypeMember());
-        ENFORCE(!isCovariant() && !isInvariant());
-        flags |= Symbol::Flags::TYPE_CONTRAVARIANT;
-    }
-
-    inline void setInvariant() {
-        ENFORCE(isTypeArgument() || isTypeMember());
-        ENFORCE(!isCovariant() && !isContravariant());
-        flags |= Symbol::Flags::TYPE_INVARIANT;
-    }
-
-    inline void setFixed() {
-        ENFORCE(isTypeArgument() || isTypeMember());
-        flags |= Symbol::Flags::TYPE_FIXED;
-    }
-
-    inline void setClassOrModuleAbstract() {
-        ENFORCE(isClassOrModule());
-        flags |= Symbol::Flags::CLASS_OR_MODULE_ABSTRACT;
-    }
-
-    inline void setClassOrModuleInterface() {
-        ENFORCE(isClassOrModule());
-        flags |= Symbol::Flags::CLASS_OR_MODULE_INTERFACE;
-    }
-
-    inline void setClassOrModuleLinearizationComputed() {
-        ENFORCE(isClassOrModule());
-        flags |= Symbol::Flags::CLASS_OR_MODULE_LINEARIZATION_COMPUTED;
-    }
-
-    inline void setClassOrModuleFinal() {
-        ENFORCE(isClassOrModule());
-        flags |= Symbol::Flags::CLASS_OR_MODULE_FINAL;
-    }
-
-    inline void setClassOrModuleSealed() {
-        ENFORCE(isClassOrModule());
-        flags |= Symbol::Flags::CLASS_OR_MODULE_SEALED;
-    }
-
-    inline void setClassOrModulePrivate() {
-        ENFORCE(isClassOrModule());
-        flags |= Symbol::Flags::CLASS_OR_MODULE_PRIVATE;
-    }
-
-    inline void setRewriterSynthesized() {
-        flags |= Symbol::Flags::REWRITER_SYNTHESIZED;
-    }
-    inline bool isRewriterSynthesized() {
-        return (flags & Symbol::Flags::REWRITER_SYNTHESIZED) != 0;
+    inline bool isUndeclared() const {
+        if (!isClassModuleSet()) {
+            return true;
+        }
+        return flags.isUndeclared;
     }
 
     SymbolRef findMember(const GlobalState &gs, NameRef name) const;
@@ -531,6 +505,7 @@ public:
     SymbolRef findMemberNoDealias(const GlobalState &gs, NameRef name) const;
     MethodRef findMethodNoDealias(const GlobalState &gs, NameRef name) const;
     SymbolRef findMemberTransitive(const GlobalState &gs, NameRef name) const;
+    SymbolRef findMemberTransitiveNoDealias(const GlobalState &gs, NameRef name) const;
     MethodRef findMethodTransitive(const GlobalState &gs, NameRef name) const;
     MethodRef findConcreteMethodTransitive(const GlobalState &gs, NameRef name) const;
 
@@ -562,7 +537,7 @@ public:
     void recordSealedSubclass(MutableContext ctx, ClassOrModuleRef subclass);
 
     // Returns the locations that are allowed to subclass the sealed class.
-    const InlinedVector<Loc, 2> &sealedLocs(const GlobalState &gs) const;
+    const SymbolRef::LOC_store &sealedLocs(const GlobalState &gs) const;
 
     TypePtr sealedSubclassesToUnion(const GlobalState &ctx) const;
 
@@ -594,20 +569,18 @@ public:
 
     bool ignoreInHashing(const GlobalState &gs) const;
 
-    SymbolRef owner;
+    ClassOrModuleRef owner;
     ClassOrModuleRef superClass_;
 
     inline ClassOrModuleRef superClass() const {
-        ENFORCE_NO_TIMER(isClassOrModule());
         return superClass_;
     }
 
     inline void setSuperClass(ClassOrModuleRef claz) {
-        ENFORCE(isClassOrModule());
         superClass_ = claz;
     }
 
-    uint32_t flags = Flags::NONE;
+    Flags flags;
     NameRef name; // todo: move out? it should not matter but it's important for name resolution
     TypePtr resultType;
 
@@ -622,7 +595,7 @@ public:
 
     std::vector<std::pair<NameRef, SymbolRef>> membersStableOrderSlow(const GlobalState &gs) const;
 
-    Symbol deepCopy(const GlobalState &to, bool keepGsId = false) const;
+    ClassOrModule deepCopy(const GlobalState &to, bool keepGsId = false) const;
     void sanityCheck(const GlobalState &gs) const;
 
 private:
@@ -646,8 +619,8 @@ private:
 
     /** For Class or module - ordered type members of the class,
      */
-    InlinedVector<TypeMemberRef, 4> typeParams;
-    InlinedVector<Loc, 2> locs_;
+    std::unique_ptr<InlinedVector<TypeMemberRef, 4>> typeParams;
+    SymbolRef::LOC_store locs_;
 
     // Record a required ancestor for this class of module in a magic property
     void recordRequiredAncestorInternal(GlobalState &gs, RequiredAncestor &ancestor, NameRef prop);
@@ -658,16 +631,15 @@ private:
     std::vector<RequiredAncestor> requiredAncestorsTransitiveInternal(GlobalState &gs,
                                                                       std::vector<ClassOrModuleRef> &seen);
 
-    SymbolRef findMemberTransitiveInternal(const GlobalState &gs, NameRef name, int maxDepth = 100) const;
+    SymbolRef findMemberTransitiveInternal(const GlobalState &gs, NameRef name, int maxDepth, bool dealias) const;
 
     inline void unsetClassOrModuleLinearizationComputed() {
-        ENFORCE(isClassOrModule());
-        flags &= ~Symbol::Flags::CLASS_OR_MODULE_LINEARIZATION_COMPUTED;
+        flags.isLinearizationComputed = false;
     }
 
     void addMixinAt(ClassOrModuleRef sym, std::optional<uint16_t> index);
 };
-// CheckSize(Symbol, 144, 8); // This is under too much churn to be worth checking
+CheckSize(ClassOrModule, 128, 8);
 
 } // namespace sorbet::core
 #endif // SORBET_SYMBOLS_H

@@ -17,7 +17,7 @@
 namespace sorbet::core {
 
 class NameRef;
-class Symbol;
+class ClassOrModule;
 class SymbolRef;
 class ClassOrModuleRef;
 class MethodRef;
@@ -26,7 +26,7 @@ class TypeArgumentRef;
 class TypeMemberRef;
 class NameSubstitution;
 class ErrorQueue;
-struct GlobalStateHash;
+struct LocalSymbolTableHashes;
 
 namespace lsp {
 class Task;
@@ -40,9 +40,10 @@ class SerializerImpl;
 
 class GlobalState final {
     friend NameRef;
-    friend Symbol;
+    friend ClassOrModule;
     friend Method;
     friend Field;
+    friend TypeParameter;
     friend SymbolRef;
     friend ClassOrModuleRef;
     friend MethodRef;
@@ -86,6 +87,7 @@ public:
 
     void initEmpty();
     void installIntrinsics();
+    void computeLinearization();
 
     // Expand symbol and name tables to the given lengths. Does nothing if the value is <= current capacity.
     void preallocateTables(uint32_t classAndModulesSize, uint32_t methodsSize, uint32_t fieldsSize,
@@ -122,8 +124,7 @@ public:
     MethodRef lookupMethodSymbol(ClassOrModuleRef owner, NameRef name) const {
         return lookupSymbolWithKind(owner, name, SymbolRef::Kind::Method, Symbols::noMethod()).asMethodRef();
     }
-    MethodRef lookupMethodSymbolWithHash(ClassOrModuleRef owner, NameRef name,
-                                         const std::vector<uint32_t> &methodHash) const;
+    MethodRef lookupMethodSymbolWithHash(ClassOrModuleRef owner, NameRef name, ArityHash arityHash) const;
     FieldRef lookupStaticFieldSymbol(ClassOrModuleRef owner, NameRef name) const {
         // N.B.: Fields and static fields have entirely different types of names, so this should be unambiguous.
         return lookupSymbolWithKind(owner, name, SymbolRef::Kind::FieldOrStaticField, Symbols::noField()).asFieldRef();
@@ -137,8 +138,8 @@ public:
     MethodRef staticInitForFile(Loc loc);
     MethodRef staticInitForClass(ClassOrModuleRef klass, Loc loc);
 
-    MethodRef lookupStaticInitForFile(Loc loc) const;
-    MethodRef lookupStaticInitForClass(ClassOrModuleRef klass) const;
+    MethodRef lookupStaticInitForFile(FileRef file) const;
+    MethodRef lookupStaticInitForClass(ClassOrModuleRef klass, bool allowMissing = false) const;
 
     NameRef enterNameUTF8(std::string_view nm);
     NameRef lookupNameUTF8(std::string_view nm) const;
@@ -161,10 +162,20 @@ public:
 
     const packages::PackageDB &packageDB() const;
     void setPackagerOptions(const std::vector<std::string> &secondaryTestPackageNamespaces,
-                            const std::vector<std::string> &extraPackageFilesDirectoryPrefixes, std::string errorHint);
+                            const std::vector<std::string> &extraPackageFilesDirectoryUnderscorePrefixes,
+                            const std::vector<std::string> &extraPackageFilesDirectorySlashPrefixes,
+                            const std::vector<std::string> &packageSkipRBIExportEnforcementDirs, std::string errorHint);
     packages::UnfreezePackages unfreezePackages();
 
-    void mangleRenameSymbol(SymbolRef what, NameRef origName);
+    NameRef nextMangledName(ClassOrModuleRef owner, NameRef origName);
+    void mangleRenameMethod(MethodRef what, NameRef origName);
+    void mangleRenameForOverload(MethodRef what, NameRef origName);
+    // NOTE: You likely want to use mangleRenameMethod not deleteMethodSymbol, unless you know what you're doing.
+    // See the comment on the implementation for more.
+    void deleteMethodSymbol(MethodRef what);
+    // NOTE: You likely want to use mangleRenameMethod not deleteFieldSymbol, unless you know what you're doing.
+    // See the comment on the implementation for more.
+    void deleteFieldSymbol(FieldRef what);
     spdlog::logger &tracer() const;
     unsigned int namesUsedTotal() const;
     unsigned int utf8NamesUsed() const;
@@ -231,7 +242,7 @@ public:
     bool runningUnderAutogen = false;
     bool censorForSnapshotTests = false;
 
-    bool sleepInSlowPath = false;
+    std::optional<int> sleepInSlowPathSeconds = std::nullopt;
 
     std::unique_ptr<GlobalState> deepCopy(bool keepId = false) const;
     mutable std::shared_ptr<ErrorQueue> errorQueue;
@@ -267,7 +278,7 @@ public:
 
     void trace(std::string_view msg) const;
 
-    std::unique_ptr<GlobalStateHash> hash() const;
+    std::unique_ptr<LocalSymbolTableHashes> hash() const;
     const std::vector<std::shared_ptr<File>> &getFiles() const;
 
     // Contains a string to be used as the base of the error URL.
@@ -280,6 +291,13 @@ public:
     // If 'true', enforce use of Ruby 3.0-style keyword args.
     bool ruby3KeywordArgs = false;
 
+    // If 'true', enable the experimental, symbol-deletion-based fast path mode
+    bool lspExperimentalFastPathEnabled = false;
+
+    // When present, this indicates that single-package rbi generation is being performed, and contains metadata about
+    // the packages that are imported by the one whose interface is being generated.
+    std::optional<packages::ImportInfo> singlePackageImports;
+
     void ignoreErrorClassForSuggestTyped(int code);
     void suppressErrorClass(int code);
     void onlyShowErrorClass(int code);
@@ -290,8 +308,9 @@ public:
 
     bool requiresAncestorEnabled = false;
 
-private:
     bool shouldReportErrorOn(Loc loc, ErrorClass what) const;
+
+private:
     struct DeepCloneHistoryEntry {
         int globalStateId;
         unsigned int lastUTF8NameKnownByParentGlobalState;
@@ -307,11 +326,11 @@ private:
     std::vector<ConstantName> constantNames;
     std::vector<UniqueName> uniqueNames;
     UnorderedMap<std::string, FileRef> fileRefByPath;
-    std::vector<Symbol> classAndModules;
+    std::vector<ClassOrModule> classAndModules;
     std::vector<Method> methods;
     std::vector<Field> fields;
-    std::vector<Symbol> typeMembers;
-    std::vector<Symbol> typeArguments;
+    std::vector<TypeParameter> typeMembers;
+    std::vector<TypeParameter> typeArguments;
     std::vector<std::pair<unsigned int, uint32_t>> namesByHash;
     std::vector<std::shared_ptr<File>> files;
     UnorderedSet<int> ignoredForSuggestTypedErrorClasses;
@@ -337,6 +356,8 @@ private:
 
     SymbolRef lookupSymbolWithKind(ClassOrModuleRef owner, NameRef name, SymbolRef::Kind kind,
                                    SymbolRef defaultReturnValue, bool ignoreKind = false) const;
+
+    void mangleRenameMethodInternal(MethodRef what, NameRef origName, UniqueNameKind kind);
 
     std::string toStringWithOptions(bool showFull, bool showRaw) const;
 };

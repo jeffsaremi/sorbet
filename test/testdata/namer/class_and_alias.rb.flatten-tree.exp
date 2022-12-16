@@ -5,12 +5,12 @@ begin
       begin
         ::A = 91
         begin
-          ::<Magic>.<define-top-class-or-module>(::A)
+          <emptyTree>
           ::Sorbet::Private::Static.keep_for_ide(::A)
           <emptyTree>
         end
         begin
-          ::<Magic>.<define-top-class-or-module>(::B)
+          <emptyTree>
           ::Sorbet::Private::Static.keep_for_ide(::B)
           <emptyTree>
         end
@@ -24,7 +24,7 @@ begin
       <emptyTree>
     end
   end
-  class ::B<B$1> < (::<todo sym>)
+  class ::B<<C B>> < (::<todo sym>)
     def self.<static-init>(<blk>)
       <emptyTree>
     end

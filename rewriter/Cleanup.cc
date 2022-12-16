@@ -9,42 +9,60 @@ using namespace std;
 namespace sorbet::rewriter {
 
 // This pass gets rid of some unnecessary nodes that are likely to have gotten created in the course of the rewriter
-// pass, specifically by removing EmptyTree nodes in places where they can be safely removed (i.e. as part of longer
-// sequences of expressions where they are not a return value)
+// pass, specifically by removing EmptyTree nodes and `nil` nodes in places where they can be safely
+// removed (i.e. as part of longer sequences of expressions where they are not a return value)
 struct CleanupWalk {
-    ast::ExpressionPtr postTransformInsSeq(core::Context ctx, ast::ExpressionPtr tree) {
+    void postTransformInsSeq(core::Context ctx, ast::ExpressionPtr &tree) {
         auto &insSeq = ast::cast_tree_nonnull<ast::InsSeq>(tree);
 
         ast::InsSeq::STATS_store newStore;
         for (auto &m : insSeq.stats) {
-            if (!ast::isa_tree<ast::EmptyTree>(m)) {
-                newStore.emplace_back(move(m));
+            if (ast::isa_tree<ast::EmptyTree>(m)) {
+                continue;
             }
+
+            if (ast::isa_tree<ast::Literal>(m)) {
+                auto lit = ast::cast_tree_nonnull<ast::Literal>(m);
+                if (lit.isNil(ctx)) {
+                    continue;
+                }
+            }
+
+            newStore.emplace_back(move(m));
         }
         if (newStore.empty()) {
-            return move(insSeq.expr);
+            tree = move(insSeq.expr);
+            return;
         }
         insSeq.stats = std::move(newStore);
-        return tree;
     }
 
-    ast::ExpressionPtr postTransformClassDef(core::Context ctx, ast::ExpressionPtr tree) {
+    void postTransformClassDef(core::Context ctx, ast::ExpressionPtr &tree) {
         auto &classDef = ast::cast_tree_nonnull<ast::ClassDef>(tree);
 
         ast::ClassDef::RHS_store newStore;
         for (auto &m : classDef.rhs) {
-            if (!ast::isa_tree<ast::EmptyTree>(m)) {
-                newStore.emplace_back(move(m));
+            if (ast::isa_tree<ast::EmptyTree>(m)) {
+                continue;
             }
+
+            if (ast::isa_tree<ast::Literal>(m)) {
+                auto lit = ast::cast_tree_nonnull<ast::Literal>(m);
+                if (lit.isNil(ctx)) {
+                    continue;
+                }
+            }
+
+            newStore.emplace_back(move(m));
         }
         classDef.rhs = std::move(newStore);
-        return tree;
     }
 };
 
 ast::ExpressionPtr Cleanup::run(core::Context ctx, ast::ExpressionPtr tree) {
     CleanupWalk cleanup;
-    return ast::TreeMap::apply(ctx, cleanup, std::move(tree));
+    ast::TreeWalk::apply(ctx, cleanup, tree);
+    return tree;
 }
 
 } // namespace sorbet::rewriter

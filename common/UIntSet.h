@@ -12,6 +12,9 @@ public:
     // Creates a new set with the given capacity as the maximum acceptable item ID.
     UIntSet(uint32_t capacity);
 
+    // Removes all elements from the set.
+    void clear();
+
     // Add number to set.
     void add(uint32_t item);
 
@@ -27,11 +30,17 @@ public:
     // Add items in `set` to this set. Sets must have the same size.
     void add(const UIntSet &set);
 
+    // Add items in the given sets to this set. Sets must have the same size.
+    void add(const UIntSet &a, const UIntSet &b);
+
     // Remove items in `set` from this set. Sets must have the same size.
     void remove(const UIntSet &set);
 
     // Mutates the set to contain the intersection of this set and the passed-in set.
     void intersect(const UIntSet &set);
+
+    // Mutates the set to contain the union of the given sets.
+    void overwriteWithUnion(const UIntSet &a, const UIntSet &b);
 
     // Returns true if the set is empty.
     bool empty() const;

@@ -689,6 +689,21 @@ class Hash < Object
   # ```
   def fetch_values(*_); end
 
+  # Returns a new Hash excluding entries for the given keys.
+  # [`Hash#except`](https://ruby-doc.org/core-3.0.0/Hash.html#method-i-except)
+  #
+  # ```ruby
+  # h = { a: 100, b: 200, c: 300 }
+  # h.except(:a)          #=> {:b=>200, :c=>300}
+  # ```
+  sig do
+    params(
+        args: K,
+    )
+    .returns(T::Hash[K, V])
+  end
+  def except(*args); end
+
   # Returns a new array that is a one-dimensional flattening of this hash. That
   # is, for every key or value that is an array, extract its elements into the
   # new array. Unlike
@@ -741,6 +756,30 @@ class Hash < Object
     .returns(T::Boolean)
   end
   def has_value?(arg0); end
+
+  # Returns `true` if the given key is present in *hsh*.
+  #
+  # ```ruby
+  # h = { "a" => 100, "b" => 200 }
+  # h.has_key?("a")   #=> true
+  # h.has_key?("z")   #=> false
+  # ```
+  #
+  # Note that
+  # [`include?`](https://docs.ruby-lang.org/en/2.7.0/Hash.html#method-i-include-3F)
+  # and
+  # [`member?`](https://docs.ruby-lang.org/en/2.7.0/Hash.html#method-i-member-3F)
+  # do not test member equality using `==` as do other Enumerables.
+  #
+  # See also
+  # [`Enumerable#include?`](https://docs.ruby-lang.org/en/2.7.0/Enumerable.html#method-i-include-3F)
+  sig do
+    params(
+        arg0: K,
+    )
+    .returns(T::Boolean)
+  end
+  def include?(arg0); end
 
   # Compute a hash-code for this hash. Two hashes with the same content will
   # have the same hash code (and will compare using `eql?`).
@@ -1361,6 +1400,21 @@ class Hash < Object
     returns(T::Enumerator[V])
   end
   def transform_values!(&blk); end
+
+  # Attempts to convert a given object to a `Hash``. If *obj* is a `Hash``,
+  # *obj* is returned. If *obj* reponds to `to_hash`, the return of
+  # *obj.to_hash* is returned. Otherwise, `nil` is returned.
+  #
+  # ```ruby
+  # Hash.try_convert({ a: :b }) #=> { a: :b }
+  # Hash.try_convert(Object.new) #=> nil
+  # ```
+  #
+  # An exception is raised when `obj.to_hash` doesn't return a Hash.
+  sig do
+    params(obj: T.untyped).returns(T.nilable(T::Hash[T.untyped, T.untyped]))
+  end
+  def self.try_convert(obj); end
 
   # Adds the contents of the given hashes to the receiver.
   #

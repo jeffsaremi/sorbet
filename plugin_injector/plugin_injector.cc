@@ -80,6 +80,12 @@ public:
     // The basic-block that holds the initialization of string constants.
     llvm::BasicBlock *allocRubyIdsEntry = nullptr;
 
+    compiler::StringTable stringTable;
+
+    compiler::IDTable idTable;
+
+    compiler::RubyStringTable rubyStringTable;
+
     // The function that holds calls to global constructors
     //
     // This works as a replacement to llvm.global_ctors so that we can delay initialization until after
@@ -143,7 +149,6 @@ class LLVMSemanticExtension : public SemanticExtension {
                 if (auto *send = cfg::cast_instruction<cfg::Send>(binding.value)) {
                     switch (send->fun.rawId()) {
                         case core::Names::keepForIde().rawId():
-                        case core::Names::keepForTypechecking().rawId():
                             // TODO: figure out why we can't delete this.
                             // case core::Names::keepForCfg().rawId():
                             refsToDelete.emplace(binding.bind.variable);
@@ -161,6 +166,8 @@ class LLVMSemanticExtension : public SemanticExtension {
                         refsToDelete.emplace(arg.variable);
                     }
                     refsToDelete.emplace(send->recv.variable);
+                } else if (auto *read = cfg::cast_instruction<cfg::KeepAlive>(binding.value)) {
+                    refsToDelete.emplace(read->what);
                 }
             }
 
@@ -179,8 +186,9 @@ public:
 
     virtual void run(core::MutableContext &ctx, ast::ClassDef *klass) const override{};
 
-    virtual void typecheck(const core::GlobalState &gs, cfg::CFG &cfg, ast::MethodDef &md) const override {
-        if (!shouldCompile(gs, cfg.file)) {
+    virtual void typecheck(const core::GlobalState &gs, core::FileRef file, cfg::CFG &cfg,
+                           ast::MethodDef &md) const override {
+        if (!shouldCompile(gs, file)) {
             return;
         }
 
@@ -211,7 +219,7 @@ public:
         // TODO: Figure out why this isn't true
         // ENFORCE(absl::c_find(cfg.symbol.data(gs)->locs(), md->loc) != cfg.symbol.data(gs)->locs().end(),
         // loc.toString(gs));
-        ENFORCE(cfg.file.exists());
+        ENFORCE(file.exists());
         if (!module) {
             ENFORCE(threadState->globalConstructorsEntry == nullptr);
             ENFORCE(debug == nullptr);
@@ -231,14 +239,17 @@ public:
 
             // NOTE: we use C here because our generated functions follow its abi
             auto language = llvm::dwarf::DW_LANG_C;
-            auto filename = cfg.file.data(gs).path();
+            auto filename = file.data(gs).path();
             auto isOptimized = false;
             auto runtimeVersion = 0;
             compUnit = debug->createCompileUnit(
                 language, debug->createFile(llvm::StringRef(filename.data(), filename.size()), "."), "Sorbet LLVM",
                 isOptimized, "", runtimeVersion);
 
-            threadState->file = cfg.file;
+            threadState->file = file;
+            threadState->stringTable.clear();
+            threadState->idTable.clear();
+            threadState->rubyStringTable.clear();
 
             {
                 auto linkageType = llvm::Function::InternalLinkage;
@@ -252,12 +263,13 @@ public:
             }
 
         } else {
-            ENFORCE(threadState->file == cfg.file);
+            ENFORCE(threadState->file == file);
             ENFORCE(threadState->globalConstructorsEntry != nullptr);
         }
         ENFORCE(threadState->file.exists());
         compiler::CompilerState state(gs, lctx, module.get(), debug.get(), compUnit, threadState->file,
-                                      threadState->allocRubyIdsEntry, threadState->globalConstructorsEntry);
+                                      threadState->allocRubyIdsEntry, threadState->globalConstructorsEntry,
+                                      threadState->stringTable, threadState->idTable, threadState->rubyStringTable);
         absl::Cleanup dropInternalState = [&] {
             threadState->aborted = true;
             module = nullptr;
@@ -265,7 +277,7 @@ public:
         };
         try {
             compiler::IREmitter::run(state, cfg, md);
-            string fileName = objectFileName(gs, cfg.file);
+            string fileName = objectFileName(gs, file);
             compiler::IREmitter::buildInitFor(state, cfg.symbol, fileName);
             std::move(dropInternalState).Cancel();
         } catch (sorbet::compiler::AbortCompilation &) {
@@ -277,7 +289,7 @@ public:
             // This exception is thrown from within an optimizer pass, where GlobalState
             // is not available, so we need to emit an error here, where we do have
             // access to GlobalState.
-            if (auto e = gs.beginError(core::Loc(cfg.file, 0, 0), core::errors::Compiler::OptimizerFailure)) {
+            if (auto e = gs.beginError(core::Loc(file, 0, 0), core::errors::Compiler::OptimizerFailure)) {
                 e.setHeader("{}", oe.what());
             }
         }
@@ -318,7 +330,11 @@ public:
         {
             llvm::IRBuilder<> builder(lctx);
 
+            threadState->stringTable.defineGlobalVariables(lctx, *module);
+
             builder.SetInsertPoint(threadState->allocRubyIdsEntry);
+            threadState->idTable.defineGlobalVariables(lctx, *module, builder);
+            threadState->rubyStringTable.defineGlobalVariables(lctx, *module, builder);
             builder.CreateBr(threadState->globalConstructorsEntry);
 
             builder.SetInsertPoint(threadState->globalConstructorsEntry);

@@ -1,5 +1,6 @@
 #include "main/lsp/ErrorReporter.h"
 #include "core/errors/infer.h"
+#include "core/errors/internal.h"
 #include "core/lsp/TypecheckEpochManager.h"
 #include "main/lsp/LSPConfiguration.h"
 #include "main/lsp/LSPMessage.h"
@@ -55,18 +56,41 @@ void ErrorReporter::endEpoch(uint32_t epoch, bool committed) {
     epochTimers.erase(it);
 }
 
+namespace {
+
+void assertNoCritical(const vector<unique_ptr<core::Error>> &errors) {
+    if constexpr (!debug_mode) {
+        return;
+    }
+
+    for (const auto &error : errors) {
+        if (error->isCritical()) {
+            // Fail fast.
+            // Exception::raise will have already printed a backtrace, we just need to crash the process.
+            __builtin_trap();
+        }
+    }
+}
+
+} // namespace
+
 void ErrorReporter::pushDiagnostics(uint32_t epoch, core::FileRef file, const vector<unique_ptr<core::Error>> &errors,
                                     const core::GlobalState &gs) {
     ENFORCE(file.exists());
 
-    ErrorStatus &fileErrorStatus = getFileErrorStatus(file);
-    if (fileErrorStatus.lastReportedEpoch > epoch) {
+    if (!wouldReportForFile(epoch, file)) {
+        // Internal errors should always crash Sorbet in tests. Most of the time though, ENFORCE
+        // failures and Exception::raise translate into user-visible errors with `beginError`.
+        // Regardless of epoch, we want internal errors to crash the process.
+        assertNoCritical(errors);
         return;
     }
 
+    ErrorStatus &fileErrorStatus = getFileErrorStatus(file);
+
     // Update clientErrorCount
     if (fileErrorStatus.lastReportedEpoch >= this->lastFullTypecheckEpoch) {
-        // clientErrorCount contains the errors from the last reported epoch. Subtract them since this action will
+        // clientErrorCount counts the errors from the last reported epoch. Subtract them since this action will
         // revoke them via publishing a new error list.
         this->clientErrorCount = this->clientErrorCount - fileErrorStatus.errorCount;
     }
@@ -84,7 +108,7 @@ void ErrorReporter::pushDiagnostics(uint32_t epoch, core::FileRef file, const ve
         }
     }
 
-    this->clientErrorCount += errors.size();
+    this->clientErrorCount += errorsToReport;
 
     fileErrorStatus.lastReportedEpoch = epoch;
 
@@ -101,12 +125,13 @@ void ErrorReporter::pushDiagnostics(uint32_t epoch, core::FileRef file, const ve
         }
     }
 
-    // If errors is empty and the file had no errors previously, break
-    if (errors.empty() && fileErrorStatus.errorCount == 0) {
+    // If the error reporter is not going to report errors and the file had no errors previously, break
+    // Avoids an issue where ErrorReporter sends an empty error list for files that have hidden errors.
+    if (errorsToReport == 0 && fileErrorStatus.errorCount == 0) {
         return;
     }
 
-    fileErrorStatus.errorCount = errors.size();
+    fileErrorStatus.errorCount = errorsToReport;
 
     const string uri = config->fileRef2Uri(gs, file);
     vector<unique_ptr<Diagnostic>> diagnostics;
@@ -144,17 +169,20 @@ void ErrorReporter::pushDiagnostics(uint32_t epoch, core::FileRef file, const ve
                 string message = errorLine.formattedMessage.length() > 0 ? errorLine.formattedMessage : sectionHeader;
                 auto location = config->loc2Location(gs, errorLine.loc);
                 if (location == nullptr) {
+                    // This was probably from an addErrorNote call. Still want to report the note.
+                    location = config->loc2Location(gs, error->loc);
+                    message = "\n    " + message;
+                }
+                if (location == nullptr) {
                     continue;
                 }
                 relatedInformation.push_back(make_unique<DiagnosticRelatedInformation>(std::move(location), message));
             }
         }
         // Add link to error documentation.
-        relatedInformation.push_back(make_unique<DiagnosticRelatedInformation>(
-            make_unique<Location>(absl::StrCat(config->opts.errorUrlBase, error->what.code),
-                                  make_unique<Range>(make_unique<Position>(0, 0), make_unique<Position>(0, 0))),
-            "Click for more information on this error."));
         diagnostic->relatedInformation = move(relatedInformation);
+        diagnostic->codeDescription =
+            make_unique<CodeDescription>(absl::StrCat(config->opts.errorUrlBase, error->what.code));
         diagnostics.push_back(move(diagnostic));
     }
 
@@ -167,9 +195,20 @@ void ErrorReporter::pushDiagnostics(uint32_t epoch, core::FileRef file, const ve
         make_unique<NotificationMessage>("2.0", LSPMethod::TextDocumentPublishDiagnostics, move(params))));
 };
 
+bool ErrorReporter::wouldReportForFile(uint32_t epoch, core::FileRef file) const {
+    if (file.id() >= fileErrorStatuses.size()) {
+        // No entry in fileErrorStatuses yet means we have never reported for this file, so we will
+        // certainly report any errors when requested.
+        return true;
+    } else {
+        const auto &fileErrorStatus = fileErrorStatuses[file.id()];
+        return fileErrorStatus.lastReportedEpoch <= epoch;
+    }
+}
+
 ErrorStatus &ErrorReporter::getFileErrorStatus(core::FileRef file) {
     if (file.id() >= fileErrorStatuses.size()) {
-        fileErrorStatuses.resize(file.id() + 1, ErrorStatus{0, false});
+        fileErrorStatuses.resize(file.id() + 1, ErrorStatus{0, 0});
     }
     return fileErrorStatuses[file.id()];
 };

@@ -43,17 +43,17 @@ class T::InterfaceWrapper
   def initialize(target_obj, interface_mod)
     if target_obj.is_a?(T::InterfaceWrapper)
       # wrapped_dynamic_cast should guarantee this never happens.
-      raise "Unexpected: wrapping a wrapper. Please report to #dev-productivity."
+      raise "Unexpected: wrapping a wrapper. Please report this bug at https://github.com/sorbet/sorbet/issues"
     end
 
     if !target_obj.is_a?(interface_mod)
       # wrapped_dynamic_cast should guarantee this never happens.
-      raise "Unexpected: `is_a?` failed. Please report to #dev-productivity."
+      raise "Unexpected: `is_a?` failed. Please report this bug at https://github.com/sorbet/sorbet/issues"
     end
 
     if target_obj.class == interface_mod
       # wrapped_dynamic_cast should guarantee this never happens.
-      raise "Unexpected: exact class match. Please report to #dev-productivity."
+      raise "Unexpected: exact class match. Please report this bug at https://github.com/sorbet/sorbet/issues"
     end
 
     @target_obj = target_obj
@@ -71,6 +71,10 @@ class T::InterfaceWrapper
         target_obj.send(method_name, *args, &blk)
       end
 
+      if singleton_class.respond_to?(:ruby2_keywords, true)
+        singleton_class.send(:ruby2_keywords, method_name)
+      end
+
       if target_obj.singleton_class.public_method_defined?(method_name)
         # no-op, it's already public
       elsif target_obj.singleton_class.protected_method_defined?(method_name)
@@ -78,7 +82,7 @@ class T::InterfaceWrapper
       elsif target_obj.singleton_class.private_method_defined?(method_name)
         singleton_class.send(:private, method_name)
       else
-        raise "This should never happen. Report to #dev-productivity"
+        raise "This should never happen. Report this bug at https://github.com/sorbet/sorbet/issues"
       end
     end
   end

@@ -47,13 +47,13 @@ protected:
     ~ProtocolTest();
 
     /** Reset lspWrapper and other internal state. */
-    void resetState();
+    void resetState(std::shared_ptr<sorbet::realmain::options::Options> opts = nullptr);
 
     /** Get an absolute file URI for the given relative file path. */
     std::string getUri(std::string_view filePath);
 
     std::vector<std::unique_ptr<LSPMessage>>
-    initializeLSP(bool supportsMarkdown = true,
+    initializeLSP(bool supportsMarkdown = true, bool supportsCodeActionResolve = true,
                   std::optional<std::unique_ptr<SorbetInitializationOptions>> opts = std::nullopt);
 
     std::unique_ptr<LSPMessage> openFile(std::string_view path, std::string_view contents);
@@ -70,6 +70,8 @@ protected:
     std::unique_ptr<LSPMessage> getDefinition(std::string_view path, int line, int character);
 
     std::unique_ptr<LSPMessage> hover(std::string_view path, int line, int character);
+
+    std::unique_ptr<LSPMessage> codeAction(std::string_view path, int line, int character);
 
     std::unique_ptr<LSPMessage> completion(std::string_view path, int line, int character);
 
@@ -111,6 +113,14 @@ protected:
      * Request all counter metrics from the server. Used to assert that metrics are reporting correctly.
      */
     const CounterStateDatabase getCounters();
+
+    /**
+     * Set a flag that forces the slow path to block indefinitely after saving undo state. Setting this flag to `false`
+     * will immediately unblock any currently blocked slow paths.
+     */
+    void setSlowPathBlocked(bool blocked) {
+        lspWrapper->setSlowPathBlocked(blocked);
+    }
 };
 
 } // namespace sorbet::test::lsp

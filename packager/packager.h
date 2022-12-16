@@ -2,12 +2,15 @@
 #define SORBET_REWRITER_PACKAGE_H
 #include "ast/ast.h"
 #include "core/packages/PackageInfo.h"
+#include "packager/VisibilityChecker.h"
 
 namespace sorbet {
 class WorkerPool;
 }
 
 namespace sorbet::packager {
+const core::NameRef TEST_NAME = core::Names::Constants::Test();
+
 /**
  * This pass transforms package files (`foo/__package.rb`) from
  *
@@ -23,52 +26,15 @@ namespace sorbet::packager {
  *   class Project::Bar < PackageSpec
  *     export SomeClassInBar
  *     export Inner::SomeOtherClassInBar
- *     export_methods SomeClassWithMethods, SomeOtherClassWithMethods
  *   end
  *
  * to:
  *
- *   module <PackageRegistry>::Project_Foo_Package
- *     module Project::Bar
- *       # Import methods exported on Bar
- *       extend <PackageRegistry>::Bar_Package::<PackageMethods>
- *       # Import each class exported by Bar
- *       SomeClassInBar = <PackageRegistry>::Bar_Package::SomeClassInBar
- *       SomeOtherClassInBar = <PackageRegistry>::Bar_Package::SomeOtherClassInBar
- *     end
- *     module <PackageMethods>
- *       include <PackageRegistry>::Project_Foo_Package::FooClassWithMethods
- *     end
+ *   class <PackgeSpecRegistry>::Project::Foo < PackageSpec
+ *    import <PackgeSpecRegistry>::Project::Bar
+ *
+ *    export Package::Baz
  *   end
- *
- *   class Project::Foo < PackageSpec
- *    import Project::Bar
- *
- *    export <PackageRegistry>::Project_Foo_Package::Baz
- *    export_methods <PackageRegistry>::Project_Foo_Package::FooClassWithMethods
- *   end
- *
- * It also rewrites files in the package, like `foo/baz.rb`, from:
- *
- * class SomeOtherClassInTheFile
- *   ...
- * end
- *
- * class Baz
- *   ...
- * end
- *
- * to:
- *
- * module <PackageRegistry>::Project_Foo_Package
- *   class SomeOtherClassInTheFile
- *     ...
- *   end
- *
- *   class Baz
- *     ...
- *   end
- * end
  *
  * Note that packages cannot have `_` in their names, so the above name mangling is 1:1.
  *
@@ -85,13 +51,13 @@ public:
     // Run packager incrementally. Note: `files` must contain all packages files. Does not support package changes.
     static std::vector<ast::ParsedFile> runIncremental(core::GlobalState &gs, std::vector<ast::ParsedFile> files);
 
-    // The structures created for `__package.rb` files from their imports are large and deep. This causes
-    // performance problems with typechecking. Use to remove these modules while retaining the PackageSpec
-    // class itself during typecheck.
-    static ast::ParsedFile removePackageModules(core::Context ctx, ast::ParsedFile pf,
-                                                bool intentionallyLeakASTs = false);
-
     static void dumpPackageInfo(const core::GlobalState &gs, std::string output);
+
+    // For each file, set its package name.
+    static void setPackageNameOnFiles(core::GlobalState &gs, const std::vector<ast::ParsedFile> &files);
+
+    // For each file, set its package name.
+    static void setPackageNameOnFiles(core::GlobalState &gs, const std::vector<core::FileRef> &files);
 
     Packager() = delete;
 };

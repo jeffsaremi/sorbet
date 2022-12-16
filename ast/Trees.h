@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 #include "core/Context.h"
+#include "core/FoundDefinitions.h"
 #include "core/LocalVariable.h"
 #include "core/SymbolRef.h"
 #include "core/Types.h"
@@ -62,10 +63,13 @@ enum class Tag {
     ZSuperArgs,
     Block,
     InsSeq,
+    RuntimeMethodDefinition,
 };
 
 // A mapping from tree type to its corresponding tag.
 template <typename T> struct ExpressionToTag;
+
+class EmptyTree;
 
 class ExpressionPtr {
 public:
@@ -89,6 +93,9 @@ private:
     template <typename E, typename... Args> friend ExpressionPtr make_expression(Args &&...);
 
     static tagged_storage tagPtr(Tag tag, void *expr) {
+        ENFORCE(static_cast<size_t>(tag) != 0);
+        ENFORCE(expr != nullptr);
+
         // Store the tag in the lower 16 bits of the pointer, regardless of size.
         auto val = static_cast<tagged_storage>(tag);
         auto maskedPtr = reinterpret_cast<tagged_storage>(expr) << 16;
@@ -169,9 +176,7 @@ public:
         resetTagged(0);
     }
 
-    template <typename T> void reset(T *expr = nullptr) noexcept {
-        resetTagged(tagPtr(ExpressionToTag<T>::value, expr));
-    }
+    void resetToEmpty(EmptyTree *expr) noexcept;
 
     Tag tag() const noexcept {
         ENFORCE(ptr != 0);
@@ -192,22 +197,30 @@ public:
     }
 
     explicit operator bool() const noexcept {
-        return get() != nullptr;
+        return ptr != 0;
     }
 
     bool operator==(const ExpressionPtr &other) const noexcept {
-        return get() == other.get();
+        return ptr == other.ptr;
+    }
+
+    bool operator==(std::nullptr_t) const noexcept {
+        return ptr == 0;
     }
 
     bool operator!=(const ExpressionPtr &other) const noexcept {
-        return get() != other.get();
+        return ptr != other.ptr;
+    }
+
+    bool operator!=(std::nullptr_t) const noexcept {
+        return ptr != 0;
     }
 
     ExpressionPtr deepCopy() const;
 
     std::string nodeName() const;
 
-    std::string showRaw(const core::GlobalState &gs, int tabs = 0);
+    std::string showRaw(const core::GlobalState &gs, int tabs = 0) const;
 
     bool isSelfReference() const;
 
@@ -220,6 +233,11 @@ public:
     std::string toString(const core::GlobalState &gs) const {
         return toStringWithTabs(gs);
     }
+
+    void swap(ExpressionPtr &other) noexcept {
+        using std::swap;
+        swap(this->ptr, other.ptr);
+    }
 };
 
 template <class E, typename... Args> ExpressionPtr make_expression(Args &&...args) {
@@ -229,7 +247,17 @@ template <class E, typename... Args> ExpressionPtr make_expression(Args &&...arg
 struct ParsedFile {
     ExpressionPtr tree;
     core::FileRef file;
+
+    void swap(ParsedFile &other) noexcept {
+        using std::swap;
+        this->tree.swap(other.tree);
+        swap(this->file, other.file);
+    }
 };
+
+inline void swap(ParsedFile &a, ParsedFile &b) {
+    a.swap(b);
+}
 
 /**
  * Stores a vector of `ParsedFile`s. May be empty if pass was canceled or encountered an error.
@@ -324,10 +352,7 @@ public:
     core::LocOffsets declLoc;
     core::ClassOrModuleRef symbol;
 
-    enum class Kind : uint8_t {
-        Module,
-        Class,
-    };
+    using Kind = core::FoundClass::Kind;
     Kind kind;
     static constexpr int EXPECTED_RHS_COUNT = 4;
     using RHS_store = InlinedVector<ExpressionPtr, EXPECTED_RHS_COUNT>;
@@ -348,8 +373,8 @@ public:
     ExpressionPtr deepCopy() const;
 
     std::string toStringWithTabs(const core::GlobalState &gs, int tabs = 0) const;
-    std::string showRaw(const core::GlobalState &gs, int tabs = 0);
-    std::string nodeName();
+    std::string showRaw(const core::GlobalState &gs, int tabs = 0) const;
+    std::string nodeName() const;
 
     void _sanityCheck();
 };
@@ -368,20 +393,7 @@ public:
 
     core::NameRef name;
 
-    struct Flags {
-        bool isSelfMethod : 1;
-        bool isRewriterSynthesized : 1;
-        bool isAttrReader : 1;
-        bool discardDef : 1;
-        bool genericPropGetter : 1;
-
-        // In C++20 we can replace this with bit field initialzers
-        Flags()
-            : isSelfMethod(false), isRewriterSynthesized(false), isAttrReader(false), discardDef(false),
-              genericPropGetter(false) {}
-    };
-    CheckSize(Flags, 1, 1);
-
+    using Flags = core::FoundMethod::Flags;
     Flags flags;
 
     MethodDef(core::LocOffsets loc, core::LocOffsets declLoc, core::MethodRef symbol, core::NameRef name,
@@ -390,8 +402,8 @@ public:
     ExpressionPtr deepCopy() const;
 
     std::string toStringWithTabs(const core::GlobalState &gs, int tabs = 0) const;
-    std::string showRaw(const core::GlobalState &gs, int tabs = 0);
-    std::string nodeName();
+    std::string showRaw(const core::GlobalState &gs, int tabs = 0) const;
+    std::string nodeName() const;
 
     void _sanityCheck();
 };
@@ -410,8 +422,8 @@ public:
     ExpressionPtr deepCopy() const;
 
     std::string toStringWithTabs(const core::GlobalState &gs, int tabs = 0) const;
-    std::string showRaw(const core::GlobalState &gs, int tabs = 0);
-    std::string nodeName();
+    std::string showRaw(const core::GlobalState &gs, int tabs = 0) const;
+    std::string nodeName() const;
 
     void _sanityCheck();
 };
@@ -429,8 +441,8 @@ public:
     ExpressionPtr deepCopy() const;
 
     std::string toStringWithTabs(const core::GlobalState &gs, int tabs = 0) const;
-    std::string showRaw(const core::GlobalState &gs, int tabs = 0);
-    std::string nodeName();
+    std::string showRaw(const core::GlobalState &gs, int tabs = 0) const;
+    std::string nodeName() const;
 
     void _sanityCheck();
 };
@@ -447,8 +459,8 @@ public:
     ExpressionPtr deepCopy() const;
 
     std::string toStringWithTabs(const core::GlobalState &gs, int tabs = 0) const;
-    std::string showRaw(const core::GlobalState &gs, int tabs = 0);
-    std::string nodeName();
+    std::string showRaw(const core::GlobalState &gs, int tabs = 0) const;
+    std::string nodeName() const;
 
     void _sanityCheck();
 };
@@ -463,8 +475,8 @@ public:
     ExpressionPtr deepCopy() const;
 
     std::string toStringWithTabs(const core::GlobalState &gs, int tabs = 0) const;
-    std::string showRaw(const core::GlobalState &gs, int tabs = 0);
-    std::string nodeName();
+    std::string showRaw(const core::GlobalState &gs, int tabs = 0) const;
+    std::string nodeName() const;
 
     void _sanityCheck();
 };
@@ -481,8 +493,8 @@ public:
     ExpressionPtr deepCopy() const;
 
     std::string toStringWithTabs(const core::GlobalState &gs, int tabs = 0) const;
-    std::string showRaw(const core::GlobalState &gs, int tabs = 0);
-    std::string nodeName();
+    std::string showRaw(const core::GlobalState &gs, int tabs = 0) const;
+    std::string nodeName() const;
 
     void _sanityCheck();
 };
@@ -499,8 +511,8 @@ public:
     ExpressionPtr deepCopy() const;
 
     std::string toStringWithTabs(const core::GlobalState &gs, int tabs = 0) const;
-    std::string showRaw(const core::GlobalState &gs, int tabs = 0);
-    std::string nodeName();
+    std::string showRaw(const core::GlobalState &gs, int tabs = 0) const;
+    std::string nodeName() const;
 
     void _sanityCheck();
 };
@@ -525,8 +537,8 @@ public:
     ExpressionPtr deepCopy() const;
 
     std::string toStringWithTabs(const core::GlobalState &gs, int tabs = 0) const;
-    std::string showRaw(const core::GlobalState &gs, int tabs = 0);
-    std::string nodeName();
+    std::string showRaw(const core::GlobalState &gs, int tabs = 0) const;
+    std::string nodeName() const;
 
     void _sanityCheck();
 };
@@ -550,8 +562,8 @@ public:
     ExpressionPtr deepCopy() const;
 
     std::string toStringWithTabs(const core::GlobalState &gs, int tabs = 0) const;
-    std::string showRaw(const core::GlobalState &gs, int tabs = 0);
-    std::string nodeName();
+    std::string showRaw(const core::GlobalState &gs, int tabs = 0) const;
+    std::string nodeName() const;
 
     void _sanityCheck();
 };
@@ -568,8 +580,8 @@ public:
     ExpressionPtr deepCopy() const;
 
     std::string toStringWithTabs(const core::GlobalState &gs, int tabs = 0) const;
-    std::string showRaw(const core::GlobalState &gs, int tabs = 0);
-    std::string nodeName();
+    std::string showRaw(const core::GlobalState &gs, int tabs = 0) const;
+    std::string nodeName() const;
 
     void _sanityCheck();
 };
@@ -593,8 +605,8 @@ public:
     ExpressionPtr deepCopy() const;
 
     std::string toStringWithTabs(const core::GlobalState &gs, int tabs = 0) const;
-    std::string showRaw(const core::GlobalState &gs, int tabs = 0);
-    std::string nodeName();
+    std::string showRaw(const core::GlobalState &gs, int tabs = 0) const;
+    std::string nodeName() const;
 
     void _sanityCheck();
 };
@@ -611,8 +623,8 @@ public:
     ExpressionPtr deepCopy() const;
 
     std::string toStringWithTabs(const core::GlobalState &gs, int tabs = 0) const;
-    std::string showRaw(const core::GlobalState &gs, int tabs = 0);
-    std::string nodeName();
+    std::string showRaw(const core::GlobalState &gs, int tabs = 0) const;
+    std::string nodeName() const;
 
     void _sanityCheck();
 };
@@ -629,8 +641,8 @@ public:
     ExpressionPtr deepCopy() const;
 
     std::string toStringWithTabs(const core::GlobalState &gs, int tabs = 0) const;
-    std::string showRaw(const core::GlobalState &gs, int tabs = 0);
-    std::string nodeName();
+    std::string showRaw(const core::GlobalState &gs, int tabs = 0) const;
+    std::string nodeName() const;
 
     void _sanityCheck();
 };
@@ -648,8 +660,8 @@ public:
     ExpressionPtr deepCopy() const;
 
     std::string toStringWithTabs(const core::GlobalState &gs, int tabs = 0) const;
-    std::string showRaw(const core::GlobalState &gs, int tabs = 0);
-    std::string nodeName();
+    std::string showRaw(const core::GlobalState &gs, int tabs = 0) const;
+    std::string nodeName() const;
 
     void _sanityCheck();
 };
@@ -666,8 +678,8 @@ public:
     ExpressionPtr deepCopy() const;
 
     std::string toStringWithTabs(const core::GlobalState &gs, int tabs = 0) const;
-    std::string showRaw(const core::GlobalState &gs, int tabs = 0);
-    std::string nodeName();
+    std::string showRaw(const core::GlobalState &gs, int tabs = 0) const;
+    std::string nodeName() const;
 
     void _sanityCheck();
 };
@@ -684,8 +696,8 @@ public:
     ExpressionPtr deepCopy() const;
 
     std::string toStringWithTabs(const core::GlobalState &gs, int tabs = 0) const;
-    std::string showRaw(const core::GlobalState &gs, int tabs = 0);
-    std::string nodeName();
+    std::string showRaw(const core::GlobalState &gs, int tabs = 0) const;
+    std::string nodeName() const;
 
     void _sanityCheck();
 };
@@ -703,8 +715,8 @@ public:
     ExpressionPtr deepCopy() const;
 
     std::string toStringWithTabs(const core::GlobalState &gs, int tabs = 0) const;
-    std::string showRaw(const core::GlobalState &gs, int tabs = 0);
-    std::string nodeName();
+    std::string showRaw(const core::GlobalState &gs, int tabs = 0) const;
+    std::string nodeName() const;
 
     void _sanityCheck();
 };
@@ -786,8 +798,8 @@ public:
     void addKwArg(ExpressionPtr key, ExpressionPtr value);
 
     std::string toStringWithTabs(const core::GlobalState &gs, int tabs = 0) const;
-    std::string showRaw(const core::GlobalState &gs, int tabs = 0);
-    std::string nodeName();
+    std::string showRaw(const core::GlobalState &gs, int tabs = 0) const;
+    std::string nodeName() const;
 
     // Add the given positional argument as the last positional argument.
     void addPosArg(ExpressionPtr ptr);
@@ -942,13 +954,15 @@ public:
     core::TypePtr type;
     ExpressionPtr arg;
 
-    Cast(core::LocOffsets loc, core::TypePtr ty, ExpressionPtr arg, core::NameRef cast);
+    ExpressionPtr typeExpr;
+
+    Cast(core::LocOffsets loc, core::TypePtr ty, ExpressionPtr arg, core::NameRef cast, ExpressionPtr typeExpr);
 
     ExpressionPtr deepCopy() const;
 
     std::string toStringWithTabs(const core::GlobalState &gs, int tabs = 0) const;
-    std::string showRaw(const core::GlobalState &gs, int tabs = 0);
-    std::string nodeName();
+    std::string showRaw(const core::GlobalState &gs, int tabs = 0) const;
+    std::string nodeName() const;
 
     void _sanityCheck();
 };
@@ -969,8 +983,8 @@ public:
     ExpressionPtr deepCopy() const;
 
     std::string toStringWithTabs(const core::GlobalState &gs, int tabs = 0) const;
-    std::string showRaw(const core::GlobalState &gs, int tabs = 0);
-    std::string nodeName();
+    std::string showRaw(const core::GlobalState &gs, int tabs = 0) const;
+    std::string nodeName() const;
 
     void _sanityCheck();
 };
@@ -990,8 +1004,8 @@ public:
     ExpressionPtr deepCopy() const;
 
     std::string toStringWithTabs(const core::GlobalState &gs, int tabs = 0) const;
-    std::string showRaw(const core::GlobalState &gs, int tabs = 0);
-    std::string nodeName();
+    std::string showRaw(const core::GlobalState &gs, int tabs = 0) const;
+    std::string nodeName() const;
 
     void _sanityCheck();
 };
@@ -1008,19 +1022,19 @@ public:
     ExpressionPtr deepCopy() const;
 
     std::string toStringWithTabs(const core::GlobalState &gs, int tabs = 0) const;
-    std::string showRaw(const core::GlobalState &gs, int tabs = 0);
-    std::string nodeName();
-    bool isString(const core::GlobalState &gs) const;
-    bool isSymbol(const core::GlobalState &gs) const;
+    std::string showRaw(const core::GlobalState &gs, int tabs = 0) const;
+    std::string nodeName() const;
+    bool isString() const;
+    bool isSymbol() const;
     bool isNil(const core::GlobalState &gs) const;
-    core::NameRef asString(const core::GlobalState &gs) const;
-    core::NameRef asSymbol(const core::GlobalState &gs) const;
+    core::NameRef asString() const;
+    core::NameRef asSymbol() const;
     bool isTrue(const core::GlobalState &gs) const;
     bool isFalse(const core::GlobalState &gs) const;
 
     void _sanityCheck();
 };
-CheckSize(Literal, 24, 8);
+CheckSize(Literal, 16, 8);
 
 EXPRESSION(UnresolvedConstantLit) {
 public:
@@ -1034,8 +1048,8 @@ public:
     ExpressionPtr deepCopy() const;
 
     std::string toStringWithTabs(const core::GlobalState &gs, int tabs = 0) const;
-    std::string showRaw(const core::GlobalState &gs, int tabs = 0);
-    std::string nodeName();
+    std::string showRaw(const core::GlobalState &gs, int tabs = 0) const;
+    std::string nodeName() const;
 
     void _sanityCheck();
 };
@@ -1058,8 +1072,8 @@ public:
     ExpressionPtr deepCopy() const;
 
     std::string toStringWithTabs(const core::GlobalState &gs, int tabs = 0) const;
-    std::string showRaw(const core::GlobalState &gs, int tabs = 0);
-    std::string nodeName();
+    std::string showRaw(const core::GlobalState &gs, int tabs = 0) const;
+    std::string nodeName() const;
     std::optional<std::pair<core::SymbolRef, std::vector<core::NameRef>>> fullUnresolvedPath(
         const core::GlobalState &gs) const;
 
@@ -1077,8 +1091,8 @@ public:
     ExpressionPtr deepCopy() const;
 
     std::string toStringWithTabs(const core::GlobalState &gs, int tabs = 0) const;
-    std::string showRaw(const core::GlobalState &gs, int tabs = 0);
-    std::string nodeName();
+    std::string showRaw(const core::GlobalState &gs, int tabs = 0) const;
+    std::string nodeName() const;
 
     void _sanityCheck();
 };
@@ -1096,8 +1110,8 @@ public:
     ExpressionPtr deepCopy() const;
 
     std::string toStringWithTabs(const core::GlobalState &gs, int tabs = 0) const;
-    std::string showRaw(const core::GlobalState &gs, int tabs = 0);
-    std::string nodeName();
+    std::string showRaw(const core::GlobalState &gs, int tabs = 0) const;
+    std::string nodeName() const;
     void _sanityCheck();
 };
 CheckSize(Block, 40, 8);
@@ -1119,12 +1133,32 @@ public:
     ExpressionPtr deepCopy() const;
 
     std::string toStringWithTabs(const core::GlobalState &gs, int tabs = 0) const;
-    std::string showRaw(const core::GlobalState &gs, int tabs = 0);
-    std::string nodeName();
+    std::string showRaw(const core::GlobalState &gs, int tabs = 0) const;
+    std::string nodeName() const;
 
     void _sanityCheck();
 };
 CheckSize(InsSeq, 56, 8);
+
+EXPRESSION(RuntimeMethodDefinition) {
+public:
+    // This should be equivalent to MethodDef.declLoc.
+    // It's called `loc` because every node in the AST has to have a `loc` field.
+    const core::LocOffsets loc;
+    core::NameRef name;
+    const bool isSelfMethod;
+
+    RuntimeMethodDefinition(core::LocOffsets loc, core::NameRef name, bool isSelfMethod);
+
+    ExpressionPtr deepCopy() const;
+
+    std::string toStringWithTabs(const core::GlobalState &gs, int tabs = 0) const;
+    std::string showRaw(const core::GlobalState &gs, int tabs = 0) const;
+    std::string nodeName() const;
+
+    void _sanityCheck();
+};
+CheckSize(RuntimeMethodDefinition, 16, 8);
 
 EXPRESSION(EmptyTree) {
 public:
@@ -1135,8 +1169,8 @@ public:
     ExpressionPtr deepCopy() const;
 
     std::string toStringWithTabs(const core::GlobalState &gs, int tabs = 0) const;
-    std::string showRaw(const core::GlobalState &gs, int tabs = 0);
-    std::string nodeName();
+    std::string showRaw(const core::GlobalState &gs, int tabs = 0) const;
+    std::string nodeName() const;
 
     void _sanityCheck();
 };

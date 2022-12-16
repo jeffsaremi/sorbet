@@ -378,8 +378,8 @@ Another exception: for `package-tree` exp tests, the filename is always
 ### CLI tests
 
 Any folder `<name>` that is added to `test/cli/` becomes a test.
-This folder should have a file `<name>.sh` that is executable.
-When run, its output will be compared against `<name>.out` in that folder.
+This folder should have a file `test.sh` that is executable.
+When run, its output will be compared against `test.out` in that folder.
 
 Our bazel setup will produce two targets:
 
@@ -479,6 +479,57 @@ different version number, and also marked `default-arg-value`:
 
 This is due to the translation of defaults into the CFG: there is a synthetic conditional that chooses either to
 initialize the variable from the argument passed at the send, or to the default value when no value is present.
+
+Finding all references works differently in package specification (__package.rb) files. Consider the following:
+
+```ruby
+class Foo < PackageSpec
+  import Bar
+```
+
+Calling "find all references" on `Bar` in this file will return only references to `Bar` in the `Foo` package. LSP tests 
+have access to `import` and `importusage` assertions that you can use to test this functionality.
+
+```ruby
+class Foo < PackageSpec
+  import Bar
+  #      ^^^ import: bar
+```
+
+```ruby
+  class Foo::Baz
+    Bar.new
+ #  ^^^ importusage: bar
+  end
+```
+
+With these annotations, the LSP test will check if "find all references" on `Bar` in `import Bar` statement returns the `Bar.new` usage.
+
+Note that an `import` assertion is dissimilar to a `def` assertion, in that it is in fact a subclass of a `usage` assertion. 
+In this case, the `def` corresponding to an `import` is the PackageSpec declaration of the imported package. Calling "find all references"
+on a PackageSpec declaration will return all imports of the package.
+
+
+```ruby
+class Bar < PackageSpec
+  #   ^^^ def: bar
+  import Bar
+```
+
+```ruby
+class Foo < PackageSpec
+  import Bar
+  #      ^^^ import: bar
+```
+
+```ruby
+class Baz < PackageSpec
+  import Bar
+  #      ^^^ import: bar
+```
+
+With these annotations, the LSP test will check if "find all references" on `Bar` from the `class Bar < PackageSpec`
+declaration returns the declaration itself plus the imports.
 
 #### Testing "Go to Type Definition"
 
@@ -778,6 +829,24 @@ Inside `*.rbupdate` files, you can assert that the slow path ran by adding a lin
 You can assert that the fast path ran on `foo__bar.rb` and `foo__baz.rb` with
 `#assert-fast-path: foo__bar.rb,foo__baz.rb`.
 
+Note that the default behavior when testing multi-file updates (e.g.,
+`*__1.1.rbupdate` + `*__2.1.rbupdate`) is to include all the files in the file
+update that is created and sent to the LSP server. When testing changes that
+assert whether the right files were typechecked on the fast path with
+`assert-fast-path`, you also likely want to declare which files **should not**
+be included in the file edit, leaving Sorbet to figure out the subset of files
+to be typechecked. **But** regardless of whether a file was included in the
+update set, you likely want to assert that error occur at certain points inside
+the file. For this, you can use `# exclude-from-file-update: true` inside an
+`rbupdate` file. Note that when using this, the act of adding the
+`exclude-from-file-update` assertion in the `rbupdate` will have the effect of
+shifting all the `error` assertions off by one line compared to where the LSP
+server will be reporting those errors. To work around this, you should leave a
+spacer line in the previous file, so that the `exclude-from-file-update`
+assertion replaces the spacer line, instead of being inserted into the file as a
+completely new line. Search for `spacer` in some of the `fast_path` tests to see
+an example.
+
 ### LSP recorded tests
 
 It is possible to record an LSP session and use it as a test. We are attempting to move away from this form of
@@ -821,9 +890,6 @@ tools/scripts/update_testdata_exp.sh test/testdata/cfg/next.rb
 
 # Only update the `*.out` files in `test/cli`
 bazel test //test/cli:update
-
-# Update the `*.exp` files in `gems/sorbet/test/hidden-method-finder`
-gems/sorbet/test/hidden-method-finder/update_hidden_methods_exp.sh
 ```
 
 
@@ -882,6 +948,8 @@ To set up a new worktree with Sorbet:
 ```shell
 tools/scripts/make_worktree.sh <worktree_name>
 ```
+
+[multiple working trees]: https://git-scm.com/docs/git-worktree
 
 ### Shell
 

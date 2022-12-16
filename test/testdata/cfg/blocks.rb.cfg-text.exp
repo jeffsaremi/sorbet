@@ -1,13 +1,10 @@
 method ::<Class:<root>>#<static-init> {
 
-bb0[rubyRegionId=0, firstDead=8]():
+bb0[rubyRegionId=0, firstDead=5]():
     <self>: T.class_of(<root>) = cast(<self>: NilClass, T.class_of(<root>));
-    <cfgAlias>$5: T.class_of(<Magic>) = alias <C <Magic>>
-    <cfgAlias>$7: T.class_of(BlockTest) = alias <C BlockTest>
-    <statTemp>$3: Sorbet::Private::Static::Void = <cfgAlias>$5: T.class_of(<Magic>).<define-top-class-or-module>(<cfgAlias>$7: T.class_of(BlockTest))
-    <cfgAlias>$10: T.class_of(Sorbet::Private::Static) = alias <C Static>
-    <cfgAlias>$12: T.class_of(BlockTest) = alias <C BlockTest>
-    <statTemp>$8: Sorbet::Private::Static::Void = <cfgAlias>$10: T.class_of(Sorbet::Private::Static).keep_for_ide(<cfgAlias>$12: T.class_of(BlockTest))
+    <cfgAlias>$6: T.class_of(Sorbet::Private::Static) = alias <C Static>
+    <cfgAlias>$8: T.class_of(BlockTest) = alias <C BlockTest>
+    <statTemp>$4: Sorbet::Private::Static::Void = <cfgAlias>$6: T.class_of(Sorbet::Private::Static).keep_for_ide(<cfgAlias>$8: T.class_of(BlockTest))
     <finalReturn>: T.noreturn = return <returnMethodTemp>$2: NilClass
     <unconditional> -> bb1
 
@@ -52,10 +49,10 @@ bb3[rubyRegionId=0, firstDead=2](<block-pre-call-temp>$7: Sorbet::Private::Stati
 # - bb2(rubyRegionId=1)
 bb5[rubyRegionId=1, firstDead=6](<self>: BlockTest, <block-pre-call-temp>$7: Sorbet::Private::Static::Void, <selfRestore>$8: BlockTest):
     # outerLoops: 1
-    <self>: BlockTest = loadSelf
+    <self>: BlockTest = loadSelf(foo)
     <blk>$9: T.untyped = load_yield_params(foo)
-    x$1: T.untyped = yield_load_arg(0)
-    y$1: T.untyped = yield_load_arg(1)
+    x$1: T.untyped = yield_load_arg(0, <blk>$9: T.untyped)
+    y$1: T.untyped = yield_load_arg(1, <blk>$9: T.untyped)
     <blockReturnTemp>$10: T.untyped = x$1
     <blockReturnTemp>$11: T.noreturn = blockreturn<foo> <blockReturnTemp>$10: T.untyped
     <unconditional> -> bb2
@@ -64,12 +61,9 @@ bb5[rubyRegionId=1, firstDead=6](<self>: BlockTest, <block-pre-call-temp>$7: Sor
 
 method ::<Class:BlockTest>#<static-init> {
 
-bb0[rubyRegionId=0, firstDead=6]():
+bb0[rubyRegionId=0, firstDead=3]():
     <self>: T.class_of(BlockTest) = cast(<self>: NilClass, T.class_of(BlockTest));
-    <cfgAlias>$4: T.class_of(Sorbet::Private::Static) = alias <C Static>
-    <statTemp>$6: Symbol(:blockPass) = :blockPass
-    <statTemp>$7: Symbol(:normal) = :normal
-    <returnMethodTemp>$2: Symbol(:blockPass) = <cfgAlias>$4: T.class_of(Sorbet::Private::Static).keep_def(<self>: T.class_of(BlockTest), <statTemp>$6: Symbol(:blockPass), <statTemp>$7: Symbol(:normal))
+    <returnMethodTemp>$2: Symbol(:blockPass) = :blockPass
     <finalReturn>: T.noreturn = return <returnMethodTemp>$2: Symbol(:blockPass)
     <unconditional> -> bb1
 

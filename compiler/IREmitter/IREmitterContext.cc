@@ -28,16 +28,16 @@ optional<string_view> isSymbol(const core::GlobalState &gs, const cfg::Instructi
         return std::nullopt;
     }
 
-    if (!core::isa_type<core::LiteralType>(liti->value)) {
+    if (!core::isa_type<core::NamedLiteralType>(liti->value)) {
         return std::nullopt;
     }
 
-    const auto &lit = core::cast_type_nonnull<core::LiteralType>(liti->value);
-    if (lit.literalKind != core::LiteralType::LiteralTypeKind::Symbol) {
+    const auto &lit = core::cast_type_nonnull<core::NamedLiteralType>(liti->value);
+    if (lit.literalKind != core::NamedLiteralType::LiteralTypeKind::Symbol) {
         return std::nullopt;
     }
 
-    return lit.asName(gs).shortName(gs);
+    return lit.asName().shortName(gs);
 }
 
 struct AliasesAndKeywords {
@@ -742,8 +742,7 @@ string locationNameFor(CompilerState &cs, core::MethodRef symbol) {
         enclosingClassRef = enclosingClassRef.data(cs)->attachedClass(cs);
         ENFORCE(enclosingClassRef.exists());
         const auto &enclosingClass = enclosingClassRef.data(cs);
-        return fmt::format("<{}:{}>", enclosingClass->isClassOrModuleClass() ? "class"sv : "module"sv,
-                           enclosingClassRef.show(cs));
+        return fmt::format("<{}:{}>", enclosingClass->isClass() ? "class"sv : "module"sv, enclosingClassRef.show(cs));
     } else if (IREmitterHelpers::isFileStaticInit(cs, symbol)) {
         return string("<top (required)>"sv);
     } else {

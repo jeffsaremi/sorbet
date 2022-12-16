@@ -2,9 +2,11 @@
 #define SORBET_TYPES_H
 
 #include "absl/base/casts.h"
+#include "absl/types/span.h"
 #include "common/Counters.h"
 #include "core/Context.h"
 #include "core/Error.h"
+#include "core/ParsedArg.h"
 #include "core/ShowOptions.h"
 #include "core/SymbolRef.h"
 #include "core/TypeConstraint.h"
@@ -13,7 +15,6 @@
 #include <string>
 namespace sorbet::core {
 /** Dmitry: unlike in Dotty, those types are always dealiased. For now */
-class Type;
 class AppliedType;
 class IntrinsicMethod;
 class TypeConstraint;
@@ -21,32 +22,17 @@ struct DispatchArgs;
 struct DispatchComponent;
 struct DispatchResult;
 struct CallLocs;
-class Symbol;
+class ClassOrModule;
 class TypeVar;
 class SendAndBlockLink;
 class TypeAndOrigins;
 
 class ArgInfo {
 public:
-    struct ArgFlags {
-        bool isKeyword : 1;
-        bool isRepeated : 1;
-        bool isDefault : 1;
-        bool isShadow : 1;
-        bool isBlock : 1;
-
-        // In C++20 we can replace this with bit field initialzers
-        ArgFlags() : isKeyword(false), isRepeated(false), isDefault(false), isShadow(false), isBlock(false) {}
-
-    private:
-        friend class Method;
-        friend class serialize::SerializerImpl;
-
-        void setFromU1(uint8_t flags);
-        uint8_t toU1() const;
-    };
+    using ArgFlags = core::ParsedArg::ArgFlags;
     ArgFlags flags;
     NameRef name;
+    // Stores the `.bind(...)` symbol if the `&blk` arg's type had one
     ClassOrModuleRef rebind;
     Loc loc;
     TypePtr type;
@@ -67,7 +53,7 @@ public:
     ArgInfo &operator=(ArgInfo &&) noexcept = default;
     ArgInfo deepCopy() const;
 };
-CheckSize(ArgInfo, 40, 8);
+CheckSize(ArgInfo, 32, 8);
 
 template <class T, class... Args> TypePtr make_type(Args &&...args) {
     static_assert(!TypePtr::TypeToIsInlined<T>::value, "Inlined types must specialize `make_type` for each combination "
@@ -99,10 +85,14 @@ public:
     /** is every instance of  t1 an  instance of t2 when not allowed to modify constraint */
     static bool isSubType(const GlobalState &gs, const TypePtr &t1, const TypePtr &t2);
     static bool equiv(const GlobalState &gs, const TypePtr &t1, const TypePtr &t2);
+    static bool equivUnderConstraint(const GlobalState &gs, TypeConstraint &constr, const TypePtr &t1,
+                                     const TypePtr &t2);
 
     /** check that t1 <: t2, but do not consider `T.untyped` as super type or a subtype of all other types */
     static bool isAsSpecificAs(const GlobalState &gs, const TypePtr &t1, const TypePtr &t2);
     static bool equivNoUntyped(const GlobalState &gs, const TypePtr &t1, const TypePtr &t2);
+    static bool equivNoUntypedUnderConstraint(const GlobalState &gs, TypeConstraint &constr, const TypePtr &t1,
+                                              const TypePtr &t2);
 
     static TypePtr top();
     static TypePtr bottom();
@@ -122,6 +112,7 @@ public:
     static TypePtr rangeOfUntyped();
     static TypePtr hashOfUntyped();
     static TypePtr procClass();
+    static TypePtr nilableProcClass();
     static TypePtr classClass();
     static TypePtr declBuilderForProcsSingletonClass();
     static TypePtr falsyTypes();
@@ -140,8 +131,8 @@ public:
                                                              const std::vector<TypePtr> &targs, ClassOrModuleRef asIf);
     // Extract the return value type from a proc.
     static TypePtr getProcReturnType(const GlobalState &gs, const TypePtr &procType);
-    static TypePtr instantiate(const GlobalState &gs, const TypePtr &what,
-                               const InlinedVector<TypeMemberRef, 4> &params, const std::vector<TypePtr> &targs);
+    static TypePtr instantiate(const GlobalState &gs, const TypePtr &what, absl::Span<const TypeMemberRef> params,
+                               const std::vector<TypePtr> &targs);
     /** Replace all type variables in `what` with their instantiations.
      * Requires that `tc` has already been solved.
      */
@@ -191,7 +182,9 @@ struct Intrinsic {
     const NameRef method;
     const IntrinsicMethod *impl;
 };
-extern const std::vector<Intrinsic> intrinsicMethods;
+absl::Span<const Intrinsic> intrinsicMethods();
+using IntrinsicMethodsDispatchMap = UnorderedMap<NameRef, const std::vector<NameRef>>;
+const IntrinsicMethodsDispatchMap &intrinsicMethodsDispatchMap();
 
 template <class To> bool isa_type(const TypePtr &what) {
     return what != nullptr && what.tag() == TypePtr::TypeToTag<To>::value;
@@ -226,7 +219,9 @@ inline bool is_ground_type(const TypePtr &what) {
         case TypePtr::Tag::OrType:
         case TypePtr::Tag::AndType:
             return true;
-        case TypePtr::Tag::LiteralType:
+        case TypePtr::Tag::NamedLiteralType:
+        case TypePtr::Tag::IntegerLiteralType:
+        case TypePtr::Tag::FloatLiteralType:
         case TypePtr::Tag::ShapeType:
         case TypePtr::Tag::TupleType:
         case TypePtr::Tag::MetaType:
@@ -245,7 +240,9 @@ inline bool is_proxy_type(const TypePtr &what) {
         return false;
     }
     switch (what.tag()) {
-        case TypePtr::Tag::LiteralType:
+        case TypePtr::Tag::NamedLiteralType:
+        case TypePtr::Tag::IntegerLiteralType:
+        case TypePtr::Tag::FloatLiteralType:
         case TypePtr::Tag::ShapeType:
         case TypePtr::Tag::TupleType:
         case TypePtr::Tag::MetaType:
@@ -348,11 +345,11 @@ public:
 CheckSize(ClassType, 8, 8);
 
 template <> inline TypePtr make_type<ClassType, core::ClassOrModuleRef>(core::ClassOrModuleRef &&ref) {
-    return TypePtr(TypePtr::Tag::ClassType, ref.id(), 0);
+    return TypePtr(TypePtr::Tag::ClassType, ref.id());
 }
 
 template <> inline TypePtr make_type<ClassType, core::ClassOrModuleRef &>(core::ClassOrModuleRef &ref) {
-    return TypePtr(TypePtr::Tag::ClassType, ref.id(), 0);
+    return TypePtr(TypePtr::Tag::ClassType, ref.id());
 }
 
 template <> inline ClassType cast_type_nonnull<ClassType>(const TypePtr &what) {
@@ -369,7 +366,7 @@ template <> inline ClassType cast_type_nonnull<ClassType>(const TypePtr &what) {
  * This is the type used to represent a use of a type_member or type_template in
  * a signature.
  */
-TYPE(LambdaParam) final {
+TYPE(LambdaParam) final : public Refcounted {
 public:
     TypeMemberRef definition;
 
@@ -379,6 +376,8 @@ public:
     TypePtr upperBound;
 
     LambdaParam(TypeMemberRef definition, TypePtr lower, TypePtr upper);
+    LambdaParam(const LambdaParam &) = delete;
+    LambdaParam &operator=(const LambdaParam &) = delete;
     std::string toStringWithTabs(const GlobalState &gs, int tabs = 0) const;
     std::string show(const GlobalState &gs) const {
         return show(gs, {});
@@ -390,10 +389,10 @@ public:
 
     void _sanityCheck(const GlobalState &gs) const;
 
-    TypePtr _instantiate(const GlobalState &gs, const InlinedVector<TypeMemberRef, 4> &params,
+    TypePtr _instantiate(const GlobalState &gs, absl::Span<const TypeMemberRef> params,
                          const std::vector<TypePtr> &targs) const;
 };
-CheckSize(LambdaParam, 40, 8);
+CheckSize(LambdaParam, 24, 8);
 
 TYPE_INLINED(SelfTypeParam) final {
 public:
@@ -415,7 +414,12 @@ public:
 CheckSize(SelfTypeParam, 8, 8);
 
 template <> inline TypePtr make_type<SelfTypeParam, core::SymbolRef &>(core::SymbolRef &definition) {
-    return TypePtr(TypePtr::Tag::SelfTypeParam, definition.rawId(), 0);
+    return TypePtr(TypePtr::Tag::SelfTypeParam, definition.rawId());
+}
+
+template <> inline TypePtr make_type<SelfTypeParam, core::TypeArgumentRef &>(core::TypeArgumentRef &definition) {
+    auto sym = SymbolRef(definition);
+    return make_type<SelfTypeParam>(sym);
 }
 
 template <> inline SelfTypeParam cast_type_nonnull<SelfTypeParam>(const TypePtr &what) {
@@ -440,11 +444,11 @@ public:
 CheckSize(AliasType, 8, 8);
 
 template <> inline TypePtr make_type<AliasType, core::SymbolRef &>(core::SymbolRef &other) {
-    return TypePtr(TypePtr::Tag::AliasType, other.rawId(), 0);
+    return TypePtr(TypePtr::Tag::AliasType, other.rawId());
 }
 
 template <> inline TypePtr make_type<AliasType, core::SymbolRef>(core::SymbolRef &&other) {
-    return TypePtr(TypePtr::Tag::AliasType, other.rawId(), 0);
+    return TypePtr(TypePtr::Tag::AliasType, other.rawId());
 }
 
 template <> inline AliasType cast_type_nonnull<AliasType>(const TypePtr &what) {
@@ -476,7 +480,7 @@ CheckSize(SelfType, 8, 8);
 
 template <> inline TypePtr make_type<SelfType>() {
     // static_cast required to disambiguate TypePtr constructor.
-    return TypePtr(TypePtr::Tag::SelfType, static_cast<uint32_t>(0), 0);
+    return TypePtr(TypePtr::Tag::SelfType, uint64_t(0));
 }
 
 template <> inline SelfType cast_type_nonnull<SelfType>(const TypePtr &what) {
@@ -484,25 +488,18 @@ template <> inline SelfType cast_type_nonnull<SelfType>(const TypePtr &what) {
     return SelfType();
 }
 
-TYPE_INLINED(LiteralType) final {
-    union {
-        const int64_t value;
-        const double floatval;
-        const uint32_t nameId;
-    };
+TYPE_INLINED(NamedLiteralType) final {
+    const NameRef name;
 
 public:
-    enum class LiteralTypeKind : uint8_t { Integer, String, Symbol, Float };
+    enum class LiteralTypeKind : uint8_t { String, Symbol };
     const LiteralTypeKind literalKind;
-    LiteralType(int64_t val);
-    LiteralType(double val);
-    LiteralType(ClassOrModuleRef klass, NameRef val);
+    NamedLiteralType(ClassOrModuleRef klass, NameRef val);
     TypePtr underlying(const GlobalState &gs) const;
     bool derivesFrom(const GlobalState &gs, ClassOrModuleRef klass) const;
-    DispatchResult dispatchCall(const GlobalState &gs, DispatchArgs args) const;
+    DispatchResult dispatchCall(const GlobalState &gs, const DispatchArgs &args) const;
     int64_t asInteger() const;
-    double asFloat() const;
-    core::NameRef asName(const core::GlobalState &gs) const;
+    core::NameRef asName() const;
     core::NameRef unsafeAsName() const;
 
     std::string toStringWithTabs(const GlobalState &gs, int tabs = 0) const;
@@ -513,71 +510,114 @@ public:
     std::string showValue(const GlobalState &gs) const;
     uint32_t hash(const GlobalState &gs) const;
 
-    bool equals(const LiteralType &rhs) const;
+    bool equals(const NamedLiteralType &rhs) const;
     void _sanityCheck(const GlobalState &gs) const;
 };
-CheckSize(LiteralType, 16, 8);
+CheckSize(NamedLiteralType, 8, 8);
 
-template <> inline TypePtr make_type<LiteralType, double &>(double &val) {
-    return TypePtr(TypePtr::Tag::LiteralType, static_cast<uint32_t>(LiteralType::LiteralTypeKind::Float),
-                   absl::bit_cast<uint64_t>(val));
+// TODO(froydnj) it would be more work, but maybe it would be cleaner to split this
+// type into distinct types, rather than doing this manual tagging.
+template <>
+inline TypePtr make_type<NamedLiteralType, ClassOrModuleRef, NameRef &>(ClassOrModuleRef &&klass, NameRef &val) {
+    NamedLiteralType type(klass, val);
+    return TypePtr(TypePtr::Tag::NamedLiteralType,
+                   (uint64_t(val.rawId()) << 8) | static_cast<uint64_t>(type.literalKind));
 }
 
-template <> inline TypePtr make_type<LiteralType, double>(double &&val) {
-    return TypePtr(TypePtr::Tag::LiteralType, static_cast<uint32_t>(LiteralType::LiteralTypeKind::Float),
-                   absl::bit_cast<uint64_t>(val));
+template <>
+inline TypePtr make_type<NamedLiteralType, ClassOrModuleRef, NameRef>(ClassOrModuleRef &&klass, NameRef &&val) {
+    NamedLiteralType type(klass, val);
+    return TypePtr(TypePtr::Tag::NamedLiteralType,
+                   (uint64_t(val.rawId()) << 8) | static_cast<uint64_t>(type.literalKind));
 }
 
-template <> inline TypePtr make_type<LiteralType, int64_t>(int64_t &&val) {
-    return TypePtr(TypePtr::Tag::LiteralType, static_cast<uint32_t>(LiteralType::LiteralTypeKind::Integer),
-                   absl::bit_cast<uint64_t>(val));
-}
-
-template <> inline TypePtr make_type<LiteralType, long &>(long &val) {
-    return make_type<LiteralType>(static_cast<int64_t>(val));
-}
-
-template <> inline TypePtr make_type<LiteralType, long long &>(long long &val) {
-    return make_type<LiteralType>(static_cast<int64_t>(val));
-}
-
-template <> inline TypePtr make_type<LiteralType, float>(float &&val) {
-    return make_type<LiteralType>(static_cast<double>(val));
-}
-
-template <> inline TypePtr make_type<LiteralType, ClassOrModuleRef, NameRef &>(ClassOrModuleRef &&klass, NameRef &val) {
-    LiteralType type(klass, val);
-    return TypePtr(TypePtr::Tag::LiteralType, static_cast<uint32_t>(type.literalKind), val.rawId());
-}
-
-template <> inline TypePtr make_type<LiteralType, ClassOrModuleRef, NameRef>(ClassOrModuleRef &&klass, NameRef &&val) {
-    LiteralType type(klass, val);
-    return TypePtr(TypePtr::Tag::LiteralType, static_cast<uint32_t>(type.literalKind), val.rawId());
-}
-
-template <> inline LiteralType cast_type_nonnull<LiteralType>(const TypePtr &what) {
-    ENFORCE_NO_TIMER(isa_type<LiteralType>(what));
-    auto literalKind = static_cast<LiteralType::LiteralTypeKind>(what.inlinedValue());
+template <> inline NamedLiteralType cast_type_nonnull<NamedLiteralType>(const TypePtr &what) {
+    ENFORCE_NO_TIMER(isa_type<NamedLiteralType>(what));
+    uint64_t tagged = what.inlinedValue();
+    uint32_t id = static_cast<uint32_t>(tagged >> 8);
+    auto literalKind = static_cast<NamedLiteralType::LiteralTypeKind>(tagged & 0xff);
     switch (literalKind) {
-        case LiteralType::LiteralTypeKind::Float:
-            return LiteralType(absl::bit_cast<double>(what.value));
-        case LiteralType::LiteralTypeKind::Integer:
-            return LiteralType(absl::bit_cast<int64_t>(what.value));
-        case LiteralType::LiteralTypeKind::String:
-            return LiteralType(Symbols::String(), NameRef::fromRawUnchecked(static_cast<uint32_t>(what.value)));
-        case LiteralType::LiteralTypeKind::Symbol:
-            return LiteralType(Symbols::Symbol(), NameRef::fromRawUnchecked(static_cast<uint32_t>(what.value)));
+        case NamedLiteralType::LiteralTypeKind::String:
+            return NamedLiteralType(Symbols::String(), NameRef::fromRawUnchecked(id));
+        case NamedLiteralType::LiteralTypeKind::Symbol:
+            return NamedLiteralType(Symbols::Symbol(), NameRef::fromRawUnchecked(id));
     }
+}
+
+TYPE(IntegerLiteralType) final : public Refcounted {
+public:
+    const int64_t value;
+
+    IntegerLiteralType(int64_t val);
+    TypePtr underlying(const GlobalState &gs) const;
+    bool derivesFrom(const GlobalState &gs, ClassOrModuleRef klass) const;
+    DispatchResult dispatchCall(const GlobalState &gs, const DispatchArgs &args) const;
+
+    std::string toStringWithTabs(const GlobalState &gs, int tabs = 0) const;
+    std::string show(const GlobalState &gs) const {
+        return show(gs, {});
+    };
+    std::string show(const GlobalState &gs, ShowOptions options) const;
+    std::string showValue(const GlobalState &gs) const;
+    uint32_t hash(const GlobalState &gs) const;
+
+    bool equals(const IntegerLiteralType &rhs) const;
+    void _sanityCheck(const GlobalState &gs) const;
+};
+CheckSize(IntegerLiteralType, 16, 8);
+
+template <> inline TypePtr make_type<IntegerLiteralType, int64_t>(int64_t &&val) {
+    return make_type<IntegerLiteralType>(absl::bit_cast<uint64_t>(val));
+}
+
+template <> inline TypePtr make_type<IntegerLiteralType, long &>(long &val) {
+    return make_type<IntegerLiteralType>(static_cast<int64_t>(val));
+}
+
+template <> inline TypePtr make_type<IntegerLiteralType, long long &>(long long &val) {
+    return make_type<IntegerLiteralType>(static_cast<int64_t>(val));
+}
+
+TYPE(FloatLiteralType) final : public Refcounted {
+public:
+    const double value;
+
+    FloatLiteralType(double val);
+    TypePtr underlying(const GlobalState &gs) const;
+    bool derivesFrom(const GlobalState &gs, ClassOrModuleRef klass) const;
+    DispatchResult dispatchCall(const GlobalState &gs, const DispatchArgs &args) const;
+
+    std::string toStringWithTabs(const GlobalState &gs, int tabs = 0) const;
+    std::string show(const GlobalState &gs) const {
+        return show(gs, {});
+    };
+    std::string show(const GlobalState &gs, ShowOptions options) const;
+    std::string showValue(const GlobalState &gs) const;
+    uint32_t hash(const GlobalState &gs) const;
+
+    bool equals(const FloatLiteralType &rhs) const;
+    void _sanityCheck(const GlobalState &gs) const;
+};
+CheckSize(FloatLiteralType, 16, 8);
+
+template <> inline TypePtr make_type<FloatLiteralType, double &&>(double &&val) {
+    return make_type<FloatLiteralType>(val);
+}
+
+template <> inline TypePtr make_type<FloatLiteralType, float &&>(float &&val) {
+    return make_type<FloatLiteralType>(static_cast<double>(val));
 }
 
 /*
  * TypeVars are the used for the type parameters of generic methods.
  * Note: These are mutated post-construction and cannot be inlined.
  */
-TYPE(TypeVar) final {
+TYPE(TypeVar) final : public Refcounted {
 public:
     TypeArgumentRef sym;
     TypeVar(TypeArgumentRef sym);
+    TypeVar(const TypeVar &) = delete;
+    TypeVar &operator=(const TypeVar &) = delete;
     std::string toStringWithTabs(const GlobalState &gs, int tabs = 0) const;
     std::string show(const GlobalState &gs) const {
         return show(gs, {});
@@ -588,16 +628,18 @@ public:
 
     bool derivesFrom(const GlobalState &gs, ClassOrModuleRef klass) const;
 
-    TypePtr _approximate(const GlobalState &gs, const TypeConstraint &tc) const;
+    TypePtr _approximate(const GlobalState &gs, const TypeConstraint &tc, core::Polarity polarity) const;
     TypePtr _instantiate(const GlobalState &gs, const TypeConstraint &tc) const;
 };
 CheckSize(TypeVar, 8, 8);
 
-TYPE(OrType) final {
+TYPE(OrType) final : public Refcounted {
 public:
     TypePtr left;
     TypePtr right;
 
+    OrType(const OrType &) = delete;
+    OrType &operator=(const OrType &) = delete;
     std::string toStringWithTabs(const GlobalState &gs, int tabs = 0) const;
     std::string show(const GlobalState &gs) const {
         return show(gs, {});
@@ -608,9 +650,9 @@ public:
     TypePtr getCallArguments(const GlobalState &gs, NameRef name) const;
     bool derivesFrom(const GlobalState &gs, ClassOrModuleRef klass) const;
     void _sanityCheck(const GlobalState &gs) const;
-    TypePtr _instantiate(const GlobalState &gs, const InlinedVector<TypeMemberRef, 4> &params,
+    TypePtr _instantiate(const GlobalState &gs, absl::Span<const TypeMemberRef> params,
                          const std::vector<TypePtr> &targs) const;
-    TypePtr _approximate(const GlobalState &gs, const TypeConstraint &tc) const;
+    TypePtr _approximate(const GlobalState &gs, const TypeConstraint &tc, core::Polarity polarity) const;
     TypePtr _instantiate(const GlobalState &gs, const TypeConstraint &tc) const;
     TypePtr _replaceSelfType(const GlobalState &gs, const TypePtr &receiver) const;
 
@@ -627,6 +669,7 @@ private:
      * constructor, so the friend declaration doesn't work), we provide the
      * `make_shared` helper here.
      */
+    friend TypePtr Types::nilableProcClass();
     friend TypePtr Types::falsyTypes();
     friend TypePtr Types::Boolean();
     friend class NameSubstitution;
@@ -640,18 +683,20 @@ private:
     friend TypePtr filterOrComponents(const TypePtr &originalType, const InlinedVector<TypePtr, 4> &typeFilter);
     friend TypePtr Types::dropSubtypesOf(const GlobalState &gs, const TypePtr &from, ClassOrModuleRef klass);
     friend TypePtr Types::unwrapSelfTypeParam(Context ctx, const TypePtr &t1);
-    friend class Symbol; // the actual method is `recordSealedSubclass(Mutableconst GlobalState &gs, SymbolRef
-                         // subclass)`, but refering to it introduces a cycle
+    friend class ClassOrModule; // the actual method is `recordSealedSubclass(Mutableconst GlobalState &gs, SymbolRef
+                                // subclass)`, but refering to it introduces a cycle
 
     static TypePtr make_shared(const TypePtr &left, const TypePtr &right);
 };
-CheckSize(OrType, 32, 8);
+CheckSize(OrType, 24, 8);
 
-TYPE(AndType) final {
+TYPE(AndType) final : public Refcounted {
 public:
     TypePtr left;
     TypePtr right;
 
+    AndType(const AndType &) = delete;
+    AndType &operator=(const AndType &) = delete;
     std::string toStringWithTabs(const GlobalState &gs, int tabs = 0) const;
     std::string show(const GlobalState &gs) const {
         return show(gs, {});
@@ -663,10 +708,10 @@ public:
     TypePtr getCallArguments(const GlobalState &gs, NameRef name) const;
     bool derivesFrom(const GlobalState &gs, ClassOrModuleRef klass) const;
     void _sanityCheck(const GlobalState &gs) const;
-    TypePtr _instantiate(const GlobalState &gs, const InlinedVector<TypeMemberRef, 4> &params,
+    TypePtr _instantiate(const GlobalState &gs, absl::Span<const TypeMemberRef> params,
                          const std::vector<TypePtr> &targs) const;
     TypePtr _replaceSelfType(const GlobalState &gs, const TypePtr &receiver) const;
-    TypePtr _approximate(const GlobalState &gs, const TypeConstraint &tc) const;
+    TypePtr _approximate(const GlobalState &gs, const TypeConstraint &tc, core::Polarity polarity) const;
     TypePtr _instantiate(const GlobalState &gs, const TypeConstraint &tc) const;
 
 private:
@@ -690,13 +735,15 @@ private:
 
     static TypePtr make_shared(const TypePtr &left, const TypePtr &right);
 };
-CheckSize(AndType, 32, 8);
+CheckSize(AndType, 24, 8);
 
-TYPE(ShapeType) final {
+TYPE(ShapeType) final : public Refcounted {
 public:
     std::vector<TypePtr> keys; // TODO: store sorted by whatever
     std::vector<TypePtr> values;
     ShapeType(std::vector<TypePtr> keys, std::vector<TypePtr> values);
+    ShapeType(const ShapeType &) = delete;
+    ShapeType &operator=(const ShapeType &) = delete;
 
     std::string toStringWithTabs(const GlobalState &gs, int tabs = 0) const;
     std::string show(const GlobalState &gs) const {
@@ -707,16 +754,21 @@ public:
     std::string showWithMoreInfo(const GlobalState &gs) const;
     DispatchResult dispatchCall(const GlobalState &gs, const DispatchArgs &args) const;
     void _sanityCheck(const GlobalState &gs) const;
-    TypePtr _instantiate(const GlobalState &gs, const InlinedVector<TypeMemberRef, 4> &params,
+    TypePtr _instantiate(const GlobalState &gs, absl::Span<const TypeMemberRef> params,
                          const std::vector<TypePtr> &targs) const;
-    TypePtr _approximate(const GlobalState &gs, const TypeConstraint &tc) const;
+    TypePtr _approximate(const GlobalState &gs, const TypeConstraint &tc, core::Polarity polarity) const;
     TypePtr _instantiate(const GlobalState &gs, const TypeConstraint &tc) const;
     TypePtr underlying(const GlobalState &gs) const;
     bool derivesFrom(const GlobalState &gs, core::ClassOrModuleRef klass) const;
-};
-CheckSize(ShapeType, 48, 8);
 
-TYPE(TupleType) final {
+    std::optional<size_t> indexForKey(const TypePtr &t) const;
+    std::optional<size_t> indexForKey(const NamedLiteralType &lit) const;
+    std::optional<size_t> indexForKey(const IntegerLiteralType &lit) const;
+    std::optional<size_t> indexForKey(const FloatLiteralType &lit) const;
+};
+CheckSize(ShapeType, 56, 8);
+
+TYPE(TupleType) final : public Refcounted {
 private:
     TupleType() = delete;
 
@@ -724,6 +776,8 @@ public:
     std::vector<TypePtr> elems;
 
     TupleType(std::vector<TypePtr> elements);
+    TupleType(const TupleType &) = delete;
+    TupleType &operator=(const TupleType &) = delete;
 
     std::string toStringWithTabs(const GlobalState &gs, int tabs = 0) const;
     std::string show(const GlobalState &gs) const {
@@ -733,10 +787,10 @@ public:
     std::string showWithMoreInfo(const GlobalState &gs) const;
     uint32_t hash(const GlobalState &gs) const;
     void _sanityCheck(const GlobalState &gs) const;
-    TypePtr _instantiate(const GlobalState &gs, const InlinedVector<TypeMemberRef, 4> &params,
+    TypePtr _instantiate(const GlobalState &gs, absl::Span<const TypeMemberRef> params,
                          const std::vector<TypePtr> &targs) const;
     DispatchResult dispatchCall(const GlobalState &gs, const DispatchArgs &args) const;
-    TypePtr _approximate(const GlobalState &gs, const TypeConstraint &tc) const;
+    TypePtr _approximate(const GlobalState &gs, const TypeConstraint &tc, core::Polarity polarity) const;
     TypePtr _instantiate(const GlobalState &gs, const TypeConstraint &tc) const;
 
     // Return the type of the underlying array that this tuple decays into
@@ -744,13 +798,15 @@ public:
     TypePtr underlying(const GlobalState &gs) const;
     bool derivesFrom(const GlobalState &gs, core::ClassOrModuleRef klass) const;
 };
-CheckSize(TupleType, 24, 8);
+CheckSize(TupleType, 32, 8);
 
-TYPE(AppliedType) final {
+TYPE(AppliedType) final : public Refcounted {
 public:
     ClassOrModuleRef klass;
     std::vector<TypePtr> targs;
     AppliedType(ClassOrModuleRef klass, std::vector<TypePtr> targs);
+    AppliedType(const AppliedType &) = delete;
+    AppliedType &operator=(const AppliedType &) = delete;
 
     std::string toStringWithTabs(const GlobalState &gs, int tabs = 0) const;
     std::string show(const GlobalState &gs) const {
@@ -760,13 +816,13 @@ public:
     uint32_t hash(const GlobalState &gs) const;
     DispatchResult dispatchCall(const GlobalState &gs, const DispatchArgs &args) const;
     void _sanityCheck(const GlobalState &gs) const;
-    TypePtr _instantiate(const GlobalState &gs, const InlinedVector<TypeMemberRef, 4> &params,
+    TypePtr _instantiate(const GlobalState &gs, absl::Span<const TypeMemberRef> params,
                          const std::vector<TypePtr> &targs) const;
 
     TypePtr getCallArguments(const GlobalState &gs, NameRef name) const;
 
     bool derivesFrom(const GlobalState &gs, ClassOrModuleRef klass) const;
-    TypePtr _approximate(const GlobalState &gs, const TypeConstraint &tc) const;
+    TypePtr _approximate(const GlobalState &gs, const TypeConstraint &tc, core::Polarity polarity) const;
     TypePtr _instantiate(const GlobalState &gs, const TypeConstraint &tc) const;
 };
 CheckSize(AppliedType, 32, 8);
@@ -779,11 +835,13 @@ CheckSize(AppliedType, 32, 8);
 //
 // These are used within the inferencer in places where we need to track
 // user-written types in the source code.
-TYPE(MetaType) final {
+TYPE(MetaType) final : public Refcounted {
 public:
     TypePtr wrapped;
 
     MetaType(const TypePtr &wrapped);
+    MetaType(const MetaType &) = delete;
+    MetaType &operator=(const MetaType &) = delete;
 
     std::string toStringWithTabs(const GlobalState &gs, int tabs = 0) const;
     std::string show(const GlobalState &gs) const {
@@ -797,7 +855,7 @@ public:
     DispatchResult dispatchCall(const GlobalState &gs, const DispatchArgs &args) const;
     void _sanityCheck(const GlobalState &gs) const;
 
-    TypePtr _approximate(const GlobalState &gs, const TypeConstraint &tc) const;
+    TypePtr _approximate(const GlobalState &gs, const TypeConstraint &tc, core::Polarity polarity) const;
     TypePtr underlying(const GlobalState &gs) const;
 };
 CheckSize(MetaType, 16, 8);
@@ -830,13 +888,14 @@ public:
 
     ~TypeAndOrigins() noexcept;
     TypeAndOrigins() = default;
-    TypeAndOrigins(TypePtr type, InlinedVector<Loc, 1> origins) : type(type), origins(origins) {}
+    TypeAndOrigins(TypePtr type, Loc origin);
+    TypeAndOrigins(TypePtr type, InlinedVector<Loc, 1> origins) : type(std::move(type)), origins(std::move(origins)) {}
     TypeAndOrigins(const TypeAndOrigins &) = default;
     TypeAndOrigins(TypeAndOrigins &&) = default;
     TypeAndOrigins &operator=(const TypeAndOrigins &) = default;
     TypeAndOrigins &operator=(TypeAndOrigins &&) = default;
 };
-CheckSize(TypeAndOrigins, 40, 8);
+CheckSize(TypeAndOrigins, 32, 8);
 
 struct CallLocs final {
     FileRef file;
@@ -879,6 +938,9 @@ struct DispatchArgs {
     // unreported errors is expensive!
     bool suppressErrors;
 
+    DispatchArgs(const DispatchArgs &) = delete;
+    DispatchArgs &operator=(const DispatchArgs &) = delete;
+
     Loc callLoc() const {
         return core::Loc(locs.file, locs.call);
     }
@@ -891,6 +953,25 @@ struct DispatchArgs {
     Loc argLoc(size_t i) const {
         return core::Loc(locs.file, locs.args[i]);
     }
+    Loc argsLoc() const {
+        if (!locs.args.empty()) {
+            return core::Loc(locs.file, locs.args.front().join(locs.args.back()));
+        }
+
+        if (this->block != nullptr) {
+            if (locs.fun.exists()) {
+                return funLoc().copyEndWithZeroLength();
+            }
+            return callLoc().copyEndWithZeroLength();
+        }
+
+        if (locs.fun.exists()) {
+            return core::Loc(locs.file, locs.fun.endPos(), locs.call.endPos());
+        }
+
+        return callLoc().copyEndWithZeroLength();
+    }
+    Loc blockLoc(const GlobalState &gs) const;
 
     DispatchArgs withSelfRef(const TypePtr &newSelfRef) const;
     DispatchArgs withThisRef(const TypePtr &newThisRef) const;
@@ -940,7 +1021,7 @@ public:
 };
 
 template <> inline TypePtr make_type<BlamedUntyped, core::SymbolRef &>(core::SymbolRef &whoToBlame) {
-    return TypePtr(TypePtr::Tag::BlamedUntyped, whoToBlame.rawId(), 0);
+    return TypePtr(TypePtr::Tag::BlamedUntyped, whoToBlame.rawId());
 }
 
 template <> inline BlamedUntyped cast_type_nonnull<BlamedUntyped>(const TypePtr &what) {
@@ -948,12 +1029,14 @@ template <> inline BlamedUntyped cast_type_nonnull<BlamedUntyped>(const TypePtr 
     return BlamedUntyped(core::SymbolRef::fromRaw(what.inlinedValue()));
 }
 
-TYPE(UnresolvedClassType) final : public ClassType {
+TYPE(UnresolvedClassType) final : public Refcounted, public ClassType {
 public:
     const core::SymbolRef scope;
     const std::vector<core::NameRef> names;
     UnresolvedClassType(SymbolRef scope, std::vector<core::NameRef> names)
         : ClassType(core::Symbols::untyped()), scope(scope), names(std::move(names)){};
+    UnresolvedClassType(const UnresolvedClassType &) = delete;
+    UnresolvedClassType &operator=(const UnresolvedClassType &) = delete;
     std::string toStringWithTabs(const GlobalState &gs, int tabs = 0) const;
     std::string show(const GlobalState &gs) const {
         return show(gs, {});
@@ -962,12 +1045,14 @@ public:
     uint32_t hash(const GlobalState &gs) const;
 };
 
-TYPE(UnresolvedAppliedType) final : public ClassType {
+TYPE(UnresolvedAppliedType) final : public Refcounted, public ClassType {
 public:
     const core::ClassOrModuleRef klass;
     const std::vector<TypePtr> targs;
     UnresolvedAppliedType(ClassOrModuleRef klass, std::vector<TypePtr> targs)
         : ClassType(core::Symbols::untyped()), klass(klass), targs(std::move(targs)){};
+    UnresolvedAppliedType(const UnresolvedAppliedType &) = delete;
+    UnresolvedAppliedType &operator=(const UnresolvedAppliedType &) = delete;
     std::string toStringWithTabs(const GlobalState &gs, int tabs = 0) const;
     std::string show(const GlobalState &gs) const {
         return show(gs, {});

@@ -12,8 +12,9 @@ struct OwnedKeyValueStore::TxnState {};
     throw invalid_argument(string(what));
 }
 
-KeyValueStore::KeyValueStore(string version, string path, string flavor)
-    : version(move(version)), path(move(path)), flavor(move(flavor)), dbState(make_unique<DBState>()) {
+KeyValueStore::KeyValueStore(shared_ptr<spdlog::logger> logger, string version, string path, string flavor,
+                             size_t maxSize)
+    : version(move(version)), path(move(path)), flavor(move(flavor)), dbState(make_unique<DBState>()), logger(logger) {
     throw_mdb_error("creating databases isn't supported on emscripten"sv, 0);
 }
 KeyValueStore::~KeyValueStore() noexcept(false) {
@@ -48,11 +49,11 @@ KeyValueStoreValue OwnedKeyValueStore::read(string_view key) const {
     throw_mdb_error("creating databases isn't supported on emscripten"sv, 0);
 }
 
-void OwnedKeyValueStore::clear() {
+void OwnedKeyValueStore::checkVersions() {
     throw_mdb_error("creating databases isn't supported on emscripten"sv, 0);
 }
 
-string_view OwnedKeyValueStore::readString(string_view key) const {
+optional<string_view> OwnedKeyValueStore::readString(string_view key) const {
     throw_mdb_error("creating databases isn't supported on emscripten"sv, 0);
 }
 

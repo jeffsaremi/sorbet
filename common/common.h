@@ -1,11 +1,11 @@
 #ifndef SORBET_COMMON_HPP
 #define SORBET_COMMON_HPP
 
-#if __cplusplus < 201402L
+#if __cplusplus < 201703L
 #define STRINGIZE(x) "C++ = " #x
 #define SSTRINGIZE(x) STRINGIZE(x)
 #pragma message(SSTRINGIZE(__cplusplus))
-static_assert(false, "Need c++14 to compile this codebase");
+static_assert(false, "Need c++17 to compile this codebase");
 #endif
 
 #include "absl/container/flat_hash_map.h"
@@ -29,23 +29,6 @@ template <class E> using UnorderedSet = absl::flat_hash_set<E>;
 // Wraps input in double quotes. https://stackoverflow.com/a/6671729
 #define Q(x) #x
 #define QUOTED(x) Q(x)
-
-#define _MAYBE_ADD_COMMA(...) , ##__VA_ARGS__
-
-// A faster version of ENFORCE that does not emit a timer. Useful for checks that happen extremely frequently and
-// are O(1). Please avoid using unless ENFORCE shows up in profiles.
-#define ENFORCE_NO_TIMER(x, ...)                                                                            \
-    do {                                                                                                    \
-        if (::sorbet::debug_mode) {                                                                         \
-            if (!(x)) {                                                                                     \
-                ::sorbet::Exception::failInFuzzer();                                                        \
-                if (stopInDebugger()) {                                                                     \
-                    (void)!(x);                                                                             \
-                }                                                                                           \
-                ::sorbet::Exception::enforce_handler(#x, __FILE__, __LINE__ _MAYBE_ADD_COMMA(__VA_ARGS__)); \
-            }                                                                                               \
-        }                                                                                                   \
-    } while (false);
 
 // Used for cases like https://xkcd.com/2200/
 // where there is some assumption that you believe should always hold.
@@ -102,7 +85,7 @@ template <typename ToCheck, std::size_t ExpectedAlign, std::size_t RealAlign = a
 #endif
 
 #define CheckSize(T, ExpSize, ExpAlign)                                              \
-    inline void _##T##is##ExpSize##_bytes_long_() {                                  \
+    [[maybe_unused]] inline void _##T##is##ExpSize##_bytes_long_() {                 \
         sorbet::check_size<T, ExpSize> UNUSED(_##T##is##ExpSize##_bytes_long);       \
         sorbet::check_align<T, ExpAlign> UNUSED(_##T##is##ExpAlign##_bytes_aligned); \
     }
@@ -128,6 +111,8 @@ template <class From, class To> To *fast_cast(From *what) {
 
 // Rounds the provided number up to the nearest power of two. If v is already a power of two, it returns v.
 uint32_t nextPowerOfTwo(uint32_t v);
+
+std::vector<int> findLineBreaks(std::string_view s);
 
 // To get exhaustiveness checking with std::visit.
 // From: https://en.cppreference.com/w/cpp/utility/variant/visit#Example
@@ -168,6 +153,7 @@ std::string demangle(const char *mangled);
 #pragma GCC poison cuserid
 #pragma GCC poison rexec rexec_af
 
-#include "Exception.h"
 #include "Timer.h"
+#include "enforce_no_timer/EnforceNoTimer.h"
+#include "exception/Exception.h"
 #endif

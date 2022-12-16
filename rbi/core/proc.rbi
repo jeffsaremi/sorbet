@@ -361,7 +361,8 @@ class Proc < Object
   # proc = proc_from { "hello" }
   # proc.call   #=> "hello"
   # ```
-  def self.new(*_, &blk); end
+  sig {params(blk: T.untyped).returns(T.attached_class)}
+  def self.new(&blk); end
 
   # Invokes the block with `obj` as the proc's parameter like
   # [`Proc#call`](https://docs.ruby-lang.org/en/2.7.0/Proc.html#method-i-call).
@@ -458,7 +459,7 @@ class Proc < Object
   # [`Proc#lambda?`](https://docs.ruby-lang.org/en/2.7.0/Proc.html#method-i-lambda-3F).
   sig do
     params(
-        arg0: BasicObject,
+        arg0: T.untyped,
         blk: T.untyped,
     )
     .returns(T.untyped)

@@ -77,6 +77,9 @@ test:coverage --spawn_strategy=local
 build --define=versioned=false
 build:versioned --workspace_status_command=tools/buildstamp/get_workspace_status --stamp --define=versioned=true
 
+build:dbg-darwin --config=dbg --platforms=@//tools/config:darwin_x86_64
+build:dbg-linux --config=dbg --platforms=@//tools/config:linux_x86_64
+
 ##
 ## Configurations used for releases
 ##
@@ -94,12 +97,12 @@ build:release-debug-common --config=skipslowenforce
 
 # harden: mark relocation sections read-only
 build:release-linux --linkopt=-Wl,-z,relro,-z,now
-build:release-linux --config=lto-linux --config=release-common
+build:release-linux --config=lto-linux --config=release-common --platforms=@//tools/config:linux_x86_64
 
 build:release-linux           --copt=-mcpu=generic
 build:release-sanitized-linux --copt=-mcpu=generic
 
-build:release-mac --config=release-common
+build:release-mac --config=release-common --platforms=@//tools/config:darwin_x86_64
 
 build:release-debug-linux --config=release-linux
 build:release-debug-linux --config=release-debug-common
@@ -131,11 +134,8 @@ build:reduce-intermediate-file-size-base --copt=-g0 --linkopt=-g0 # used by buil
 build:reduce-intermediate-file-size-base --strip=always
 build:reduce-intermediate-file-size-base --copt=-fno-standalone-debug --linkopt=-fno-standalone-debug # used by buildfarm to have less debug information on disk
 
-# integrates rubyfmt into sorbet
-build:rubyfmt --define rubyfmt=true --copt=-DRUBYFMT_ENABLED
-
 # extend reduce-intermediate-file-size with -Os
-build:buildfarm --copt=-Os --linkopt=-Os --config=reduce-intermediate-file-size-base --config=rubyfmt
+build:buildfarm --copt=-Os --linkopt=-Os --config=reduce-intermediate-file-size-base
 test:buildfarm --test_output=errors
 
 build:buildfarm-sanitized-linux --config=test-sanitized-linux --config=buildfarm

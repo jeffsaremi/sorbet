@@ -1,9 +1,9 @@
 #include "main/lsp/requests/workspace_symbols.h"
 #include "common/sort.h"
 #include "core/lsp/QueryResponse.h"
+#include "main/lsp/LSPLoop.h"
 #include "main/lsp/ShowOperation.h"
 #include "main/lsp/json_types.h"
-#include "main/lsp/lsp.h"
 #include <algorithm>
 #include <cctype>
 #include <iterator>
@@ -83,7 +83,7 @@ vector<unique_ptr<SymbolInformation>> SymbolMatcher::symbolRef2SymbolInformation
         }
 
         // Don't report definitions in __package.rb files, as they're references to symbols defined elsewhere.
-        if (loc.file().data(gs).isPackage()) {
+        if (this->config.opts.stripePackages && loc.file().data(gs).isPackage()) {
             continue;
         }
 

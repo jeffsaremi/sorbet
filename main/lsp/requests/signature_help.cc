@@ -1,7 +1,8 @@
 #include "main/lsp/requests/signature_help.h"
 #include "core/lsp/QueryResponse.h"
+#include "main/lsp/LSPLoop.h"
+#include "main/lsp/LSPQuery.h"
 #include "main/lsp/json_types.h"
-#include "main/lsp/lsp.h"
 
 using namespace std;
 
@@ -64,8 +65,8 @@ unique_ptr<ResponseMessage> SignatureHelpTask::runRequest(LSPTypecheckerDelegate
     }
 
     const core::GlobalState &gs = typechecker.state();
-    auto result =
-        queryByLoc(typechecker, params->textDocument->uri, *params->position, LSPMethod::TextDocumentSignatureHelp);
+    auto result = LSPQuery::byLoc(config, typechecker, params->textDocument->uri, *params->position,
+                                  LSPMethod::TextDocumentSignatureHelp);
     if (result.error) {
         // An error happened while setting up the query.
         response->error = move(result.error);
@@ -88,8 +89,9 @@ unique_ptr<ResponseMessage> SignatureHelpTask::runRequest(LSPTypecheckerDelegate
                 return response;
             }
             auto src = fref.data(gs).source();
-            auto loc = config.lspPos2Loc(fref, *params->position, gs);
-            string_view call_str = src.substr(sendLocIndex, loc.endPos() - sendLocIndex);
+            auto loc = params->position->toLoc(gs, fref);
+            ENFORCE(loc.has_value(), "LSPQuery::byLoc should have reported an error earlier if nullopt");
+            string_view call_str = src.substr(sendLocIndex, loc.value().endPos() - sendLocIndex);
             int numberCommas = absl::c_count(call_str, ',');
             // Active parameter depends on number of ,'s in the current string being typed. (0 , = first arg, 1 , =
             // 2nd arg)

@@ -41,6 +41,7 @@ using namespace std;
 namespace sorbet::rewriter {
 
 class FlattenWalk {
+    const bool compiledFile;
     enum class ScopeType { ClassScope, StaticMethodScope, InstanceMethodScope };
 
     struct ScopeInfo {
@@ -291,37 +292,36 @@ class FlattenWalk {
     }
 
 public:
-    FlattenWalk() {
+    FlattenWalk(core::Context ctx) : compiledFile(ctx.file.data(ctx).compiledLevel == core::CompiledLevel::True) {
         newMethodSet();
     }
     ~FlattenWalk() {
         ENFORCE(classScopes.empty());
     }
 
-    ast::ExpressionPtr preTransformClassDef(core::Context ctx, ast::ExpressionPtr tree) {
+    void preTransformClassDef(core::Context ctx, ast::ExpressionPtr &tree) {
         if (!curMethodSet().stack.empty()) {
             curMethodSet().pushScope(computeScopeInfo(ScopeType::InstanceMethodScope));
         }
         newMethodSet();
-        return tree;
     }
 
-    ast::ExpressionPtr postTransformClassDef(core::Context ctx, ast::ExpressionPtr tree) {
+    void postTransformClassDef(core::Context ctx, ast::ExpressionPtr &tree) {
         auto &classDef = ast::cast_tree_nonnull<ast::ClassDef>(tree);
         classDef.rhs = addClassDefMethods(ctx, std::move(classDef.rhs), classDef.loc);
         auto &methods = curMethodSet();
         if (curMethodSet().stack.empty()) {
-            return tree;
+            return;
         }
         // if this class is dirrectly nested inside a method, we want to steal it
         auto md = methods.popScope();
         ENFORCE(md);
 
         methods.addExpr(*md, move(tree));
-        return ast::MK::EmptyTree();
+        tree = ast::MK::EmptyTree();
     };
 
-    ast::ExpressionPtr preTransformSend(core::Context ctx, ast::ExpressionPtr tree) {
+    void preTransformSend(core::Context ctx, ast::ExpressionPtr &tree) {
         auto &send = ast::cast_tree_nonnull<ast::Send>(tree);
         // we might want to move sigs, so we mostly use the same logic that we use for methods. The one exception is
         // that we don't know the 'staticness level' of a sig, as it depends on the method that follows it (whether that
@@ -329,34 +329,33 @@ public:
         if (send.fun == core::Names::sig()) {
             curMethodSet().pushScope(computeScopeInfo(ScopeType::StaticMethodScope));
         }
-
-        return tree;
     }
 
-    ast::ExpressionPtr postTransformSend(core::Context ctx, ast::ExpressionPtr tree) {
+    void postTransformSend(core::Context ctx, ast::ExpressionPtr &tree) {
         auto &send = ast::cast_tree_nonnull<ast::Send>(tree);
         auto &methods = curMethodSet();
         // if it's not a send, then we didn't make a stack frame for it
         if (send.fun != core::Names::sig()) {
-            return tree;
+            return;
         }
-        // if we get a MethodData back, then we need to move this and replace it with an EmptyTree
+        // if we get a MethodData back, then we need to move this and replace it with a `nil`
+        // (`nil` instead of `EmptyTree` so that we still have a loc for the thing, because the
+        // `nil` might appear in an error message)
         if (auto md = methods.popScope()) {
             methods.addExpr(*md, move(tree));
-            return ast::MK::EmptyTree();
+            tree = ast::MK::Nil(send.loc);
+            return;
         }
-        return tree;
     }
 
-    ast::ExpressionPtr preTransformMethodDef(core::Context ctx, ast::ExpressionPtr tree) {
+    void preTransformMethodDef(core::Context ctx, ast::ExpressionPtr &tree) {
         auto &methodDef = ast::cast_tree_nonnull<ast::MethodDef>(tree);
         // add a new scope for this method def
         curMethodSet().pushScope(computeScopeInfo(methodDef.flags.isSelfMethod ? ScopeType::StaticMethodScope
                                                                                : ScopeType::InstanceMethodScope));
-        return tree;
     }
 
-    ast::ExpressionPtr postTransformMethodDef(core::Context ctx, ast::ExpressionPtr tree) {
+    void postTransformMethodDef(core::Context ctx, ast::ExpressionPtr &tree) {
         auto &methodDef = ast::cast_tree_nonnull<ast::MethodDef>(tree);
         auto &methods = curMethodSet();
         // if we get a MethodData back, then we need to move this and replace it
@@ -366,20 +365,27 @@ public:
         // Stash some stuff from the methodDef before we move it
         auto loc = methodDef.declLoc;
         auto name = methodDef.name;
-        auto keepName = methodDef.flags.isSelfMethod ? core::Names::keepSelfDef() : core::Names::keepDef();
 
-        auto kind = methodDef.flags.genericPropGetter ? core::Names::genericPropGetter()
-                    : methodDef.flags.isAttrReader    ? core::Names::attrReader()
-                                                      : core::Names::normal();
         auto discardable = methodDef.flags.discardDef;
         methods.addExpr(*md, move(tree));
 
         if (discardable) {
-            return ast::MK::EmptyTree();
+            tree = ast::MK::EmptyTree();
+            return;
+        } else if (!this->compiledFile) {
+            // We need to return something here so things like `module_function` and method
+            // visibility tracking can work correctly.
+            tree = ast::MK::RuntimeMethodDefinition(loc, name, methodDef.flags.isSelfMethod);
+            return;
         } else {
-            return ast::MK::Send3(loc, ast::MK::Constant(loc, core::Symbols::Sorbet_Private_Static()), keepName,
+            auto keepName = methodDef.flags.isSelfMethod ? core::Names::keepSelfDef() : core::Names::keepDef();
+            auto kind = methodDef.flags.genericPropGetter ? core::Names::genericPropGetter()
+                        : methodDef.flags.isAttrReader    ? core::Names::attrReader()
+                                                          : core::Names::normal();
+            tree = ast::MK::Send3(loc, ast::MK::Constant(loc, core::Symbols::Sorbet_Private_Static()), keepName,
                                   loc.copyWithZeroLength(), ast::MK::Self(loc), ast::MK::Symbol(loc, name),
                                   ast::MK::Symbol(loc, kind));
+            return;
         }
     };
 
@@ -411,8 +417,8 @@ public:
 };
 
 ast::ExpressionPtr Flatten::run(core::Context ctx, ast::ExpressionPtr tree) {
-    FlattenWalk flatten;
-    tree = ast::TreeMap::apply(ctx, flatten, std::move(tree));
+    FlattenWalk flatten(ctx);
+    ast::TreeWalk::apply(ctx, flatten, tree);
     tree = flatten.addTopLevelMethods(ctx, std::move(tree));
 
     return tree;

@@ -67,7 +67,6 @@ struct NameRefDebugCheck {
 };
 
 constexpr std::string_view PACKAGE_SUFFIX = "_Package";
-constexpr std::string_view PACKAGE_PRIVATE_SUFFIX = "_Package_Private";
 
 class NameRef final : private DebugOnlyCheck<NameRefDebugCheck> {
 private:
@@ -169,14 +168,14 @@ public:
 
     NameRef addEq(GlobalState &gs) const;
     NameRef lookupWithEq(const GlobalState &gs) const;
+    bool isSetter(const GlobalState &gs) const;
+
     NameRef addQuestion(GlobalState &gs) const;
 
     NameRef addAt(GlobalState &gs) const;
     NameRef lookupWithAt(const GlobalState &gs) const;
 
     NameRef prepend(GlobalState &gs, std::string_view s) const;
-
-    NameRef lookupMangledPrivatePackageName(const GlobalState &gs) const;
 
     bool isClassName(const GlobalState &gs) const;
 
@@ -185,12 +184,18 @@ public:
     // before checking for UniqueNameKind::TEnum.
     bool isTEnumName(const GlobalState &gs) const;
 
-    // Convenience method to avoid forgeting to unwrap the first layer (NameKind::CONSTANT)
-    // before checking for UniqueNameKind::Packager.
-    bool isPackagerName(const GlobalState &gs) const;
-    bool isPackagerPrivateName(const GlobalState &gs) const;
-
     bool isValidConstantName(const GlobalState &gs) const;
+
+    // Returns true if the name is `<static-init>` (class-level static init) or `<static-init>$...`
+    // (file-level static init).
+    bool isAnyStaticInitName(const GlobalState &gs) const;
+
+    // All the names that Environment::updateKnowledge treats as special for the purposes of
+    // updating control flow-sensitive type knowledge.
+    //
+    // (This is a small hack, because Sorbet should really use Symbols not names for that purpose:
+    // https://github.com/sorbet/sorbet/issues/1747)
+    bool isUpdateKnowledgeName() const;
 
     std::string_view shortName(const GlobalState &gs) const;
     std::string showRaw(const GlobalState &gs) const;

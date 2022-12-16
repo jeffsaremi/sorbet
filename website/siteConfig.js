@@ -47,9 +47,19 @@ const users = [
     infoLink: 'https://gusto.com/',
   },
   {
+    caption: 'HealthSherpa',
+    image: 'img/healthsherpa-logo.png',
+    infoLink: 'https://www.healthsherpa.com/',
+  },
+  {
     caption: 'Hummingbird',
     image: 'img/hummingbird-logo.png',
     infoLink: 'https://hummingbird.co/',
+  },
+  {
+    caption: 'Instacart',
+    image: 'img/instacart-logo.svg',
+    infoLink: 'https://instacart.com/',
   },
   {
     caption: 'Kickstarter',
@@ -70,6 +80,11 @@ const users = [
     caption: 'TaskRabbit',
     image: 'img/taskrabbit-logo.svg',
     infoLink: 'https://www.taskrabbit.com/',
+  },
+  {
+    caption: 'TriumphPay',
+    image: 'img/triumphpay-logo.svg',
+    infoLink: 'https://triumphpay.com',
   },
   {
     caption: 'Vonage',
@@ -141,7 +156,7 @@ const siteConfig = {
   //   ]
   // },
 
-  // This copyright info is used in /core/Footer.js and blog RSS/Atom feeds.
+  // This copyright info is used in blog RSS/Atom feeds.
   copyright: `© ${new Date().getFullYear()} Stripe`,
 
   highlight: {
@@ -160,8 +175,8 @@ const siteConfig = {
 
   // Open Graph and Twitter card images.
   // (these images can't be SVGs)
-  ogImage: 'img/sorbet-logo-card@2x.png',
-  twitterImage: 'img/sorbet-logo-card@2x.png',
+  // ogImage: 'img/sorbet-logo-card@2x.png',
+  // twitterImage: 'img/sorbet-logo-card@2x.png',
 
   // Show documentation's last contributor's name.
   // enableUpdateBy: true,

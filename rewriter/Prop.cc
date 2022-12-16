@@ -49,6 +49,11 @@ bool isTInexactStruct(const ast::ExpressionPtr &expr) {
     return struct_ != nullptr && struct_->cnst == core::Names::Constants::InexactStruct() && isT(struct_->scope);
 }
 
+bool isTImmutableStruct(const ast::ExpressionPtr &expr) {
+    auto *struct_ = ast::cast_tree<ast::UnresolvedConstantLit>(expr);
+    return struct_ != nullptr && struct_->cnst == core::Names::Constants::ImmutableStruct() && isT(struct_->scope);
+}
+
 bool isChalkODMDocument(const ast::ExpressionPtr &expr) {
     auto *document = ast::cast_tree<ast::UnresolvedConstantLit>(expr);
     if (document == nullptr || document->cnst != core::Names::Constants::Document()) {
@@ -67,6 +72,7 @@ enum class SyntacticSuperClass {
     TStruct,
     TInexactStruct,
     ChalkODMDocument,
+    TImmutableStruct,
 };
 
 bool knownNonModel(SyntacticSuperClass syntacticSuperClass) {
@@ -74,6 +80,7 @@ bool knownNonModel(SyntacticSuperClass syntacticSuperClass) {
         case SyntacticSuperClass::TStruct:
         case SyntacticSuperClass::TInexactStruct:
         case SyntacticSuperClass::ChalkODMDocument:
+        case SyntacticSuperClass::TImmutableStruct:
             return true;
         case SyntacticSuperClass::Unknown:
             return false;
@@ -84,6 +91,7 @@ bool knownNonDocument(SyntacticSuperClass syntacticSuperClass) {
     switch (syntacticSuperClass) {
         case SyntacticSuperClass::TStruct:
         case SyntacticSuperClass::TInexactStruct:
+        case SyntacticSuperClass::TImmutableStruct:
             return true;
         case SyntacticSuperClass::ChalkODMDocument:
         case SyntacticSuperClass::Unknown:
@@ -94,6 +102,7 @@ bool knownNonDocument(SyntacticSuperClass syntacticSuperClass) {
 bool wantTypedInitialize(SyntacticSuperClass syntacticSuperClass) {
     switch (syntacticSuperClass) {
         case SyntacticSuperClass::TStruct:
+        case SyntacticSuperClass::TImmutableStruct:
             return true;
         case SyntacticSuperClass::TInexactStruct:
         case SyntacticSuperClass::ChalkODMDocument:
@@ -105,6 +114,7 @@ bool wantTypedInitialize(SyntacticSuperClass syntacticSuperClass) {
 struct PropContext {
     SyntacticSuperClass syntacticSuperClass = SyntacticSuperClass::Unknown;
     ast::ClassDef::Kind classDefKind;
+    bool needsRealPropBodies;
 };
 
 struct PropInfo {
@@ -187,10 +197,13 @@ optional<PropInfo> parseProp(core::MutableContext ctx, const ast::Send *send) {
                     send->loc,
                     ast::MK::UnresolvedConstant(
                         send->loc,
-                        ast::MK::UnresolvedConstant(send->loc, ast::MK::EmptyTree(), core::Names::Constants::Opus()),
-                        core::Names::Constants::Autogen()),
-                    core::Names::Constants::Tokens()),
-                core::Names::Constants::AccountModelMerchantToken());
+                        ast::MK::UnresolvedConstant(send->loc,
+                                                    ast::MK::UnresolvedConstant(send->loc, ast::MK::EmptyTree(),
+                                                                                core::Names::Constants::Opus()),
+                                                    core::Names::Constants::Autogen()),
+                        core::Names::Constants::Tokens()),
+                    core::Names::Constants::AccountModelMerchant()),
+                core::Names::Constants::Token());
             break;
 
         default:
@@ -213,13 +226,12 @@ optional<PropInfo> parseProp(core::MutableContext ctx, const ast::Send *send) {
             return nullopt;
         }
         auto *sym = ast::cast_tree<ast::Literal>(send->getPosArg(0));
-        if (!sym || !sym->isSymbol(ctx)) {
+        if (!sym || !sym->isSymbol()) {
             return nullopt;
         }
-        ret.name = sym->asSymbol(ctx);
-        ENFORCE(core::Loc(ctx.file, sym->loc).exists());
-        ENFORCE(!core::Loc(ctx.file, sym->loc).source(ctx).value().empty() &&
-                core::Loc(ctx.file, sym->loc).source(ctx).value()[0] == ':');
+        ret.name = sym->asSymbol();
+        ENFORCE(ctx.locAt(sym->loc).exists());
+        ENFORCE(!ctx.locAt(sym->loc).source(ctx).value().empty() && ctx.locAt(sym->loc).source(ctx).value()[0] == ':');
         ret.nameLoc = core::LocOffsets{sym->loc.beginPos() + 1, sym->loc.endPos()};
     }
 
@@ -253,7 +265,7 @@ optional<PropInfo> parseProp(core::MutableContext ctx, const ast::Send *send) {
         auto loc = ret.type.loc();
         if (auto e = ctx.beginError(loc, core::errors::Rewriter::NilableUntyped)) {
             e.setHeader("`{}` is the same as `{}`", "T.nilable(T.untyped)", "T.untyped");
-            e.replaceWith("Use `T.untyped`", core::Loc{ctx.file, loc}, "T.untyped");
+            e.replaceWith("Use `T.untyped`", ctx.locAt(loc), "T.untyped");
 
             bool addDefault = true;
             if (rulesTree != nullptr) {
@@ -262,7 +274,7 @@ optional<PropInfo> parseProp(core::MutableContext ctx, const ast::Send *send) {
             }
 
             if (addDefault) {
-                auto end = core::Loc{ctx.file, core::LocOffsets{send->loc.endPos(), send->loc.endPos()}};
+                auto end = core::Loc{ctx.file, send->loc.copyEndWithZeroLength()};
                 e.replaceWith("Add `default: nil`", end, ", default: nil");
             }
         }
@@ -292,9 +304,9 @@ optional<PropInfo> parseProp(core::MutableContext ctx, const ast::Send *send) {
         if (ASTUtil::hasTruthyHashValue(ctx, *rules, core::Names::computedBy())) {
             auto [key, val] = ASTUtil::extractHashValue(ctx, *rules, core::Names::computedBy());
             auto lit = ast::cast_tree<ast::Literal>(val);
-            if (lit != nullptr && lit->isSymbol(ctx)) {
+            if (lit != nullptr && lit->isSymbol()) {
                 ret.computedByMethodNameLoc = lit->loc;
-                ret.computedByMethodName = lit->asSymbol(ctx);
+                ret.computedByMethodName = lit->asSymbol();
             } else {
                 if (auto e = ctx.beginError(val.loc(), core::errors::Rewriter::ComputedBySymbol)) {
                     e.setHeader("Value for `{}` must be a symbol literal", "computed_by");
@@ -354,6 +366,8 @@ vector<ast::ExpressionPtr> processProp(core::MutableContext ctx, PropInfo &ret, 
 
     nodes.emplace_back(ast::MK::Sig0(loc, ASTUtil::dupType(getType)));
 
+    // Generate a real prop body for computed_by: props so Sorbet can assert the
+    // existence of the computed_by: method.
     if (computedByMethodName.exists()) {
         // Given `const :foo, type, computed_by: <name>`, where <name> is a Symbol pointing to a class method,
         // assert that the method takes 1 argument (of any type), and returns the same type as the prop,
@@ -368,7 +382,7 @@ vector<ast::ExpressionPtr> processProp(core::MutableContext ctx, PropInfo &ret, 
             ast::MK::AssertType(computedByMethodNameLoc, std::move(sendComputedMethod), ASTUtil::dupType(getType));
         auto insSeq = ast::MK::InsSeq1(loc, std::move(assertTypeMatches), ast::MK::RaiseUnimplemented(loc));
         nodes.emplace_back(ASTUtil::mkGet(ctx, loc, name, std::move(insSeq)));
-    } else if (propContext.classDefKind == ast::ClassDef::Kind::Module) {
+    } else if (propContext.needsRealPropBodies && propContext.classDefKind == ast::ClassDef::Kind::Module) {
         // Not all modules include Kernel, can't make an initialize, etc. so we're punting on props in modules rn.
         nodes.emplace_back(ASTUtil::mkGet(ctx, loc, name, ast::MK::RaiseUnimplemented(loc)));
     } else if (ret.ifunset == nullptr) {
@@ -383,7 +397,7 @@ vector<ast::ExpressionPtr> processProp(core::MutableContext ctx, PropInfo &ret, 
                                               ast::MK::Symbol(nameLoc, ivarName));
                 nodes.emplace_back(ASTUtil::mkGet(ctx, loc, name, std::move(ivarGet), flags));
             }
-        } else {
+        } else if (propContext.needsRealPropBodies) {
             ast::MethodDef::Flags flags;
             flags.genericPropGetter = true;
 
@@ -404,6 +418,8 @@ vector<ast::ExpressionPtr> processProp(core::MutableContext ctx, PropInfo &ret, 
 
             auto insSeq = ast::MK::InsSeq1(loc, std::move(assign), std::move(propGetLogic));
             nodes.emplace_back(ASTUtil::mkGet(ctx, loc, name, std::move(insSeq), flags));
+        } else {
+            nodes.emplace_back(ASTUtil::mkGet(ctx, loc, name, ast::MK::RaiseUnimplemented(loc)));
         }
     } else {
         nodes.emplace_back(ASTUtil::mkGet(ctx, loc, name, ast::MK::RaiseUnimplemented(loc)));
@@ -419,7 +435,7 @@ vector<ast::ExpressionPtr> processProp(core::MutableContext ctx, PropInfo &ret, 
         sigArgs.emplace_back(ASTUtil::dupType(setType));
         nodes.emplace_back(ast::MK::Sig(loc, std::move(sigArgs), ASTUtil::dupType(setType)));
 
-        if (propContext.classDefKind == ast::ClassDef::Kind::Module) {
+        if (propContext.needsRealPropBodies && propContext.classDefKind == ast::ClassDef::Kind::Module) {
             // Not all modules include Kernel, can't make an initialize, etc. so we're punting on props in modules rn.
             nodes.emplace_back(ASTUtil::mkSet(ctx, loc, setName, nameLoc, ast::MK::RaiseUnimplemented(loc)));
         } else if (ret.enum_ == nullptr) {
@@ -435,7 +451,7 @@ vector<ast::ExpressionPtr> processProp(core::MutableContext ctx, PropInfo &ret, 
                                                   ast::MK::Local(nameLoc, core::Names::arg0()));
                     nodes.emplace_back(ASTUtil::mkSet(ctx, loc, setName, nameLoc, std::move(ivarSet)));
                 }
-            } else {
+            } else if (propContext.needsRealPropBodies) {
                 // need to hide the instance variable access, because there wasn't a typed constructor to declare it
                 auto ivarSet =
                     ast::MK::Send2(loc, ast::MK::Self(loc), core::Names::instanceVariableSet(), locZero,
@@ -447,6 +463,8 @@ vector<ast::ExpressionPtr> processProp(core::MutableContext ctx, PropInfo &ret, 
                                                       ast::MK::Self(loc), ast::MK::Symbol(loc, name));
                 auto insSeq = ast::MK::InsSeq1(loc, std::move(propFreezeLogic), std::move(ivarSet));
                 nodes.emplace_back(ASTUtil::mkSet(ctx, loc, setName, nameLoc, std::move(insSeq)));
+            } else {
+                nodes.emplace_back(ASTUtil::mkSet(ctx, loc, setName, nameLoc, ast::MK::RaiseUnimplemented(loc)));
             }
         } else {
             nodes.emplace_back(ASTUtil::mkSet(ctx, loc, setName, nameLoc, ast::MK::RaiseUnimplemented(loc)));
@@ -466,17 +484,17 @@ vector<ast::ExpressionPtr> processProp(core::MutableContext ctx, PropInfo &ret, 
             nonNilType = ASTUtil::dupType(ret.foreign);
         }
 
-        // sig {params(opts: T.untyped).returns(T.nilable($foreign))}
-        nodes.emplace_back(
-            ast::MK::Sig1(loc, ast::MK::Symbol(nameLoc, core::Names::opts()), ast::MK::Untyped(loc), std::move(type)));
+        // sig {params(allow_direct_mutation: T.nilable(T::Boolean)).returns(T.nilable($foreign))}
+        nodes.emplace_back(ast::MK::Sig1(loc, ast::MK::Symbol(nameLoc, core::Names::allowDirectMutation()),
+                                         ast::MK::Nilable(loc, ast::MK::T_Boolean(loc)), std::move(type)));
 
-        // def $fk_method(**opts)
+        // def $fk_method(allow_direct_mutation: nil)
         //  T.unsafe(nil)
         // end
 
         auto fkMethod = ctx.state.enterNameUTF8(name.show(ctx) + "_");
 
-        auto arg = ast::MK::RestArg(nameLoc, ast::MK::KeywordArg(nameLoc, core::Names::opts()));
+        auto arg = ast::MK::KeywordArgWithDefault(nameLoc, core::Names::allowDirectMutation(), ast::MK::Nil(loc));
         ast::MethodDef::Flags fkFlags;
         fkFlags.discardDef = true;
         auto fkMethodDef =
@@ -484,15 +502,15 @@ vector<ast::ExpressionPtr> processProp(core::MutableContext ctx, PropInfo &ret, 
         nodes.emplace_back(std::move(fkMethodDef));
 
         // sig {params(opts: T.untyped).returns($foreign)}
-        nodes.emplace_back(ast::MK::Sig1(loc, ast::MK::Symbol(nameLoc, core::Names::opts()), ast::MK::Untyped(loc),
-                                         std::move(nonNilType)));
+        nodes.emplace_back(ast::MK::Sig1(loc, ast::MK::Symbol(nameLoc, core::Names::allowDirectMutation()),
+                                         ast::MK::Nilable(loc, ast::MK::T_Boolean(loc)), std::move(nonNilType)));
 
         // def $fk_method_!(**opts)
         //  T.unsafe(nil)
         // end
 
         auto fkMethodBang = ctx.state.enterNameUTF8(name.show(ctx) + "_!");
-        auto arg2 = ast::MK::RestArg(nameLoc, ast::MK::KeywordArg(nameLoc, core::Names::opts()));
+        auto arg2 = ast::MK::KeywordArgWithDefault(nameLoc, core::Names::allowDirectMutation(), ast::MK::Nil(loc));
         ast::MethodDef::Flags fkBangFlags;
         fkBangFlags.discardDef = true;
         auto fkMethodDefBang = ast::MK::SyntheticMethod1(loc, loc, fkMethodBang, std::move(arg2),
@@ -596,11 +614,20 @@ void Prop::run(core::MutableContext ctx, ast::ClassDef *klass) {
             syntacticSuperClass = SyntacticSuperClass::TStruct;
         } else if (isTInexactStruct(superClass)) {
             syntacticSuperClass = SyntacticSuperClass::TInexactStruct;
+        } else if (isTImmutableStruct(superClass)) {
+            syntacticSuperClass = SyntacticSuperClass::TImmutableStruct;
         } else if (isChalkODMDocument(superClass)) {
             syntacticSuperClass = SyntacticSuperClass::ChalkODMDocument;
         }
     }
-    auto propContext = PropContext{syntacticSuperClass, klass->kind};
+    // The compiler is going to turn the bodies of rewritten prop methods into actual
+    // code, so they need to be faithful replications of runtime behavior.  If we're
+    // not compiling the file, however, then the static checker only really cares about
+    // the sigs and we can put some smaller untyped representation in the methods.
+    //
+    // This change saves ~2% memory on large codebases with many props.
+    const bool needsRealPropBodies = ctx.file.data(ctx.state).compiledLevel == core::CompiledLevel::True;
+    auto propContext = PropContext{syntacticSuperClass, klass->kind, needsRealPropBodies};
     UnorderedMap<void *, vector<ast::ExpressionPtr>> replaceNodes;
     replaceNodes.reserve(klass->rhs.size());
     vector<PropInfo> props;
@@ -613,6 +640,15 @@ void Prop::run(core::MutableContext ctx, ast::ClassDef *klass) {
         if (!propInfo.has_value()) {
             continue;
         }
+
+        if (!propInfo->isImmutable && syntacticSuperClass == SyntacticSuperClass::TImmutableStruct) {
+            if (auto e = ctx.beginError(propInfo->loc, core::errors::Rewriter::InvalidStructMember)) {
+                e.setHeader("Cannot use `{}` in an immutable struct", "prop");
+                e.replaceWith("Use `const`", ctx.locAt(propInfo->loc), "const");
+            }
+            continue;
+        }
+
         auto processed = processProp(ctx, propInfo.value(), propContext);
         ENFORCE(!processed.empty(), "if parseProp completed successfully, processProp must complete too");
 

@@ -43,6 +43,10 @@ public:
     MarkupKind clientHoverMarkupKind = MarkupKind::Plaintext;
     /** What completion item markup should we send to the client? */
     MarkupKind clientCompletionItemMarkupKind = MarkupKind::Plaintext;
+    /** If true, then LSP client can resolve CodeAction's `edit` property lazily */
+    bool clientCodeActionResolveEditSupport = false;
+    /** If true, then LSP client can pass additional data between codeAction and codeAction/resolve requests */
+    bool clientCodeActionDataSupport = false;
 
     LSPClientConfiguration(const InitializeParams &initializeParams);
 };
@@ -103,7 +107,6 @@ public:
     std::vector<std::string> frefsToPaths(const core::GlobalState &gs, const std::vector<core::FileRef> &refs) const;
     std::string remoteName2Local(std::string_view uri) const;
     std::string localName2Remote(std::string_view filePath) const;
-    core::Loc lspPos2Loc(core::FileRef fref, const Position &pos, const core::GlobalState &gs) const;
     // returns nullptr if this loc doesn't exist
     std::unique_ptr<Location> loc2Location(const core::GlobalState &gs, core::Loc loc) const;
     bool isFileIgnored(std::string_view filePath) const;

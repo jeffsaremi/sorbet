@@ -6,6 +6,8 @@ using namespace std;
 namespace {
 
 tuple<string, string> MESSAGES[] = {
+    {"InternalError", "internal error while parsing: {}"},
+
     // Lexer errors
     {"UnicodePointTooLarge", "invalid Unicode codepoint (too large)"},
     {"InvalidEscape", "invalid escape character syntax"},
@@ -38,6 +40,7 @@ tuple<string, string> MESSAGES[] = {
     {"InvalidAssignment", "cannot assign to a keyword"},
     {"ModuleNameConst", "class or module name must be a constant literal"},
     {"UnexpectedToken", "unexpected token {}"},
+    {"UnterminatedToken", "unterminated {}"},
     {"MissingToken", "missing token {}"},
     {"ArgumentConst", "formal argument cannot be a constant"},
     {"ArgumentIvar", "formal argument cannot be an instance variable"},
@@ -64,9 +67,21 @@ tuple<string, string> MESSAGES[] = {
     {"PatternDuplicateVariable", "duplicate variable name {}"},
     {"PatternDuplicateKey", "duplicate hash pattern key {}"},
     {"PositionalAfterKeyword", "positional arg \\\"{}\\\" after keyword arg"},
+    {"UnmatchedBlockArgs", "unmatched \\\"|\\\" in block argument list"},
     {"IfInsteadOfItForTest", "Unexpected token \\\"if\\\"; did you mean \\\"it\\\"?"},
     {"MissingCommaBetweenKwargs", "missing \\\",\\\" between keyword args"},
+    {"MissingOperatorArg", "missing arg to {} operator"},
     {"CurlyBracesAroundBlockPass", "block pass should not be enclosed in curly braces"},
+    {"EmptyCase", "{} statement must at least have one \\\"when\\\" clause"},
+    {"ForwardArgAfterRestArg", "... after rest argument"},
+    {"InvalidIdToGet", "identifier {} is not valid to get"},
+    {"NoAnonymousBlockArg", "no anonymous block parameter"},
+
+    // Error recovery hints
+    {"DedentedEnd", "Hint: this {} token might not be properly closed"},
+    {"BlockArgsUnexpectedNewline", "Hint: expected \\\"|\\\" token here"},
+    {"EOFInsteadOfEnd", "Hint: this {} token is not closed before the end of the file"},
+    {"DefMissingName", "Hint: this {} token might not be followed by a method name"},
 
     // Parser warnings
     {"UselessElse", "else without rescue is useless"},

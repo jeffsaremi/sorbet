@@ -43,6 +43,7 @@ void ExpressionPtr::_sanityCheck() const {
         SANITY_CHECK(ZSuperArgs)
         SANITY_CHECK(Block)
         SANITY_CHECK(InsSeq)
+        SANITY_CHECK(RuntimeMethodDefinition)
     }
 #undef SANITY_CHECK
 }
@@ -78,7 +79,8 @@ void Cast::_sanityCheck() {
     ENFORCE(arg);
     ENFORCE(type);
     ENFORCE(cast == core::Names::cast() || cast == core::Names::assertType() || cast == core::Names::let() ||
-            cast == core::Names::uncheckedLet() || cast == core::Names::bind());
+            cast == core::Names::uncheckedLet() || cast == core::Names::bind() || cast == core::Names::syntheticBind());
+    ENFORCE(typeExpr);
 }
 
 void ClassDef::_sanityCheck() {
@@ -227,5 +229,9 @@ void While::_sanityCheck() {
 }
 
 void ZSuperArgs::_sanityCheck() {}
+
+void RuntimeMethodDefinition::_sanityCheck() {
+    ENFORCE(name.exists());
+}
 
 } // namespace sorbet::ast

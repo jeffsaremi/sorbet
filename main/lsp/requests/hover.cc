@@ -3,8 +3,9 @@
 #include "absl/strings/str_join.h"
 #include "common/sort.h"
 #include "core/lsp/QueryResponse.h"
+#include "main/lsp/LSPLoop.h"
+#include "main/lsp/LSPQuery.h"
 #include "main/lsp/json_types.h"
-#include "main/lsp/lsp.h"
 
 using namespace std;
 
@@ -38,7 +39,8 @@ unique_ptr<ResponseMessage> HoverTask::runRequest(LSPTypecheckerDelegate &typech
     auto response = make_unique<ResponseMessage>("2.0", id, LSPMethod::TextDocumentHover);
 
     const core::GlobalState &gs = typechecker.state();
-    auto result = queryByLoc(typechecker, params->textDocument->uri, *params->position, LSPMethod::TextDocumentHover);
+    auto result = LSPQuery::byLoc(config, typechecker, params->textDocument->uri, *params->position,
+                                  LSPMethod::TextDocumentHover);
     if (result.error) {
         // An error happened while setting up the query.
         response->error = move(result.error);
@@ -46,14 +48,24 @@ unique_ptr<ResponseMessage> HoverTask::runRequest(LSPTypecheckerDelegate &typech
     }
 
     auto &queryResponses = result.responses;
+    auto clientHoverMarkupKind = config.getClientConfig().clientHoverMarkupKind;
     if (queryResponses.empty()) {
-        // Note: Need to specifically specify the variant type here so the null gets placed into the proper slot.
-        response->result = variant<JSONNullObject, unique_ptr<Hover>>(JSONNullObject());
+        auto fref = config.uri2FileRef(gs, params->textDocument->uri);
+        ENFORCE(fref.exists());
+        auto level = fref.data(gs).strictLevel;
+        if (level < core::StrictLevel::True) {
+            auto text = fmt::format("This file is `# typed: {}`.\n"
+                                    "Hover, Go To Definition, and other features are disabled in this file.",
+                                    level == core::StrictLevel::Ignore ? "ignore" : "false");
+            response->result = make_unique<Hover>(make_unique<MarkupContent>(clientHoverMarkupKind, text));
+        } else {
+            // Note: Need to specifically specify the variant type here so the null gets placed into the proper slot.
+            response->result = variant<JSONNullObject, unique_ptr<Hover>>(JSONNullObject());
+        }
         return response;
     }
 
     auto resp = move(queryResponses[0]);
-    auto clientHoverMarkupKind = config.getClientConfig().clientHoverMarkupKind;
     vector<core::Loc> documentationLocations;
     string typeString;
 
@@ -71,8 +83,8 @@ unique_ptr<ResponseMessage> HoverTask::runRequest(LSPTypecheckerDelegate &typech
                 documentationLocations.emplace_back(loc);
             }
         }
-    } else if (auto d = resp->isDefinition()) {
-        for (auto loc : d->symbol.locs(gs)) {
+    } else if (auto d = resp->isMethodDef()) {
+        for (auto loc : d->symbol.data(gs)->locs()) {
             if (loc.exists()) {
                 documentationLocations.emplace_back(loc);
             }
@@ -100,8 +112,8 @@ unique_ptr<ResponseMessage> HoverTask::runRequest(LSPTypecheckerDelegate &typech
         } else {
             typeString = methodInfoString(gs, retType, *sendResp->dispatchResult, constraint);
         }
-    } else if (auto defResp = resp->isDefinition()) {
-        typeString = prettyTypeForMethod(gs, defResp->symbol.asMethodRef(), nullptr, defResp->retType.type, nullptr);
+    } else if (auto defResp = resp->isMethodDef()) {
+        typeString = prettyTypeForMethod(gs, defResp->symbol, nullptr, defResp->retType.type, nullptr);
     } else if (auto constResp = resp->isConstant()) {
         typeString = prettyTypeForConstant(gs, constResp->symbol);
     } else {
@@ -131,4 +143,5 @@ unique_ptr<ResponseMessage> HoverTask::runRequest(LSPTypecheckerDelegate &typech
     response->result = make_unique<Hover>(formatRubyMarkup(clientHoverMarkupKind, typeString, docString));
     return response;
 }
+
 } // namespace sorbet::realmain::lsp

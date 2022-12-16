@@ -4,6 +4,10 @@ load("//third_party:externals.bzl", "register_sorbet_dependencies")
 
 register_sorbet_dependencies()
 
+load("@com_grail_bazel_compdb//:deps.bzl", "bazel_compdb_deps")
+
+bazel_compdb_deps()
+
 load("@com_grail_bazel_toolchain//toolchain:deps.bzl", "bazel_toolchain_dependencies")
 
 bazel_toolchain_dependencies()
@@ -47,50 +51,11 @@ load("@com_google_protobuf//:protobuf_deps.bzl", "protobuf_deps")
 
 protobuf_deps()
 
-load("//third_party/gems:rules.bzl", "gemfile_lock_deps")
-
-gemfile_lock_deps(
-    name = "gems",
-
-    # TODO: figure out how to discover these labels during the loading phase,
-    # rather that listing them out explicitly. `glob` doesn't work here, so
-    # we'll need to do something special within the `gemfile_lock_deps`
-    # repository rule.
-    gemfile_locks = [
-        "//gems/sorbet/test/snapshot:{}/src/Gemfile.lock".format(test)
-        for test in [
-            "partial/bad-hash",
-            "partial/bad-t",
-            "partial/create-config",
-            "partial/explosive-object",
-            "partial/fake-object",
-            "partial/fake-rails",
-            "partial/local_gem",
-            "partial/non-utf-8-file",
-            "partial/real_singleton_class",
-            "partial/rspec-lots",
-            "partial/stack_master",
-            "partial/stupidedi",
-            "partial/typed-ignore",
-            "partial/webmock",
-            "total/empty",
-            "total/sorbet-runtime",
-        ]
-    ],
-)
-
-load("@rules_rust//rust:repositories.bzl", "rust_repositories")
-
-rust_repositories(
-    edition = "2018",
-    version = "1.51.0",
-)
-
 load("@build_bazel_rules_nodejs//:index.bzl", "node_repositories")
 
 node_repositories()
 
-BAZEL_VERSION = "4.2.1"
+BAZEL_VERSION = "5.2.0"
 
 BAZEL_VERSION_LINUX_X86_64_SHA = "1a4f3a3ce292307bceeb44f459883859c793436d564b95319aacb8af1f20557c"
 

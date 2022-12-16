@@ -41,6 +41,7 @@ struct builder {
     ForeignPtr (*call_method_error)(SelfPtr builder, ForeignPtr receiver, const token *dot);
     ForeignPtr (*case_)(SelfPtr builder, const token *case_, ForeignPtr expr, const node_list *whenBodies,
                         const token *elseTok, ForeignPtr elseBody, const token *end);
+    ForeignPtr (*case_error)(SelfPtr builder, const token *case_, ForeignPtr cond, const token *end);
     ForeignPtr (*case_match)(SelfPtr builder, const token *case_, ForeignPtr expr, const node_list *inBodies,
                              const token *elseTok, ForeignPtr elseBody, const token *end);
     ForeignPtr (*character)(SelfPtr builder, const token *char_);
@@ -60,16 +61,18 @@ struct builder {
     ForeignPtr (*dedentString)(SelfPtr builder, ForeignPtr node, size_t dedentLevel);
     ForeignPtr (*def_class)(SelfPtr builder, const token *class_, ForeignPtr name, const token *lt_,
                             ForeignPtr superclass, ForeignPtr body, const token *end_);
-    ForeignPtr (*defEndlessMethod)(SelfPtr builder, const token *def, const token *name, ForeignPtr args,
-                                   const token *equal, ForeignPtr body);
+    ForeignPtr (*defEndlessMethod)(SelfPtr builder, ForeignPtr defHead, ForeignPtr args, const token *equal,
+                                   ForeignPtr body);
     ForeignPtr (*defEndlessSingleton)(SelfPtr builder, ForeignPtr defHead, ForeignPtr args, const token *equal,
                                       ForeignPtr body);
-    ForeignPtr (*defMethod)(SelfPtr builder, const token *def, const token *name, ForeignPtr args, ForeignPtr body,
-                            const token *end);
+    ForeignPtr (*defMethod)(SelfPtr builder, ForeignPtr defHead, ForeignPtr args, ForeignPtr body, const token *end);
     ForeignPtr (*defModule)(SelfPtr builder, const token *module, ForeignPtr name, ForeignPtr body, const token *end_);
+    ForeignPtr (*defnHead)(SelfPtr builder, const token *def, const token *name);
+    ForeignPtr (*defnHeadError)(SelfPtr builder, const token *def);
     ForeignPtr (*def_sclass)(SelfPtr builder, const token *class_, const token *lshft_, ForeignPtr expr,
                              ForeignPtr body, const token *end_);
     ForeignPtr (*defsHead)(SelfPtr builder, const token *def, ForeignPtr definee, const token *dot, const token *name);
+    ForeignPtr (*defsHeadError)(SelfPtr builder, const token *def, ForeignPtr definee, const token *dot);
     ForeignPtr (*defSingleton)(SelfPtr builder, ForeignPtr defHead, ForeignPtr args, ForeignPtr body, const token *end);
     ForeignPtr (*encodingLiteral)(SelfPtr builder, const token *tok);
     ForeignPtr (*error_node)(SelfPtr builder, size_t begin, size_t end);
@@ -148,6 +151,7 @@ struct builder {
     ForeignPtr (*p_ident)(SelfPtr builder, const token *tok);
     ForeignPtr (*pair)(SelfPtr builder, ForeignPtr key, const token *assoc, ForeignPtr value);
     ForeignPtr (*pair_keyword)(SelfPtr builder, const token *key, ForeignPtr value);
+    ForeignPtr (*pair_label)(SelfPtr builder, const token *key);
     ForeignPtr (*pair_quoted)(SelfPtr builder, const token *begin, const node_list *parts, const token *end,
                               ForeignPtr value);
     ForeignPtr (*pin)(SelfPtr builder, const token *tok, ForeignPtr var);
@@ -178,6 +182,7 @@ struct builder {
     ForeignPtr (*ternary)(SelfPtr builder, ForeignPtr cond, const token *question, ForeignPtr ifTrue,
                           const token *colon, ForeignPtr ifFalse);
     ForeignPtr (*true_)(SelfPtr builder, const token *tok);
+    ForeignPtr (*truncateBodyStmt)(SelfPtr builder, ForeignPtr body, const token *truncateTok);
     ForeignPtr (*unary_op)(SelfPtr builder, const token *oper, ForeignPtr receiver);
     ForeignPtr (*undefMethod)(SelfPtr builder, const token *undef, const node_list *name_list);
     ForeignPtr (*unless_guard)(SelfPtr builder, const token *unlessGuard, ForeignPtr unlessBody);

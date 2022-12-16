@@ -13,7 +13,7 @@ class <emptyTree><<C <root>>> < (::<todo sym>)
     end
 
     def a=<<todo method>>(a, &<blk>)
-      @a = ::T.let(a, <emptyTree>::<C T>.nilable(<emptyTree>::<C String>))
+      @a = <cast:let>(a, <todo sym>, <emptyTree>::<C T>.nilable(<emptyTree>::<C String>))
     end
 
     ::Sorbet::Private::Static.sig(<self>) do ||
@@ -37,7 +37,7 @@ class <emptyTree><<C <root>>> < (::<todo sym>)
     end
 
     def b=<<todo method>>(b, &<blk>)
-      @b = ::T.let(b, <emptyTree>::<C T>.nilable(<emptyTree>::<C Integer>))
+      @b = <cast:let>(b, <todo sym>, <emptyTree>::<C T>.nilable(<emptyTree>::<C Integer>))
     end
 
     ::Sorbet::Private::Static.sig(<self>) do ||
@@ -45,7 +45,7 @@ class <emptyTree><<C <root>>> < (::<todo sym>)
     end
 
     def c=<<todo method>>(c, &<blk>)
-      @c = ::T.let(c, <emptyTree>::<C T>.nilable(<emptyTree>::<C Integer>))
+      @c = <cast:let>(c, <todo sym>, <emptyTree>::<C T>.nilable(<emptyTree>::<C Integer>))
     end
 
     ::Sorbet::Private::Static.sig(<self>) do ||
@@ -98,28 +98,28 @@ class <emptyTree><<C <root>>> < (::<todo sym>)
 
     <self>.extend(<emptyTree>::<C T>::<C Sig>)
 
-    ::Sorbet::Private::Static.keep_def(<self>, :a, :normal)
+    <runtime method definition of a>
 
-    ::Sorbet::Private::Static.keep_def(<self>, :a=, :normal)
+    <runtime method definition of a=>
 
-    ::Sorbet::Private::Static.keep_def(<self>, :b, :normal)
+    <runtime method definition of b>
 
-    ::Sorbet::Private::Static.keep_def(<self>, :c, :normal)
+    <runtime method definition of c>
 
-    ::Sorbet::Private::Static.keep_def(<self>, :b=, :normal)
+    <runtime method definition of b=>
 
-    ::Sorbet::Private::Static.keep_def(<self>, :c=, :normal)
+    <runtime method definition of c=>
 
-    ::Sorbet::Private::Static.keep_def(<self>, :d, :normal)
+    <runtime method definition of d>
 
-    ::Sorbet::Private::Static.keep_def(<self>, :e, :normal)
+    <runtime method definition of e>
 
-    ::Sorbet::Private::Static.keep_def(<self>, :f, :normal)
+    <runtime method definition of f>
 
-    ::Sorbet::Private::Static.keep_def(<self>, :g=, :normal)
+    <runtime method definition of g=>
 
-    ::Sorbet::Private::Static.keep_def(<self>, :h=, :normal)
+    <runtime method definition of h=>
 
-    ::Sorbet::Private::Static.keep_def(<self>, :i=, :normal)
+    <runtime method definition of i=>
   end
 end

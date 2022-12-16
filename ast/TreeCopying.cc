@@ -134,7 +134,8 @@ ExpressionPtr deepCopy(const void *avoid, const Tag tag, const void *tree, bool 
 
         case Tag::Cast: {
             auto *exp = reinterpret_cast<const Cast *>(tree);
-            return make_expression<Cast>(exp->loc, exp->type, deepCopy(avoid, exp->arg), exp->cast);
+            return make_expression<Cast>(exp->loc, exp->type, deepCopy(avoid, exp->arg), exp->cast,
+                                         deepCopy(avoid, exp->typeExpr));
         }
 
         case Tag::Hash: {
@@ -179,6 +180,11 @@ ExpressionPtr deepCopy(const void *avoid, const Tag tag, const void *tree, bool 
         case Tag::InsSeq: {
             auto *exp = reinterpret_cast<const InsSeq *>(tree);
             return make_expression<InsSeq>(exp->loc, deepCopyVec(avoid, exp->stats), deepCopy(avoid, exp->expr));
+        }
+
+        case Tag::RuntimeMethodDefinition: {
+            auto *exp = reinterpret_cast<const RuntimeMethodDefinition *>(tree);
+            return make_expression<RuntimeMethodDefinition>(exp->loc, exp->name, exp->isSelfMethod);
         }
     }
 }
@@ -237,5 +243,6 @@ COPY_IMPL(ConstantLit);
 COPY_IMPL(ZSuperArgs);
 COPY_IMPL(Block);
 COPY_IMPL(InsSeq);
+COPY_IMPL(RuntimeMethodDefinition);
 
 } // namespace sorbet::ast

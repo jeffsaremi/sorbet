@@ -1,9 +1,10 @@
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive", "http_file")
-load("//third_party/cargo:crates.bzl", "raze_fetch_remote_crates")
+load("//third_party:ruby_externals.bzl", "register_ruby_dependencies")
+load("//third_party/openssl:system_openssl_repository.bzl", "system_openssl_repository")
 
 # We define our externals here instead of directly in WORKSPACE
 def register_sorbet_dependencies():
-    # At some point the builtin @platforms package willbe removed, and we'll no longer be able to refer to
+    # At some point the builtin @platforms package will be removed, and we'll no longer be able to refer to
     # @platforms//os:macos etc. The long-term workaround for this is to depend directly on bazelbuild/platforms as
     # @platforms. See https://github.com/bazelbuild/bazel/issues/8622 for more information.
     http_archive(
@@ -15,10 +16,10 @@ def register_sorbet_dependencies():
 
     http_archive(
         name = "doctest",
-        urls = _github_public_urls("onqtam/doctest/archive/7d42bd0fab6c44010c8aed9338bd02bea5feba41.zip"),
-        sha256 = "b33c8e954d15a146bb744ca29f4ca204b955530f52b2f8a895746a99cee4f2df",
+        urls = _github_public_urls("doctest/doctest/archive/2.4.1.zip"),
+        sha256 = "d8d304db5a2e6d42e290b23a08a68db05478755e64db57b067cd805738e2c56f",
         build_file = "@com_stripe_ruby_typer//third_party:doctest.BUILD",
-        strip_prefix = "doctest-7d42bd0fab6c44010c8aed9338bd02bea5feba41",
+        strip_prefix = "doctest-2.4.1",
     )
 
     http_archive(
@@ -131,10 +132,10 @@ def register_sorbet_dependencies():
 
     http_archive(
         name = "cxxopts",
-        urls = _github_public_urls("jarro2783/cxxopts/archive/b0f67a06de3446aa97a4943ad0ad6086460b2b61.zip"),
-        sha256 = "8635d7305e6623e7f4c635dae901891eb1151cee3106445d124c696361bb70fc",
+        urls = _github_public_urls("jarro2783/cxxopts/archive/c74846a891b3cc3bfa992d588b1295f528d43039.zip"),
+        sha256 = "4ba2b0a3c94e61501b974118a0fe171cd658f8efdd941e9ad82e71f48a98933a",
         build_file = "@com_stripe_ruby_typer//third_party:cxxopts.BUILD",
-        strip_prefix = "cxxopts-b0f67a06de3446aa97a4943ad0ad6086460b2b61",
+        strip_prefix = "cxxopts-c74846a891b3cc3bfa992d588b1295f528d43039",
     )
 
     http_archive(
@@ -161,15 +162,10 @@ def register_sorbet_dependencies():
     )
 
     http_archive(
-        name = "compdb",
-        urls = _github_public_urls("grailbio/bazel-compilation-database/archive/0ae6349c52700f060c9a87c5ed2b04b75f94a26f.zip"),
-        sha256 = "40ad122fedbf2d8b23e70e16b5f49c1a316f02db3ed29ce1af8650dad6ccc1a9",
-        build_file_content = (
-            """
-package(default_visibility = ["//visibility:public"])
-"""
-        ),
-        strip_prefix = "bazel-compilation-database-0ae6349c52700f060c9a87c5ed2b04b75f94a26f",
+        name = "com_grail_bazel_compdb",
+        urls = _github_public_urls("grailbio/bazel-compilation-database/archive/6b9329e37295eab431f82af5fe24219865403e0f.zip"),
+        sha256 = "6cf0dc4b40023a26787cd7cdb629dccd26e2208c8a2f19e1dde4ca10c109c86c",
+        strip_prefix = "bazel-compilation-database-6b9329e37295eab431f82af5fe24219865403e0f",
     )
 
     http_archive(
@@ -284,23 +280,25 @@ package(default_visibility = ["//visibility:public"])
         strip_prefix = "cpp-subprocess-9c624ce4e3423cce9f148bafbae56abfd6437ea0",
     )
 
-    native.new_local_repository(
+    system_openssl_repository(
         name = "system_ssl_darwin",
-        path = "/usr/local/opt/openssl",
         build_file = "@com_stripe_ruby_typer//third_party/openssl:darwin.BUILD",
+        openssl_dirs = [
+            "/usr/local/opt/openssl@1.1",
+            "/opt/homebrew/opt/openssl@1.1",
+            "/usr/local/opt/openssl",
+            "/opt/homebrew/opt/openssl",
+        ],
     )
 
+    # If we ever want to search multiple paths, we can likely use the
+    # `system_openssl_repository` repository rule like above. But I figure that
+    # right now if it ain't broke don't fix it, so I've left this using
+    # new_local_repository.
     native.new_local_repository(
         name = "system_ssl_linux",
         path = "/usr",
         build_file = "@com_stripe_ruby_typer//third_party/openssl:linux.BUILD",
-    )
-
-    http_archive(
-        name = "rubyfmt",
-        build_file = "@com_stripe_ruby_typer//third_party/rubyfmt:rubyfmt.BUILD",
-        urls = _github_public_urls("penelopezone/rubyfmt/releases/download/v0.7.6/rubyfmt-v0.7.6-sources.tar.gz"),
-        sha256 = "3642469b42d86d82ee58f87b82f10eac9c14112a2d03291def86f0851568cd5f",
     )
 
     http_archive(
@@ -345,62 +343,7 @@ package(default_visibility = ["//visibility:public"])
         strip_prefix = "shellcheck-v{}".format(shellcheck_version),
     )
 
-    http_file(
-        name = "bundler_stripe",
-        urls = _rubygems_urls("bundler-1.17.3.gem"),
-        sha256 = "bc4bf75b548b27451aa9f443b18c46a739dd22ad79f7a5f90b485376a67dc352",
-    )
-
-    http_file(
-        name = "rubygems_update_stripe",
-        urls = _rubygems_urls("rubygems-update-3.1.2.gem"),
-        sha256 = "7bfe4e5e274191e56da8d127c79df10d9120feb8650e4bad29238f4b2773a661",
-    )
-
-    ruby_build = "@com_stripe_ruby_typer//third_party/ruby:ruby.BUILD"
-    ruby_for_compiler_build = "@com_stripe_ruby_typer//third_party/ruby:ruby_for_compiler.BUILD"
-
-    http_archive(
-        name = "sorbet_ruby_2_6",
-        urls = _ruby_urls("2.6/ruby-2.6.5.tar.gz"),
-        sha256 = "66976b716ecc1fd34f9b7c3c2b07bbd37631815377a2e3e85a5b194cfdcbed7d",
-        strip_prefix = "ruby-2.6.5",
-        build_file = ruby_build,
-    )
-
-    urls = _ruby_urls("2.7/ruby-2.7.2.tar.gz")
-    sha256 = "6e5706d0d4ee4e1e2f883db9d768586b4d06567debea353c796ec45e8321c3d4"
-    strip_prefix = "ruby-2.7.2"
-
-    http_archive(
-        name = "sorbet_ruby_2_7_unpatched",
-        urls = urls,
-        sha256 = sha256,
-        strip_prefix = strip_prefix,
-        build_file = ruby_build,
-    )
-
-    http_archive(
-        name = "sorbet_ruby_2_7",
-        urls = urls,
-        sha256 = sha256,
-        strip_prefix = strip_prefix,
-        build_file = ruby_build,
-        patches = ["@com_stripe_ruby_typer//third_party/ruby:gc-remove-write-barrier.patch"],
-    )
-
-    http_archive(
-        name = "sorbet_ruby_2_7_for_compiler",
-        urls = urls,
-        sha256 = sha256,
-        strip_prefix = strip_prefix,
-        build_file = ruby_for_compiler_build,
-        patches = ["@com_stripe_ruby_typer//third_party/ruby:sorbet_ruby_2_7_for_compiler.patch"],
-        patch_tool = "patch",
-        patch_args = ["-p1"],
-    )
-
-    raze_fetch_remote_crates()
+    register_ruby_dependencies()
 
 def _github_public_urls(path):
     """
@@ -418,22 +361,4 @@ def _emscripten_urls(path):
     return [
         "https://storage.googleapis.com/webassembly/emscripten-releases-builds/old/{}".format(path),
         "https://artifactory-content.stripe.build/artifactory/googleapis-storage-cache/webassembly/emscripten-releases-builds/old/{}".format(path),
-    ]
-
-def _rubygems_urls(gem):
-    """
-    Produce a url list that works both with rubygems, and stripe's internal gem cache.
-    """
-    return [
-        "https://rubygems.org/downloads/{}".format(gem),
-        "https://artifactory-content.stripe.build/artifactory/gems/gems/{}".format(gem),
-    ]
-
-def _ruby_urls(path):
-    """
-    Produce a url list that works both with ruby-lang.org, and stripe's internal artifact cache.
-    """
-    return [
-        "https://cache.ruby-lang.org/pub/ruby/{}".format(path),
-        "https://artifactory-content.stripe.build/artifactory/ruby-lang-cache/pub/ruby/{}".format(path),
     ]

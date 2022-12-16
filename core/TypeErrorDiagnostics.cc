@@ -1,4 +1,5 @@
 #include "core/TypeErrorDiagnostics.h"
+#include "absl/strings/str_join.h"
 
 using namespace std;
 
@@ -32,22 +33,31 @@ namespace {
 }
 } // namespace
 
-void TypeErrorDiagnostics::explainTypeMismatch(const GlobalState &gs, ErrorBuilder &e, const TypePtr expected,
-                                               const TypePtr got) {
-    auto selfTypeParamExpected = isa_type<SelfTypeParam>(expected);
-    auto classTypeGot = isa_type<ClassType>(got);
-    if (selfTypeParamExpected && classTypeGot) {
+void TypeErrorDiagnostics::explainTypeMismatch(const GlobalState &gs, ErrorBuilder &e, const TypePtr &expected,
+                                               const TypePtr &got) {
+    auto expectedSelfTypeParam = isa_type<SelfTypeParam>(expected);
+    auto gotClassType = isa_type<ClassType>(got);
+    if (expectedSelfTypeParam && gotClassType) {
         if (checkForAttachedClassHint(gs, e, cast_type_nonnull<SelfTypeParam>(expected),
                                       cast_type_nonnull<ClassType>(got))) {
             return;
         }
     }
 
+    if (isa_type<MetaType>(got) && !isa_type<MetaType>(expected)) {
+        e.addErrorNote(
+            "It looks like you're using Sorbet type syntax in a runtime value position.\n"
+            "    If you really mean to use types as values, use `{}` to hide the type syntax from the type checker.\n"
+            "    Otherwise, you're likely using the type system in a way it wasn't meant to be used.",
+            "T::Utils.coerce");
+        return;
+    }
+
     // TODO(jez) Add more cases
 }
 
 void TypeErrorDiagnostics::maybeAutocorrect(const GlobalState &gs, ErrorBuilder &e, Loc loc, TypeConstraint &constr,
-                                            TypePtr expectedType, TypePtr actualType) {
+                                            const TypePtr &expectedType, const TypePtr &actualType) {
     if (!loc.exists()) {
         return;
     }
@@ -56,7 +66,7 @@ void TypeErrorDiagnostics::maybeAutocorrect(const GlobalState &gs, ErrorBuilder 
         e.replaceWith(fmt::format("Wrap in `{}`", *gs.suggestUnsafe), loc, "{}({})", *gs.suggestUnsafe,
                       loc.source(gs).value());
     } else {
-        auto withoutNil = Types::approximateSubtract(gs, actualType, Types::nilClass());
+        auto withoutNil = Types::dropNil(gs, actualType);
         if (!withoutNil.isBottom() &&
             Types::isSubTypeUnderConstraint(gs, constr, withoutNil, expectedType, UntypedMode::AlwaysCompatible)) {
             e.replaceWith("Wrap in `T.must`", loc, "T.must({})", loc.source(gs).value());
@@ -69,6 +79,37 @@ void TypeErrorDiagnostics::maybeAutocorrect(const GlobalState &gs, ErrorBuilder 
                     e.replaceWith("Prepend `!!`", loc, "!!({})", loc.source(gs).value());
                 }
             }
+        } else if (isa_type<MetaType>(actualType) && !isa_type<MetaType>(expectedType) &&
+                   core::Types::isSubTypeUnderConstraint(gs, constr,
+                                                         core::Symbols::T_Types_Base().data(gs)->externalType(),
+                                                         expectedType, UntypedMode::AlwaysCompatible)) {
+            e.replaceWith("Wrap in `T::Utils.coerce`", loc, "T::Utils.coerce({})", loc.source(gs).value());
+        }
+    }
+}
+
+void TypeErrorDiagnostics::insertUntypedTypeArguments(const GlobalState &gs, ErrorBuilder &e, ClassOrModuleRef klass,
+                                                      core::Loc replaceLoc) {
+    // if we're looking at `Array`, we want the autocorrect to include `T::`, but we don't need to
+    // if we're already looking at `T::Array` instead.
+    klass = klass.maybeUnwrapBuiltinGenericForwarder();
+    auto typePrefixSym = klass.forwarderForBuiltinGeneric();
+    if (!typePrefixSym.exists()) {
+        typePrefixSym = klass;
+    }
+
+    auto loc = replaceLoc;
+    if (loc.exists()) {
+        if (klass == core::Symbols::Hash() || klass == core::Symbols::T_Hash()) {
+            // Hash is special because it has arity 3 but you're only supposed to write the first 2
+            e.replaceWith("Add type arguments", loc, "{}[T.untyped, T.untyped]", typePrefixSym.show(gs));
+        } else {
+            auto numTypeArgs = klass.data(gs)->typeArity(gs);
+            vector<string> untypeds;
+            for (int i = 0; i < numTypeArgs; i++) {
+                untypeds.emplace_back("T.untyped");
+            }
+            e.replaceWith("Add type arguments", loc, "{}[{}]", typePrefixSym.show(gs), absl::StrJoin(untypeds, ", "));
         }
     }
 }

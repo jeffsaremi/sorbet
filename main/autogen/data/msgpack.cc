@@ -1,6 +1,8 @@
 // has to go first because it violates our poisons
 #include "mpack/mpack.h"
 
+#include "absl/strings/match.h"
+#include "core/GlobalState.h"
 #include "main/autogen/data/definitions.h"
 #include "main/autogen/data/msgpack.h"
 
@@ -9,11 +11,12 @@ namespace sorbet::autogen {
 
 void MsgpackWriter::packName(core::NameRef nm) {
     uint32_t id;
-    auto it = symbolIds.find(nm);
-    if (it == symbolIds.end()) {
+    typename decltype(symbolIds)::value_type v{nm, 0};
+    auto [it, inserted] = symbolIds.insert(v);
+    if (inserted) {
         id = symbols.size();
         symbols.emplace_back(nm);
-        symbolIds[nm] = id;
+        it->second = id;
     } else {
         id = it->second;
     }
@@ -60,7 +63,8 @@ void MsgpackWriter::packRange(uint32_t begin, uint32_t end) {
     mpack_write_u64(&writer, ((uint64_t)begin << 32) | end);
 }
 
-void MsgpackWriter::packDefinition(core::Context ctx, ParsedFile &pf, Definition &def) {
+void MsgpackWriter::packDefinition(core::Context ctx, ParsedFile &pf, Definition &def,
+                                   const AutogenConfig &autogenCfg) {
     mpack_start_array(&writer, defAttrs[version].size());
 
     // raw_full_name
@@ -76,7 +80,11 @@ void MsgpackWriter::packDefinition(core::Context ctx, ParsedFile &pf, Definition
 
     // defines_behavior
     packBool(def.defines_behavior);
-    ENFORCE(!def.defines_behavior || !ctx.file.data(ctx).isRBI(), "RBI files should never define behavior");
+    const auto &filePath = ctx.file.data(ctx).path();
+    ENFORCE(!def.defines_behavior || !ctx.file.data(ctx).isRBI() ||
+                absl::c_any_of(autogenCfg.behaviorAllowedInRBIsPaths,
+                               [&](auto &allowedPath) { return absl::StartsWith(filePath, allowedPath); }),
+            "RBI files should never define behavior");
 
     // isEmpty
     packBool(def.is_empty);
@@ -109,7 +117,7 @@ void MsgpackWriter::packReference(core::Context ctx, ParsedFile &pf, Reference &
     mpack_finish_array(&writer);
 
     // expression_range
-    auto expression_range = core::Loc(ctx.file, ref.definitionLoc).position(ctx);
+    auto expression_range = ctx.locAt(ref.definitionLoc).position(ctx);
     packRange(expression_range.first.line, expression_range.second.line);
     // expression_pos_range
     packRange(ref.loc.beginPos(), ref.loc.endPos());
@@ -134,14 +142,14 @@ MsgpackWriter::MsgpackWriter(int version)
     : version(assertValidVersion(version)), refAttrs(refAttrMap.at(version)), defAttrs(defAttrMap.at(version)),
       symbols(typeCount.at(version)) {}
 
-string MsgpackWriter::pack(core::Context ctx, ParsedFile &pf) {
-    char *data;
-    size_t size;
-    mpack_writer_init_growable(&writer, &data, &size);
+string MsgpackWriter::pack(core::Context ctx, ParsedFile &pf, const AutogenConfig &autogenCfg) {
+    char *body;
+    size_t bodySize;
+    mpack_writer_init_growable(&writer, &body, &bodySize);
     mpack_start_array(&writer, 6);
 
     mpack_write_true(&writer); // did_resolution
-    packString(pf.path);
+    packString(ctx.state.getPrintablePath(pf.path));
     mpack_write_u32(&writer, pf.cksum);
 
     // requires
@@ -153,7 +161,7 @@ string MsgpackWriter::pack(core::Context ctx, ParsedFile &pf) {
 
     mpack_start_array(&writer, pf.defs.size());
     for (auto &def : pf.defs) {
-        packDefinition(ctx, pf, def);
+        packDefinition(ctx, pf, def, autogenCfg);
     }
 
     mpack_finish_array(&writer);
@@ -165,11 +173,11 @@ string MsgpackWriter::pack(core::Context ctx, ParsedFile &pf) {
     mpack_finish_array(&writer);
 
     mpack_writer_destroy(&writer);
-    auto body = string(data, size);
-    MPACK_FREE(data);
 
     // write header
-    mpack_writer_init_growable(&writer, &data, &size);
+    char *header;
+    size_t headerSize;
+    mpack_writer_init_growable(&writer, &header, &headerSize);
 
     mpack_start_map(&writer, 5);
 
@@ -179,29 +187,36 @@ string MsgpackWriter::pack(core::Context ctx, ParsedFile &pf) {
     mpack_start_array(&writer, symbols.size());
     for (auto sym : symbols) {
         ++i;
-        string str;
+        string_view str;
         if (i < numTypes) {
             switch ((Definition::Type)i) {
                 case Definition::Type::Module:
-                    str = "module";
+                    str = "module"sv;
                     break;
                 case Definition::Type::Class:
-                    str = "class";
+                    str = "class"sv;
                     break;
                 case Definition::Type::Casgn:
-                    str = "casgn";
+                    str = "casgn"sv;
                     break;
                 case Definition::Type::Alias:
-                    str = "alias";
+                    str = "alias"sv;
                     break;
                 case Definition::Type::TypeAlias:
-                    str = "typealias";
+                    str = "typealias"sv;
                     break;
-                default: // shouldn't happen
-                    str = sym.shortName(ctx);
+                default: {
+                    // shouldn't happen
+                    auto v = sym.shortName(ctx);
+                    static_assert(std::is_same_v<decltype(v), string_view>, "shortName doesn't return the right thing");
+                    str = v;
+                    break;
+                }
             }
         } else {
-            str = sym.shortName(ctx);
+            auto v = sym.shortName(ctx);
+            static_assert(std::is_same_v<decltype(v), string_view>, "shortName doesn't return the right thing");
+            str = v;
         }
 
         packString(str);
@@ -227,12 +242,13 @@ string MsgpackWriter::pack(core::Context ctx, ParsedFile &pf) {
     }
     mpack_finish_array(&writer);
 
-    mpack_write_object_bytes(&writer, body.data(), body.size());
+    mpack_write_object_bytes(&writer, body, bodySize);
+    MPACK_FREE(body);
 
     mpack_writer_destroy(&writer);
 
-    auto ret = string(data, size);
-    MPACK_FREE(data);
+    auto ret = string(header, headerSize);
+    MPACK_FREE(header);
 
     return ret;
 }

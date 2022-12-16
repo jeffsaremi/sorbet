@@ -19,7 +19,9 @@ using namespace std;
         CASE_STATEMENT(CASE_BODY, SelfTypeParam)         \
         CASE_STATEMENT(CASE_BODY, AliasType)             \
         CASE_STATEMENT(CASE_BODY, SelfType)              \
-        CASE_STATEMENT(CASE_BODY, LiteralType)           \
+        CASE_STATEMENT(CASE_BODY, NamedLiteralType)      \
+        CASE_STATEMENT(CASE_BODY, IntegerLiteralType)    \
+        CASE_STATEMENT(CASE_BODY, FloatLiteralType)      \
         CASE_STATEMENT(CASE_BODY, TypeVar)               \
         CASE_STATEMENT(CASE_BODY, OrType)                \
         CASE_STATEMENT(CASE_BODY, AndType)               \
@@ -48,7 +50,8 @@ GENERATE_CALL_MEMBER(_instantiate, return nullptr, std::declval<const GlobalStat
 
 GENERATE_CALL_MEMBER(_replaceSelfType, return nullptr, declval<const GlobalState &>(), declval<const TypePtr &>())
 
-GENERATE_CALL_MEMBER(_approximate, return nullptr, declval<const GlobalState &>(), declval<const TypeConstraint &>())
+GENERATE_CALL_MEMBER(_approximate, return nullptr, declval<const GlobalState &>(), declval<const TypeConstraint &>(),
+                     declval<core::Polarity>())
 
 GENERATE_CALL_MEMBER(underlying,
                      Exception::raise("TypePtr::underlying called on non-proxy-type `{}`",
@@ -78,6 +81,9 @@ bool TypePtr::isNilClass() const {
 bool TypePtr::isBottom() const {
     return isa_type<ClassType>(*this) && cast_type_nonnull<ClassType>(*this).symbol == Symbols::bottom();
 }
+bool TypePtr::isTop() const {
+    return isa_type<ClassType>(*this) && cast_type_nonnull<ClassType>(*this).symbol == Symbols::top();
+}
 
 int TypePtr::kind() const {
     switch (tag()) {
@@ -88,27 +94,31 @@ int TypePtr::kind() const {
         case Tag::UnresolvedClassType:
         case Tag::ClassType:
             return 2;
-        case Tag::LiteralType:
+        case Tag::IntegerLiteralType:
             return 3;
-        case Tag::ShapeType:
+        case Tag::FloatLiteralType:
             return 4;
-        case Tag::TupleType:
+        case Tag::NamedLiteralType:
             return 5;
+        case Tag::ShapeType:
+            return 6;
+        case Tag::TupleType:
+            return 7;
         case Tag::LambdaParam:
         case Tag::SelfTypeParam:
-            return 6;
-        case Tag::MetaType:
-            return 7;
-        case Tag::TypeVar:
             return 8;
-        case Tag::AliasType:
+        case Tag::MetaType:
             return 9;
-        case Tag::OrType:
+        case Tag::TypeVar:
             return 10;
-        case Tag::AndType:
+        case Tag::AliasType:
             return 11;
-        case Tag::SelfType:
+        case Tag::OrType:
             return 12;
+        case Tag::AndType:
+            return 13;
+        case Tag::SelfType:
+            return 14;
     }
 }
 
@@ -129,7 +139,9 @@ bool TypePtr::isFullyDefined() const {
         case Tag::UnresolvedClassType:
         case Tag::BlamedUntyped:
         case Tag::ClassType:
-        case Tag::LiteralType:
+        case Tag::NamedLiteralType:
+        case Tag::IntegerLiteralType:
+        case Tag::FloatLiteralType:
         case Tag::AliasType:
         case Tag::SelfTypeParam:
         case Tag::MetaType: // MetaType: this is kinda true but kinda false. it's false for subtyping but true for
@@ -168,7 +180,9 @@ bool TypePtr::isFullyDefined() const {
 bool TypePtr::hasUntyped() const {
     switch (tag()) {
         case Tag::TypeVar:
-        case Tag::LiteralType:
+        case Tag::NamedLiteralType:
+        case Tag::IntegerLiteralType:
+        case Tag::FloatLiteralType:
         case Tag::SelfType:
         case Tag::AliasType:
         case Tag::SelfTypeParam:
@@ -215,12 +229,19 @@ core::SymbolRef TypePtr::untypedBlame() const {
     return Symbols::noSymbol();
 }
 
+// Converts a type like this:
+//   T.proc.params(arg0: Integer, arg1: Integer).void
+// into this:
+//   [Integer, Integer]
+// for use with LoadYieldParams
 TypePtr TypePtr::getCallArguments(const GlobalState &gs, NameRef name) const {
     switch (tag()) {
         case Tag::MetaType:
         case Tag::TupleType:
         case Tag::ShapeType:
-        case Tag::LiteralType: {
+        case Tag::NamedLiteralType:
+        case Tag::IntegerLiteralType:
+        case Tag::FloatLiteralType: {
             return this->underlying(gs).getCallArguments(gs, name);
         }
         case Tag::OrType: {
@@ -255,8 +276,8 @@ TypePtr TypePtr::getCallArguments(const GlobalState &gs, NameRef name) const {
     }
 }
 
-TypePtr TypePtr::_approximate(const GlobalState &gs, const TypeConstraint &tc) const {
-#define _APPROXIMATE(T) return CALL_MEMBER__approximate<const T>::call(cast_type_nonnull<T>(*this), gs, tc);
+TypePtr TypePtr::_approximate(const GlobalState &gs, const TypeConstraint &tc, core::Polarity polarity) const {
+#define _APPROXIMATE(T) return CALL_MEMBER__approximate<const T>::call(cast_type_nonnull<T>(*this), gs, tc, polarity);
     GENERATE_TAG_SWITCH(tag(), _APPROXIMATE)
 #undef _APPROXIMATE
 }
@@ -274,7 +295,7 @@ TypePtr TypePtr::_instantiate(const GlobalState &gs, const TypeConstraint &tc) c
 #undef _INSTANTIATE
 }
 
-TypePtr TypePtr::_instantiate(const GlobalState &gs, const InlinedVector<TypeMemberRef, 4> &params,
+TypePtr TypePtr::_instantiate(const GlobalState &gs, absl::Span<const TypeMemberRef> params,
                               const std::vector<TypePtr> &targs) const {
     switch (tag()) {
         case Tag::BlamedUntyped:
@@ -282,7 +303,9 @@ TypePtr TypePtr::_instantiate(const GlobalState &gs, const InlinedVector<TypeMem
         case Tag::UnresolvedClassType:
         case Tag::ClassType:
         case Tag::TypeVar:
-        case Tag::LiteralType:
+        case Tag::NamedLiteralType:
+        case Tag::IntegerLiteralType:
+        case Tag::FloatLiteralType:
         case Tag::SelfTypeParam:
         case Tag::SelfType:
             return nullptr;
@@ -307,6 +330,14 @@ TypePtr TypePtr::_instantiate(const GlobalState &gs, const InlinedVector<TypeMem
 }
 
 void TypePtr::_sanityCheck(const GlobalState &gs) const {
+    // Not really a dynamic check, but this is a convenient place to put this to
+    // ensure that all relevant types get checked.
+#define SANITY_CHECK(T)                                                                        \
+    static_assert(TypePtr::TypeToIsInlined<T>::value || !std::is_copy_constructible<T>::value, \
+                  "non-inline types must not be copy-constructible");                          \
+    break;
+    GENERATE_TAG_SWITCH(tag(), SANITY_CHECK)
+#undef SANITY_CHECK
 #define SANITY_CHECK(T) return cast_type_nonnull<T>(*this)._sanityCheck(gs);
     GENERATE_TAG_SWITCH(tag(), SANITY_CHECK)
 #undef SANITY_CHECK
@@ -342,7 +373,7 @@ bool TypePtr::derivesFrom(const GlobalState &gs, ClassOrModuleRef klass) const {
 #undef DERIVES_FROM
 }
 
-DispatchResult TypePtr::dispatchCall(const GlobalState &gs, DispatchArgs args) const {
+DispatchResult TypePtr::dispatchCall(const GlobalState &gs, const DispatchArgs &args) const {
 #define DISPATCH_CALL(T) return CALL_MEMBER_dispatchCall<const T>::call(cast_type_nonnull<T>(*this), gs, args);
     GENERATE_TAG_SWITCH(tag(), DISPATCH_CALL)
 #undef DISPATCH_CALL

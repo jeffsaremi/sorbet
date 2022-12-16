@@ -204,6 +204,8 @@ NodeDef nodes[] = {
         "defined?",
         vector<FieldDef>({{"value", FieldType::Node}}),
     },
+    // def name, instance method def
+    {"DefnHead", "defnhead", vector<FieldDef>({{"name", FieldType::Name}})},
     // def <expr>.name singleton-class method def
     {
         "DefS",
@@ -446,7 +448,7 @@ NodeDef nodes[] = {
         "match_as",
         vector<FieldDef>({{"value", FieldType::Node}, {"as", FieldType::Node}}),
     },
-    // [regex literal] =~ value; autovivifies local vars from match grops
+    // [regex literal] =~ value; autovivifies local vars from match groups
     {
         "MatchAsgn",
         "match_with_lvasgn",
@@ -544,7 +546,12 @@ NodeDef nodes[] = {
     {
         "OpAsgn",
         "op_asgn",
-        vector<FieldDef>({{"left", FieldType::Node}, {"op", FieldType::Name}, {"right", FieldType::Node}}),
+        vector<FieldDef>({
+            {"left", FieldType::Node},
+            {"op", FieldType::Name},
+            {"opLoc", FieldType::Loc},
+            {"right", FieldType::Node},
+        }),
     },
     // logical or
     {

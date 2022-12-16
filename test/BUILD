@@ -1,3 +1,9 @@
+load("//tools:clang.bzl", "clang_tool")  # todo: this should be decoupled and use the library toolchain, not the compiler one
+
+clang_tool("llvm-diff")  # depended on by compiler_tests
+
+clang_tool("llvm-symbolizer")
+
 cc_binary(
     name = "pipeline_test_runner",
     testonly = 1,
@@ -204,7 +210,17 @@ cc_binary(
     deps = ["//common"],
 )
 
-load(":pipeline_test.bzl", "pipeline_tests")
+load(":pipeline_test.bzl", "pipeline_tests", "single_package_rbi_test")
+
+filegroup(
+    name = "rbi_gen_files",
+    srcs = glob(["testdata/packager/rbi_gen_files/**/*.rb"]),
+)
+
+single_package_rbi_test(
+    name = "end_to_end_rbi_test",
+    rb_files = ["//test:rbi_gen_files"],
+)
 
 pipeline_tests(
     "test_corpus",
@@ -212,7 +228,6 @@ pipeline_tests(
         [
             "testdata/**/*.rb",
             "testdata/**/*.exp",
-            "testdata/**/*.exp.svg",
         ],
         exclude = [
             "testdata/compiler/**/*",
@@ -248,7 +263,6 @@ pipeline_tests(
         [
             "testdata/**/*.rb",
             "testdata/**/*.exp",
-            "testdata/**/*.exp.svg",
         ],
         exclude = [
             "testdata/compiler/**/*",
@@ -256,6 +270,7 @@ pipeline_tests(
         ],
     ),
     "LSPTests",
+    extra_files = ["testdata/lsp/rubyfmt-stub/rubyfmt"],
 )
 
 test_suite(
@@ -269,9 +284,6 @@ test_suite(
 )
 
 load(":compiler_tests.bzl", "compiler_tests")
-load("//tools:clang.bzl", "clang_tool")  # todo: this should be decoupled and use the library toolchain, not the compiler one
-
-clang_tool("llvm-diff")  # depended on by compiler_tests
 
 compiler_tests(
     "compiler",
@@ -335,6 +347,21 @@ sh_binary(
         "@sorbet_ruby_2_7_for_compiler//:ruby",
     ],
     tags = ["compiler"],
+    deps = [
+        ":logging",
+        "@bazel_tools//tools/bash/runfiles",
+    ],
+)
+
+sh_binary(
+    name = "single_package_runner",
+    srcs = ["test_single_package_runner.sh"],
+    data = [
+        "rbi_gen_package_runner.rb",
+        "//gems/sorbet-runtime",
+        "//main:sorbet",
+        "@sorbet_ruby_2_7//:ruby",
+    ],
     deps = [
         ":logging",
         "@bazel_tools//tools/bash/runfiles",

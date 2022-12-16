@@ -1,6 +1,6 @@
 #ifdef __APPLE__
 #include "absl/debugging/symbolize.h"
-#include "common/common.h"
+#include "spdlog/spdlog.h"
 #include <cassert>
 #include <cstdio>
 #include <mach-o/dyld.h> /* _NSGetExecutablePath */
@@ -38,7 +38,7 @@ bool amIBeingDebugged()
 // Returns true if the current process is being debugged (either
 // running under the debugger or has a debugger attached post facto).
 {
-    int junk;
+    int junk __attribute__((unused));
     int mib[4];
     struct kinfo_proc info;
     size_t size;

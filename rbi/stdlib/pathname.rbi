@@ -809,9 +809,15 @@ class Pathname < Object
   sig do
     params(
         ignore_error: T::Boolean,
-        blk: T.nilable(T.proc.params(arg0: Pathname).void),
     )
-    .returns(T.nilable(T::Enumerator[Pathname]))
+    .returns(T::Enumerator[Pathname])
+  end
+  sig do
+    params(
+        ignore_error: T::Boolean,
+        blk: T.proc.params(arg0: Pathname).void,
+    )
+    .returns(NilClass)
   end
   def find(ignore_error: true, &blk); end
 
@@ -1079,10 +1085,11 @@ class Pathname < Object
         sep: String,
         limit: Integer,
         open_args: Integer,
+        chomp: T::Boolean
     )
     .returns(T::Array[String])
   end
-  def readlines(sep=T.unsafe(nil), limit=T.unsafe(nil), open_args=T.unsafe(nil)); end
+  def readlines(sep=T.unsafe(nil), limit=T.unsafe(nil), open_args=T.unsafe(nil), chomp: false); end
 
   # Read symbolic link.
   #
@@ -1425,28 +1432,6 @@ class Pathname < Object
   def to_s(); end
 end
 
-# RubyGems adds the
-# [`gem`](https://docs.ruby-lang.org/en/2.7.0/Kernel.html#method-i-gem) method
-# to allow activation of specific gem versions and overrides the
-# [`require`](https://docs.ruby-lang.org/en/2.7.0/Kernel.html#method-i-require)
-# method on [`Kernel`](https://docs.ruby-lang.org/en/2.7.0/Kernel.html) to make
-# gems appear as if they live on the `$LOAD_PATH`. See the documentation of
-# these methods for further detail.
-# The [`Kernel`](https://docs.ruby-lang.org/en/2.7.0/Kernel.html) module is
-# included by class [`Object`](https://docs.ruby-lang.org/en/2.7.0/Object.html),
-# so its methods are available in every Ruby object.
-#
-# The [`Kernel`](https://docs.ruby-lang.org/en/2.7.0/Kernel.html) instance
-# methods are documented in class
-# [`Object`](https://docs.ruby-lang.org/en/2.7.0/Object.html) while the module
-# methods are documented here. These methods are called without a receiver and
-# thus can be called in functional form:
-#
-# ```ruby
-# sprintf "%.1f", 1.234 #=> "1.2"
-# ```
-#
-# fronzen-string-literal: true
 module Kernel
   # Creates a new
   # [`Pathname`](https://docs.ruby-lang.org/en/2.7.0/Pathname.html) object from

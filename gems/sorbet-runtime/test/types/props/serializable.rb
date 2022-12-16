@@ -157,6 +157,12 @@ class Opus::Types::Test::Props::SerializableTest < Critic::Unit::UnitTest
       str = obj.inspect
       assert_equal('<Opus::Types::Test::Props::SerializableTest::MySerializable foo={"age"=>7, "color"=>"red"}, name="Bob" @_extra_props=<not_a_prop="but_here_anyway">>', str)
     end
+
+    it 'inspects frozen structs' do
+      obj = a_serializable.freeze
+      str = obj.inspect
+      assert_equal('<Opus::Types::Test::Props::SerializableTest::MySerializable foo={"age"=>7, "color"=>"red"}, name="Bob">', str)
+    end
   end
 
   describe '.from_hash' do
@@ -1328,6 +1334,21 @@ class Opus::Types::Test::Props::SerializableTest < Critic::Unit::UnitTest
       obj.arrayprop = ['bar']
       h = obj.serialize
       assert_equal(['bar'], h['arrayprop'])
+    end
+  end
+
+  class ConstDefault < T::Struct
+    const :required_at_some_point, NilClass, default: nil
+    const :still_required_prop, Integer
+  end
+
+  describe 'const NilClass' do
+    it 'round-trip serializes' do
+      h = {'still_required_prop' => 5}
+      x = ConstDefault.from_hash!(h)
+      assert_nil(x.required_at_some_point)
+      x = x.with(still_required_prop: 6)
+      assert_nil(x.required_at_some_point)
     end
   end
 

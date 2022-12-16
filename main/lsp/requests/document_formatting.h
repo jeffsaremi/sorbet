@@ -14,9 +14,12 @@ public:
 
     Phase finalPhase() const override;
 
-    void index(LSPIndexer &index) override;
+    void preprocess(LSPPreprocessor &preprocessor) override;
 
     std::unique_ptr<ResponseMessage> runRequest(LSPTypecheckerDelegate &typechecker) override;
+
+private:
+    void displayError(std::string errorMessage, std::unique_ptr<ResponseMessage> &response);
 };
 
 } // namespace sorbet::realmain::lsp

@@ -28,6 +28,7 @@
 #include "local_vars/local_vars.h"
 #include "main/autogen/autogen.h"
 #include "main/autogen/crc_builder.h"
+#include "main/autogen/data/definitions.h"
 #include "main/autogen/data/version.h"
 #include "main/minimize/minimize.h"
 #include "namer/namer.h"
@@ -52,7 +53,6 @@
 #include <vector>
 
 namespace sorbet::test {
-namespace spd = spdlog;
 using namespace std;
 
 string singleTest;
@@ -60,22 +60,22 @@ string singleTest;
 class CFGCollectorAndTyper {
 public:
     vector<unique_ptr<cfg::CFG>> cfgs;
-    ast::ExpressionPtr preTransformMethodDef(core::Context ctx, ast::ExpressionPtr tree) {
+    void preTransformMethodDef(core::Context ctx, ast::ExpressionPtr &tree) {
         auto &m = ast::cast_tree_nonnull<ast::MethodDef>(tree);
 
-        if (m.symbol.data(ctx)->flags.isOverloaded) {
-            return tree;
+        if (m.symbol.data(ctx)->flags.isOverloaded ||
+            (m.symbol.data(ctx)->flags.isAbstract && ctx.file.data(ctx).compiledLevel != core::CompiledLevel::True)) {
+            return;
         }
         auto cfg = cfg::CFGBuilder::buildFor(ctx.withOwner(m.symbol), m);
         auto symbol = cfg->symbol;
         cfg = infer::Inference::run(ctx.withOwner(symbol), move(cfg));
         if (cfg) {
             for (auto &extension : ctx.state.semanticExtensions) {
-                extension->typecheck(ctx, *cfg, m);
+                extension->typecheck(ctx, ctx.file, *cfg, m);
             }
         }
         cfgs.push_back(move(cfg));
-        return tree;
     }
 };
 
@@ -128,8 +128,8 @@ public:
         }
     }
 
-    void checkExpectations(string prefix = "") {
-        for (auto &gotPhase : got) {
+    void checkExpectations(string prefix = "") const {
+        for (const auto &gotPhase : got) {
             auto expectation = test.expectations.find(gotPhase.first);
             REQUIRE_MESSAGE(expectation != test.expectations.end(),
                             prefix << "missing expectation for " << gotPhase.first);
@@ -139,7 +139,12 @@ public:
             auto checker = test.folder + expectation->second.begin()->second;
             auto expect = FileOps::read(checker);
 
-            CHECK_EQ_DIFF(expect, gotPhase.second, fmt::format("{}Mismatch on: {}", prefix, checker));
+            CHECK_EQ_DIFF(expect, gotPhase.second,
+                          fmt::format("{}Mismatch on: {}\n"
+                                      "\n"
+                                      "If these changes are expected, run this script and commit the results:\n"
+                                      "tools/scripts/update_testdata_exp.sh\n",
+                                      prefix, checker));
             if (expect == gotPhase.second) {
                 MESSAGE(gotPhase.first << " OK");
             }
@@ -147,9 +152,23 @@ public:
     }
 
     void drainErrors(const core::GlobalState &gs) {
+        // Moves errors from being owned by GlobalState to having been flushed by the flusher
+        // In our case, errorCollector is our error flusher (accumulates a vector, instead of
+        // printing to stdout).
         errorQueue->flushAllErrors(gs);
+        // Retrieves the collected errors, and sets it to empty again
         auto newErrors = errorCollector->drainErrors();
+        // Stores them in ourself, for use with ErrorAssertion::checkAll at a later point.
         errors.insert(errors.end(), make_move_iterator(newErrors.begin()), make_move_iterator(newErrors.end()));
+    }
+
+    void dropErrors(const core::GlobalState &gs) {
+        // Moves errors from being owned by GlobalState to having been flushed by the flusher
+        // In our case, errorCollector is our error flusher (accumulates a vector, instead of
+        // printing to stdout).
+        errorQueue->flushAllErrors(gs);
+        // Retrieves the collected errors, sets it to empty again, and then drops those errors.
+        auto _newErrors = errorCollector->drainErrors();
     }
 
     void clear(const core::GlobalState &gs) {
@@ -171,7 +190,7 @@ TEST_CASE("PerPhaseTest") { // NOLINT
         }
     }
 
-    auto logger = spd::stderr_color_mt("fixtures: " + inputPath);
+    auto logger = spdlog::stderr_color_mt("fixtures: " + inputPath);
     auto errorCollector = make_shared<core::ErrorCollector>();
     auto errorQueue = make_shared<core::ErrorQueue>(*logger, *logger, errorCollector);
     auto gs = make_unique<core::GlobalState>(errorQueue);
@@ -181,12 +200,15 @@ TEST_CASE("PerPhaseTest") { // NOLINT
     }
 
     gs->censorForSnapshotTests = true;
+    gs->lspExperimentalFastPathEnabled = true;
     auto workers = WorkerPool::create(0, gs->tracer());
 
     auto assertions = RangeAssertion::parseAssertions(test.sourceFileContents);
 
     gs->requiresAncestorEnabled =
         BooleanPropertyAssertion::getValue("enable-experimental-requires-ancestor", assertions).value_or(false);
+    gs->ruby3KeywordArgs =
+        BooleanPropertyAssertion::getValue("experimental-ruby3-keyword-args", assertions).value_or(false);
 
     if (BooleanPropertyAssertion::getValue("no-stdlib", assertions).value_or(false)) {
         gs->initEmpty();
@@ -245,8 +267,8 @@ TEST_CASE("PerPhaseTest") { // NOLINT
         {
             core::UnfreezeNameTable nameTableAccess(*gs); // enters original strings
 
-            auto trace = false;
-            nodes = parser::Parser::run(*gs, file, trace);
+            auto settings = parser::Parser::Settings{};
+            nodes = parser::Parser::run(*gs, file, settings);
         }
 
         handler.drainErrors(*gs);
@@ -298,20 +320,30 @@ TEST_CASE("PerPhaseTest") { // NOLINT
     }
 
     auto enablePackager = BooleanPropertyAssertion::getValue("enable-packager", assertions).value_or(false);
-    if (enablePackager) {
-        vector<std::string> extraPackageFilesDirectoryPrefixes;
-        vector<std::string> secondaryTestPackageNamespaces = {"Critic"};
 
-        auto extraDir = StringPropertyAssertion::getValue("extra-package-files-directory-prefix", assertions);
-        if (extraDir.has_value()) {
-            extraPackageFilesDirectoryPrefixes.emplace_back(extraDir.value());
+    if (enablePackager) {
+        vector<std::string> extraPackageFilesDirectoryUnderscorePrefixes;
+        vector<std::string> extraPackageFilesDirectorySlashPrefixes;
+        vector<std::string> secondaryTestPackageNamespaces = {"Critic"};
+        vector<std::string> skipRBIExportEnforcementDirs;
+
+        auto extraDirUnderscore =
+            StringPropertyAssertion::getValue("extra-package-files-directory-prefix-underscore", assertions);
+        if (extraDirUnderscore.has_value()) {
+            extraPackageFilesDirectoryUnderscorePrefixes.emplace_back(extraDirUnderscore.value());
+        }
+
+        auto extraDirSlash =
+            StringPropertyAssertion::getValue("extra-package-files-directory-prefix-slash", assertions);
+        if (extraDirSlash.has_value()) {
+            extraPackageFilesDirectorySlashPrefixes.emplace_back(extraDirSlash.value());
         }
 
         {
             core::UnfreezeNameTable packageNS(*gs);
             core::packages::UnfreezePackages unfreezeToEnterPackagerOptionsPackageDB = gs->unfreezePackages();
-            gs->setPackagerOptions(secondaryTestPackageNamespaces, extraPackageFilesDirectoryPrefixes,
-                                   "PACKAGE_ERROR_HINT");
+            gs->setPackagerOptions(secondaryTestPackageNamespaces, extraPackageFilesDirectoryUnderscorePrefixes,
+                                   extraPackageFilesDirectorySlashPrefixes, {}, "PACKAGE_ERROR_HINT");
         }
 
         // Packager runs over all trees.
@@ -343,25 +375,32 @@ TEST_CASE("PerPhaseTest") { // NOLINT
             for (auto file : files) {
                 core::UnfreezeNameTable nameTableAccess(*rbiGenGs); // enters original strings
 
-                auto trace = false;
-                auto nodes = parser::Parser::run(*rbiGenGs, file, trace);
+                auto settings = parser::Parser::Settings{};
+                auto nodes = parser::Parser::run(*rbiGenGs, file, settings);
                 core::MutableContext ctx(*rbiGenGs, core::Symbols::root(), file);
                 auto tree = ast::ParsedFile{ast::desugar::node2Tree(ctx, move(nodes)), file};
                 tree = ast::ParsedFile{rewriter::Rewriter::run(ctx, move(tree.tree)), tree.file};
-                tree = testSerialize(*gs, local_vars::LocalVars::run(ctx, move(tree)));
+                tree = testSerialize(*rbiGenGs, local_vars::LocalVars::run(ctx, move(tree)));
 
-                if (FileOps::getFileName(tree.file.data(*rbiGenGs).path()) == packageFileName) {
+                if (tree.file.data(*rbiGenGs).isPackage()) {
                     packageTrees.emplace_back(move(tree));
                 } else {
                     trees.emplace_back(move(tree));
                 }
             }
 
+            // Initialize the package DB
+            packageTrees = packager::Packager::findPackages(*rbiGenGs, *workers, move(packageTrees));
+
+            packager::Packager::setPackageNameOnFiles(*rbiGenGs, packageTrees);
+            packager::Packager::setPackageNameOnFiles(*rbiGenGs, trees);
+
             // Namer
             {
                 core::UnfreezeNameTable nameTableAccess(*rbiGenGs);     // creates singletons and class names
                 core::UnfreezeSymbolTable symbolTableAccess(*rbiGenGs); // enters symbols
-                trees = move(namer::Namer::run(*rbiGenGs, move(trees), *workers).result());
+                auto foundHashes = nullptr;
+                trees = move(namer::Namer::run(*rbiGenGs, move(trees), *workers, foundHashes).result());
             }
 
             // Resolver
@@ -370,11 +409,9 @@ TEST_CASE("PerPhaseTest") { // NOLINT
                 core::UnfreezeSymbolTable symbolTableAccess(*rbiGenGs); // enters stubs
                 trees = move(resolver::Resolver::run(*rbiGenGs, move(trees), *workers).result());
             }
-
             // RBI generation
             {
-                auto packageNamespaces =
-                    packager::RBIGenerator::buildPackageNamespace(*rbiGenGs, packageTrees, *workers);
+                auto packageNamespaces = packager::RBIGenerator::buildPackageNamespace(*rbiGenGs, *workers);
                 for (auto &package : rbiGenGs->packageDB().packages()) {
                     auto output = packager::RBIGenerator::runOnce(*rbiGenGs, package, packageNamespaces);
                     if (!output.rbi.empty()) {
@@ -400,7 +437,8 @@ TEST_CASE("PerPhaseTest") { // NOLINT
             core::UnfreezeSymbolTable symbolTableAccess(*gs); // enters symbols
             vector<ast::ParsedFile> vTmp;
             vTmp.emplace_back(move(tree));
-            vTmp = move(namer::Namer::run(*gs, move(vTmp), *workers).result());
+            core::FoundDefHashes foundHashes; // compute this just for test coverage
+            vTmp = move(namer::Namer::run(*gs, move(vTmp), *workers, &foundHashes).result());
             namedTree = testSerialize(*gs, move(vTmp[0]));
         }
 
@@ -424,7 +462,7 @@ TEST_CASE("PerPhaseTest") { // NOLINT
                 auto crcBuilder = autogen::CRCBuilder::create();
                 for (auto &tree : trees) {
                     core::Context ctx(*gs, core::Symbols::root(), tree.file);
-                    auto pf = autogen::Autogen::generate(ctx, move(tree), *crcBuilder);
+                    auto pf = autogen::Autogen::generate(ctx, move(tree), autogen::AutogenConfig{{}}, *crcBuilder);
                     tree = move(pf.tree);
                     payload << pf.toString(ctx, autogen::AutogenVersion::MAX_VERSION);
                 }
@@ -441,6 +479,11 @@ TEST_CASE("PerPhaseTest") { // NOLINT
         core::UnfreezeNameTable nameTableAccess(*gs);     // Resolver::defineAttr
         core::UnfreezeSymbolTable symbolTableAccess(*gs); // enters stubs
         trees = move(resolver::Resolver::run(*gs, move(trees), *workers).result());
+
+        if (enablePackager) {
+            trees = packager::VisibilityChecker::run(*gs, *workers, move(trees));
+        }
+
         handler.drainErrors(*gs);
     }
 
@@ -478,10 +521,10 @@ TEST_CASE("PerPhaseTest") { // NOLINT
         auto file = resolvedTree.file;
 
         core::Context ctx(*gs, core::Symbols::root(), file);
+        resolvedTree = class_flatten::runOne(ctx, move(resolvedTree));
+
         resolvedTree = definition_validator::runOne(ctx, move(resolvedTree));
         handler.drainErrors(*gs);
-
-        resolvedTree = class_flatten::runOne(ctx, move(resolvedTree));
 
         handler.addObserved(*gs, "flatten-tree", [&]() { return resolvedTree.tree.toString(*gs); });
         handler.addObserved(*gs, "flatten-tree-raw", [&]() { return resolvedTree.tree.showRaw(*gs); });
@@ -513,7 +556,7 @@ TEST_CASE("PerPhaseTest") { // NOLINT
             checkPragma("cfg");
             CFGCollectorAndTyper collector;
             core::Context ctx(*gs, core::Symbols::root(), resolvedTree.file);
-            auto cfg = ast::TreeMap::apply(ctx, collector, move(resolvedTree.tree));
+            ast::ShallowWalk::apply(ctx, collector, resolvedTree.tree);
             for (auto &extension : ctx.state.semanticExtensions) {
                 extension->finishTypecheckFile(ctx, file);
             }
@@ -559,7 +602,7 @@ TEST_CASE("PerPhaseTest") { // NOLINT
             checkTree();
             CFGCollectorAndTyper collector;
             core::Context ctx(*gs, core::Symbols::root(), resolvedTree.file);
-            ast::TreeMap::apply(ctx, collector, move(resolvedTree.tree));
+            ast::ShallowWalk::apply(ctx, collector, resolvedTree.tree);
             for (auto &extension : ctx.state.semanticExtensions) {
                 extension->finishTypecheckFile(ctx, file);
             }
@@ -570,6 +613,47 @@ TEST_CASE("PerPhaseTest") { // NOLINT
 
     for (auto &extension : gs->semanticExtensions) {
         extension->finishTypecheck(*gs);
+    }
+
+    // Check autocorrects
+    {
+        auto autocorrects = vector<core::AutocorrectSuggestion>{};
+        for (const auto &error : handler.errors) {
+            if (error->isSilenced) {
+                continue;
+            }
+
+            for (const auto &autocorrect : error->autocorrects) {
+                autocorrects.push_back(autocorrect);
+            }
+        }
+
+        auto fs = OSFileSystem{};
+        auto applied = core::AutocorrectSuggestion::apply(*gs, fs, autocorrects);
+
+        auto toWrite = UnorderedMap<core::FileRef, string>{};
+        for (const auto &[file, editedSource] : applied) {
+            toWrite[file] = move(editedSource);
+        }
+
+        auto addNewline = false;
+        handler.addObserved(
+            *gs, "autocorrects",
+            [&]() {
+                fmt::memory_buffer buf;
+                for (const auto &file : files) {
+                    string editedSource;
+                    if (toWrite.contains(file)) {
+                        editedSource = toWrite[file];
+                    } else {
+                        editedSource = file.data(*gs).source();
+                    }
+                    fmt::format_to(std::back_inserter(buf), "# -- {} --\n{}# ------------------------------\n",
+                                   core::File::censorFilePathForSnapshotTests(file.data(*gs).path()), editedSource);
+                }
+                return to_string(buf);
+            },
+            addNewline);
     }
 
     handler.checkExpectations();
@@ -601,47 +685,6 @@ TEST_CASE("PerPhaseTest") { // NOLINT
         ErrorAssertion::checkAll(test.sourceFileContents, RangeAssertion::getErrorAssertions(assertions), diagnostics);
     }
 
-    // Check autocorrects
-    {
-        auto autocorrects = vector<core::AutocorrectSuggestion>{};
-        for (const auto &error : handler.errors) {
-            if (error->isSilenced) {
-                continue;
-            }
-
-            for (const auto &autocorrect : error->autocorrects) {
-                autocorrects.push_back(autocorrect);
-            }
-        }
-
-        auto fs = OSFileSystem{};
-        auto applied = core::AutocorrectSuggestion::apply(*gs, fs, autocorrects);
-
-        auto toWrite = vector<pair<core::FileRef, string>>{};
-        for (const auto &[file, editedSource] : applied) {
-            toWrite.emplace_back(file, move(editedSource));
-        }
-
-        fast_sort(toWrite, [&](const auto &lhs, const auto &rhs) {
-            return lhs.first.data(*gs).path() < rhs.first.data(*gs).path();
-        });
-
-        auto addNewline = false;
-        handler.addObserved(
-            *gs, "autocorrects",
-            [&]() {
-                fmt::memory_buffer buf;
-                for (const auto &[file, editedSource] : toWrite) {
-                    fmt::format_to(std::back_inserter(buf), "# -- {} --\n{}# ------------------------------\n",
-                                   core::File::censorFilePathForSnapshotTests(file.data(*gs).path()), editedSource);
-                }
-                return to_string(buf);
-            },
-            addNewline);
-    }
-
-    handler.checkExpectations();
-
     // Allow later phases to have errors that we didn't test for
     errorQueue->flushAllErrors(*gs);
     errorCollector->drainErrors();
@@ -672,8 +715,8 @@ TEST_CASE("PerPhaseTest") { // NOLINT
         gs->replaceFile(f.file, move(newFile));
 
         // this replicates the logic of pipeline::indexOne
-        auto trace = false;
-        auto nodes = parser::Parser::run(*gs, f.file, trace);
+        auto settings = parser::Parser::Settings{};
+        auto nodes = parser::Parser::run(*gs, f.file, settings);
         handler.addObserved(*gs, "parse-tree", [&]() { return nodes->toString(*gs); });
         handler.addObserved(*gs, "parse-tree-json", [&]() { return nodes->toJSON(*gs); });
 
@@ -712,7 +755,14 @@ TEST_CASE("PerPhaseTest") { // NOLINT
             core::UnfreezeSymbolTable symbolTableAccess(*gs);
             vector<ast::ParsedFile> vTmp;
             vTmp.emplace_back(move(tree));
-            vTmp = move(namer::Namer::run(*gs, move(vTmp), *workers).result());
+            core::FoundDefHashes foundHashes; // out param, compute this just for test coverage
+            // The lsp_test_runner will turn every testdata test into a test of
+            // Namer::runIncremental by way of creating a file update with leading whitespace.
+            //
+            // Here, to complement those tests, we just run Namer::run (not Namer::runIncremental)
+            // to stress the codepath where Namer is not tasked with deleting anything when run for
+            // the fast path.
+            vTmp = move(namer::Namer::run(*gs, move(vTmp), *workers, &foundHashes).result());
             tree = testSerialize(*gs, move(vTmp[0]));
 
             handler.addObserved(*gs, "name-tree", [&]() { return tree.tree.toString(*gs); });
@@ -722,6 +772,10 @@ TEST_CASE("PerPhaseTest") { // NOLINT
 
     // resolver
     trees = move(resolver::Resolver::runIncremental(*gs, move(trees)).result());
+
+    if (enablePackager) {
+        trees = packager::VisibilityChecker::runIncremental(*gs, *workers, move(trees));
+    }
 
     for (auto &resolvedTree : trees) {
         handler.addObserved(*gs, "resolve-tree", [&]() { return resolvedTree.tree.toString(*gs); });

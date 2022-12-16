@@ -11,7 +11,6 @@ namespace sorbet::rewriter {
 ast::ExpressionPtr ASTUtil::dupType(const ast::ExpressionPtr &orig) {
     auto send = ast::cast_tree<ast::Send>(orig);
     if (send) {
-        ast::Send::ARGS_store args;
         auto dupRecv = dupType(send->recv);
         if (!dupRecv) {
             return nullptr;
@@ -42,6 +41,7 @@ ast::ExpressionPtr ASTUtil::dupType(const ast::ExpressionPtr &orig) {
             return ast::MK::Send(send->loc, std::move(dupRecv), send->fun, send->funLoc, 0, std::move(args));
         }
 
+        ast::Send::ARGS_store args;
         for (auto &arg : send->nonBlockArgs()) {
             auto dupArg = dupType(arg);
             if (!dupArg) {
@@ -132,7 +132,7 @@ ast::ExpressionPtr ASTUtil::dupType(const ast::ExpressionPtr &orig) {
 bool ASTUtil::hasHashValue(core::MutableContext ctx, const ast::Hash &hash, core::NameRef name) {
     for (const auto &keyExpr : hash.keys) {
         auto *key = ast::cast_tree<ast::Literal>(keyExpr);
-        if (key && key->isSymbol(ctx) && key->asSymbol(ctx) == name) {
+        if (key && key->isSymbol() && key->asSymbol() == name) {
             return true;
         }
     }
@@ -144,7 +144,7 @@ bool ASTUtil::hasTruthyHashValue(core::MutableContext ctx, const ast::Hash &hash
     for (const auto &keyExpr : hash.keys) {
         i++;
         auto *key = ast::cast_tree<ast::Literal>(keyExpr);
-        if (key && key->isSymbol(ctx) && key->asSymbol(ctx) == name) {
+        if (key && key->isSymbol() && key->asSymbol() == name) {
             auto *val = ast::cast_tree<ast::Literal>(hash.values[i]);
             if (!val) {
                 // All non-literals are truthy
@@ -165,7 +165,7 @@ pair<ast::ExpressionPtr, ast::ExpressionPtr> ASTUtil::extractHashValue(core::Mut
     for (auto &keyExpr : hash.keys) {
         i++;
         auto *key = ast::cast_tree<ast::Literal>(keyExpr);
-        if (key && key->isSymbol(ctx) && key->asSymbol(ctx) == name) {
+        if (key && key->isSymbol() && key->asSymbol() == name) {
             auto key = std::move(keyExpr);
             auto value = std::move(hash.values[i]);
             hash.keys.erase(hash.keys.begin() + i);

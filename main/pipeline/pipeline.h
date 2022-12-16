@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/concurrency/WorkerPool.h"
 #include "common/kvstore/KeyValueStore.h"
+#include "core/FileHash.h"
 #include "main/options/options.h"
 
 namespace sorbet::core::lsp {
@@ -25,24 +26,33 @@ std::vector<ast::ParsedFile> package(core::GlobalState &gs, std::vector<ast::Par
                                      const options::Options &opts, WorkerPool &workers);
 
 ast::ParsedFilesOrCancelled resolve(std::unique_ptr<core::GlobalState> &gs, std::vector<ast::ParsedFile> what,
-                                    const options::Options &opts, WorkerPool &workers);
+                                    const options::Options &opts, WorkerPool &workers,
+                                    core::FoundDefHashes *foundHashes);
 
-std::vector<ast::ParsedFile> incrementalResolve(core::GlobalState &gs, std::vector<ast::ParsedFile> what,
-                                                const options::Options &opts);
+// If `foundMethodHashesForFiles` is non-nullopt, incrementalResolve invokes Namer in runIncremental mode.
+//
+// This is most useful when running incrementalResolve for the purpose of a file update.
+//
+// It's not required when running incrementalResolve just to turn an AST into a resolved AST, if
+// that AST has already been resolved once before on the fast path
+std::vector<ast::ParsedFile>
+incrementalResolve(core::GlobalState &gs, std::vector<ast::ParsedFile> what,
+                   std::optional<UnorderedMap<core::FileRef, core::FoundDefHashes>> &&foundHashesForFiles,
+                   const options::Options &opts);
 
 ast::ParsedFilesOrCancelled name(core::GlobalState &gs, std::vector<ast::ParsedFile> what, const options::Options &opts,
-                                 WorkerPool &workers);
+                                 WorkerPool &workers, core::FoundDefHashes *foundHashes);
+
+std::vector<ast::ParsedFile> autogenWriteCacheFile(const core::GlobalState &gs, const std::string &cachePath,
+                                                   std::vector<ast::ParsedFile> what, WorkerPool &workers);
 
 // Note: `cancelable` and `preemption task manager` are only applicable to LSP.
 // If `intentionallyLeakASTs` is `true`, typecheck will leak the ASTs rather than pay the cost of deleting them
 // properly, which is a significant speedup on large codebases.
-void typecheck(const std::unique_ptr<core::GlobalState> &gs, std::vector<ast::ParsedFile> what,
-               const options::Options &opts, WorkerPool &workers, bool cancelable = false,
+void typecheck(const core::GlobalState &gs, std::vector<ast::ParsedFile> what, const options::Options &opts,
+               WorkerPool &workers, bool cancelable = false,
                std::optional<std::shared_ptr<core::lsp::PreemptionTaskManager>> preemptionManager = std::nullopt,
                bool presorted = false, bool intentionallyLeakASTs = false);
-
-void typecheckOne(core::Context ctx, ast::ParsedFile resolved, const options::Options &opts,
-                  bool intentionallyLeakASTs = false);
 
 core::StrictLevel decideStrictLevel(const core::GlobalState &gs, const core::FileRef file,
                                     const options::Options &opts);

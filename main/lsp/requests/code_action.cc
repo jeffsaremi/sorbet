@@ -1,23 +1,35 @@
 #include "main/lsp/requests/code_action.h"
+#include "absl/algorithm/container.h"
 #include "common/sort.h"
 #include "core/lsp/QueryResponse.h"
+#include "main/lsp/LSPLoop.h"
+#include "main/lsp/LSPQuery.h"
+#include "main/lsp/MoveMethod.h"
 #include "main/lsp/json_types.h"
+#include "main/sig_finder/sig_finder.h"
 
 using namespace std;
 
 namespace sorbet::realmain::lsp {
-CodeActionTask::CodeActionTask(const LSPConfiguration &config, MessageId id, unique_ptr<CodeActionParams> params)
-    : LSPRequestTask(config, move(id), LSPMethod::TextDocumentCodeAction), params(move(params)) {}
 
 namespace {
-vector<unique_ptr<TextDocumentEdit>> getEdits(const LSPConfiguration &config, const core::GlobalState &gs,
-                                              const vector<core::AutocorrectSuggestion::Edit> &edits) {
+const UnorderedSet<string> OPERATORS = {"+",  "−",  "*",   "/",   "%",   "**",    "==",     "!=",  ">",
+                                        "<",  ">=", "<=",  "<=>", "===", ".eql?", "equal?", "=",   "+=",
+                                        "-=", "*=", "/=",  "%=",  "**=", "&",     "|",      "^",   "~",
+                                        "<<", ">>", "and", "or",  "&&",  "||",    "!",      "not", ".."};
+
+bool isOperator(string_view name) {
+    return OPERATORS.contains(name);
+}
+
+vector<unique_ptr<TextDocumentEdit>> getQuickfixEdits(const LSPConfiguration &config, const core::GlobalState &gs,
+                                                      const vector<core::AutocorrectSuggestion::Edit> &edits) {
     UnorderedMap<string, vector<unique_ptr<TextEdit>>> editsByFile;
     for (auto &edit : edits) {
         auto range = Range::fromLoc(gs, edit.loc);
         if (range != nullptr) {
             editsByFile[config.fileRef2Uri(gs, edit.loc.file())].emplace_back(
-                make_unique<TextEdit>(std::move(range), edit.replacement));
+                make_unique<TextEdit>(move(range), edit.replacement));
         }
     }
 
@@ -29,7 +41,39 @@ vector<unique_ptr<TextDocumentEdit>> getEdits(const LSPConfiguration &config, co
     }
     return documentEdits;
 }
+
+const core::lsp::MethodDefResponse *
+hasLoneClassMethodResponse(const core::GlobalState &gs, const vector<unique_ptr<core::lsp::QueryResponse>> &responses) {
+    // We want to return the singular `MethodDefResponse` for a singleton, non-operator method.
+    // We do not want to return the first such response, because there might be multiple
+    // methods "defined" at the same location (cf. the DSLBuilder rewriter).  And because the
+    // query we're examining was a location-based query, there might be several overlapping responses,
+    // and we only want to consider the method ones.
+    const core::lsp::MethodDefResponse *found = nullptr;
+
+    for (auto &resp : responses) {
+        if (auto *def = resp->isMethodDef()) {
+            if (found != nullptr) {
+                // Assume these two methods stem from some sort of rewriter pass.
+                return nullptr;
+            }
+
+            // If we find a method def we can't handle at this location, assume
+            // it also comes from sort of rewriter pass.
+            if (!def->symbol.data(gs)->owner.data(gs)->isSingletonClass(gs) || isOperator(def->name.show(gs))) {
+                return nullptr;
+            }
+
+            found = def;
+        }
+    }
+
+    return found;
+}
 } // namespace
+
+CodeActionTask::CodeActionTask(const LSPConfiguration &config, MessageId id, unique_ptr<CodeActionParams> params)
+    : LSPRequestTask(config, move(id), LSPMethod::TextDocumentCodeAction), params(move(params)) {}
 
 unique_ptr<ResponseMessage> CodeActionTask::runRequest(LSPTypecheckerDelegate &typechecker) {
     auto response = make_unique<ResponseMessage>("2.0", id, LSPMethod::TextDocumentCodeAction);
@@ -46,9 +90,16 @@ unique_ptr<ResponseMessage> CodeActionTask::runRequest(LSPTypecheckerDelegate &t
         return response;
     }
 
+    auto maybeLoc = params->range->toLoc(gs, file);
+    if (!maybeLoc.has_value()) {
+        // VSCode has been observed to send bad ranges for rubocop autofixes.  It's
+        // not clear whose fault that is, but we shouldn't send an error for that.
+        response->result = move(result);
+        return response;
+    }
+    auto loc = maybeLoc.value();
     // Simply querying the file in question is insufficient since indexing errors would not be detected.
     auto errors = typechecker.retypecheck({file});
-    auto loc = params->range->toLoc(gs, file);
     vector<core::AutocorrectSuggestion::Edit> allEdits;
     for (auto &error : errors) {
         if (!error->isSilenced && !error->autocorrects.empty()) {
@@ -71,7 +122,7 @@ unique_ptr<ResponseMessage> CodeActionTask::runRequest(LSPTypecheckerDelegate &t
                 auto action = make_unique<CodeAction>(autocorrect.title);
                 action->kind = CodeActionKind::Quickfix;
                 auto workspaceEdit = make_unique<WorkspaceEdit>();
-                workspaceEdit->documentChanges = getEdits(config, gs, autocorrect.edits);
+                workspaceEdit->documentChanges = getQuickfixEdits(config, gs, autocorrect.edits);
                 action->edit = move(workspaceEdit);
                 result.emplace_back(move(action));
             }
@@ -99,8 +150,41 @@ unique_ptr<ResponseMessage> CodeActionTask::runRequest(LSPTypecheckerDelegate &t
             auto action = make_unique<CodeAction>("Apply all Sorbet fixes for file");
             action->kind = kind;
             auto workspaceEdit = make_unique<WorkspaceEdit>();
-            workspaceEdit->documentChanges = getEdits(config, gs, allEdits);
+            workspaceEdit->documentChanges = getQuickfixEdits(config, gs, allEdits);
             action->edit = move(workspaceEdit);
+            result.emplace_back(move(action));
+        }
+    }
+
+    auto queryResult = LSPQuery::byLoc(config, typechecker, params->textDocument->uri, *params->range->start,
+                                       LSPMethod::TextDocumentCodeAction, false);
+
+    // Generate "Move method" code actions only for class method definitions
+    if (queryResult.error == nullptr) {
+        if (auto *def = hasLoneClassMethodResponse(gs, queryResult.responses)) {
+            auto action = make_unique<CodeAction>("Move method to a new module");
+            action->kind = CodeActionKind::RefactorExtract;
+
+            bool canResolveLazily = config.getClientConfig().clientCodeActionResolveEditSupport &&
+                                    config.getClientConfig().clientCodeActionDataSupport;
+            auto newModuleLoc = getNewModuleLocation(gs, *def, typechecker);
+            auto renameCommand = make_unique<Command>("Rename Symbol", "sorbet.rename");
+            auto arg = make_unique<TextDocumentPositionParams>(
+                make_unique<TextDocumentIdentifier>(params->textDocument->uri), move(newModuleLoc));
+            auto args = vector<unique_ptr<TextDocumentPositionParams>>();
+            args.emplace_back(move(arg));
+
+            renameCommand->arguments = move(args);
+            action->command = move(renameCommand);
+            if (canResolveLazily) {
+                action->data = move(params);
+            } else {
+                auto workspaceEdit = make_unique<WorkspaceEdit>();
+                auto edits = getMoveMethodEdits(typechecker, config, *def);
+                workspaceEdit->documentChanges = move(edits);
+                action->edit = move(workspaceEdit);
+            }
+
             result.emplace_back(move(action));
         }
     }
@@ -108,4 +192,5 @@ unique_ptr<ResponseMessage> CodeActionTask::runRequest(LSPTypecheckerDelegate &t
     response->result = move(result);
     return response;
 }
+
 } // namespace sorbet::realmain::lsp

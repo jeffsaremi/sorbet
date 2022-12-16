@@ -52,7 +52,7 @@ OutputCategory outputCategoryFromClassName(string_view fullName) {
     } else if (absl::StrContains(fullName, "::Mutator")) {
         return OutputCategory::Mutator;
     } else if (absl::StrContains(fullName, "::Model")) {
-        if (absl::StartsWith(fullName, "Plaid")) {
+        if (absl::StartsWith(fullName, "Plaid") || absl::StartsWith(fullName, "Algolia")) {
             return OutputCategory::External;
         } else {
             return OutputCategory::Model;
@@ -94,7 +94,7 @@ void writeClassDef(const core::GlobalState &rbiGS, options::PrinterConfig &outfi
     while (rbiEntry.data(rbiGS)->isSingletonClass(rbiGS)) {
         rbiEntry = rbiEntry.data(rbiGS)->attachedClass(rbiGS);
     }
-    auto defType = rbiEntry.data(rbiGS)->isClassOrModuleClass() ? "class" : "module";
+    auto defType = rbiEntry.data(rbiGS)->isClass() ? "class" : "module";
     auto fullName = rbiEntry.show(rbiGS);
     auto cbase = outputCategoryFromClassName(fullName) == OutputCategory::External ? "::" : "";
     // TODO: The old Ruby-powered version did not emit superclasses. Eventually, we might want to
@@ -127,8 +127,7 @@ void serializeMethods(const core::GlobalState &sourceGS, const core::GlobalState
         auto rbiEntry = maybeRbiEntry.asMethodRef();
 
         if (sourceClass.exists()) {
-            auto sourceEntryIt = sourceMembersByName.find(rbiEntryName.show(rbiGS));
-            if (sourceEntryIt != sourceMembersByName.end()) {
+            if (sourceMembersByName.contains(rbiEntryName.show(rbiGS))) {
                 continue;
             }
         }
@@ -191,7 +190,7 @@ void serializeMethods(const core::GlobalState &sourceGS, const core::GlobalState
                 continue;
             }
 
-            if (sourceClass.data(sourceGS)->isClassOrModuleAbstract() && rbiEntryName == core::Names::initialize()) {
+            if (sourceClass.data(sourceGS)->flags.isAbstract && rbiEntryName == core::Names::initialize()) {
                 // `abstract!` will define `initialize` in the class to raise unconditionally
                 // https://github.com/sorbet/sorbet/blob/026c60bf719d/gems/sorbet-runtime/lib/types/private/abstract/declare.rb#L37-L42
                 // Which is not useful to include in the minimized output.
@@ -419,7 +418,9 @@ void Minimize::indexAndResolveForMinimize(unique_ptr<core::GlobalState> &sourceG
         rbiGS->errorQueue->flushAllErrors(*rbiGS);
     }
 
-    rbiIndexed = move(pipeline::resolve(rbiGS, move(rbiIndexed), opts, workers).result());
+    // Only need to compute FoundDefHashes when running to compute a FileHash
+    auto foundHashes = nullptr;
+    rbiIndexed = move(pipeline::resolve(rbiGS, move(rbiIndexed), opts, workers, foundHashes).result());
     if (rbiGS->hadCriticalError()) {
         rbiGS->errorQueue->flushAllErrors(*rbiGS);
     }

@@ -4,28 +4,19 @@ begin
     def self.<static-init><<static-init>$CENSORED>(<blk>)
       begin
         begin
-          ::<Magic>.<define-top-class-or-module>(::Other)
+          <emptyTree>
           ::Sorbet::Private::Static.keep_for_ide(::Other)
           <emptyTree>
         end
         begin
-          ::<Magic>.<define-top-class-or-module>(::Test)
+          <emptyTree>
           ::Sorbet::Private::Static.keep_for_ide(::Test)
           ::Sorbet::Private::Static.keep_for_ide(::Other)
           <emptyTree>
         end
-        begin
-          ::Sorbet::Private::Static.keep_for_typechecking(::Test::Mixin)
-          T.assert_type!(::Test.new(), Test::Mixin)
-        end
-        begin
-          ::Sorbet::Private::Static.keep_for_typechecking(::Test::Other)
-          T.assert_type!(::Test.new(), Test::Other)
-        end
-        begin
-          ::Sorbet::Private::Static.keep_for_typechecking(::Other)
-          T.assert_type!(::Test.new(), Other)
-        end
+        <cast:assert_type!>(::Test.new(), Test::Mixin, ::Test::Mixin)
+        <cast:assert_type!>(::Test.new(), Test::Other, ::Test::Other)
+        <cast:assert_type!>(::Test.new(), Other, ::Other)
         <emptyTree>
       end
     end
@@ -39,12 +30,12 @@ begin
     def self.<static-init>(<blk>)
       begin
         begin
-          ::<Magic>.<define-top-class-or-module>(::Test::Mixin)
+          <emptyTree>
           ::Sorbet::Private::Static.keep_for_ide(::Test::Mixin)
           <emptyTree>
         end
         begin
-          ::<Magic>.<define-top-class-or-module>(::Test::Other)
+          <emptyTree>
           ::Sorbet::Private::Static.keep_for_ide(::Test::Other)
           <emptyTree>
         end

@@ -19,12 +19,11 @@
 #include <fstream>
 #include <memory>
 
-namespace spd = spdlog;
 using namespace std;
 
 namespace sorbet::infer::test {
 
-auto logger = spd::stderr_color_mt("infer_test");
+auto logger = spdlog::stderr_color_mt("infer_test");
 auto errorQueue = make_shared<sorbet::core::ErrorQueue>(*logger, *logger);
 
 void processSource(core::GlobalState &cb, string str) {
@@ -32,8 +31,8 @@ void processSource(core::GlobalState &cb, string str) {
     sorbet::core::UnfreezeSymbolTable st(cb);
     sorbet::core::UnfreezeFileTable ft(cb);
     core::FileRef fileId = cb.enterFile("<test>", str);
-    auto trace = false;
-    auto ast = parser::Parser::run(cb, fileId, trace);
+    auto settings = parser::Parser::Settings{};
+    auto ast = parser::Parser::run(cb, fileId, settings);
     sorbet::core::MutableContext ctx(cb, core::Symbols::root(), fileId);
     auto tree = ast::ParsedFile{ast::desugar::node2Tree(ctx, move(ast)), fileId};
     tree.tree = rewriter::Rewriter::run(ctx, move(tree.tree));
@@ -41,7 +40,8 @@ void processSource(core::GlobalState &cb, string str) {
     vector<ast::ParsedFile> trees;
     trees.emplace_back(move(tree));
     auto workers = WorkerPool::create(0, *logger);
-    trees = move(namer::Namer::run(cb, move(trees), *workers).result());
+    core::FoundDefHashes foundHashes; // compute this just for test coverage
+    trees = move(namer::Namer::run(cb, move(trees), *workers, &foundHashes).result());
     auto resolved = resolver::Resolver::run(cb, move(trees), *workers);
     for (auto &tree : resolved.result()) {
         sorbet::core::MutableContext ctx(cb, core::Symbols::root(), tree.file);
@@ -54,13 +54,13 @@ TEST_CASE("Infer") {
     gs.initEmpty();
 
     SUBCASE("LiteralsSubtyping") {
-        auto intLit = core::make_type<core::LiteralType>(int64_t(1));
+        auto intLit = core::make_type<core::IntegerLiteralType>(int64_t(1));
         auto intClass = core::make_type<core::ClassType>(core::Symbols::Integer());
-        auto floatLit = core::make_type<core::LiteralType>(1.0f);
+        auto floatLit = core::make_type<core::FloatLiteralType>(1.0f);
         auto floatClass = core::make_type<core::ClassType>(core::Symbols::Float());
         auto trueLit = core::Types::trueClass();
         auto trueClass = core::make_type<core::ClassType>(core::Symbols::TrueClass());
-        auto stringLit = core::make_type<core::LiteralType>(core::Symbols::String(), core::Names::assignTemp());
+        auto stringLit = core::make_type<core::NamedLiteralType>(core::Symbols::String(), core::Names::assignTemp());
         auto stringClass = core::make_type<core::ClassType>(core::Symbols::String());
         REQUIRE(core::Types::isSubType(gs, intLit, intClass));
         REQUIRE(core::Types::isSubType(gs, floatLit, floatClass));

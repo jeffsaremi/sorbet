@@ -1,6 +1,7 @@
 ClassDef{
   kind = class
-  name = EmptyTree<<C <U <root>>>>
+  name = EmptyTree
+  symbol = <C <U <root>>>
   ancestors = [ConstantLit{
       symbol = (class ::<todo sym>)
       orig = nullptr
@@ -11,7 +12,8 @@ ClassDef{
       name = UnresolvedConstantLit{
         cnst = <C <U Parent>>
         scope = EmptyTree
-      }<<C <U <todo sym>>>>
+      }
+      symbol = <C <U <todo sym>>>
       ancestors = [ConstantLit{
           symbol = (class ::<todo sym>)
           orig = nullptr
@@ -223,131 +225,30 @@ ClassDef{
           }
         }
 
-        Send{
+        MethodDef{
           flags = {}
-          recv = ConstantLit{
-            symbol = (module ::Sorbet::Private::Static)
-            orig = nullptr
-          }
-          fun = <U keep_def>
-          block = nullptr
-          pos_args = 3
-          args = [
-            Local{
-              localVariable = <U <self>>
-            }
-            Literal{ value = :takes_positional }
-            Literal{ value = :normal }
-          ]
+          name = <U zsuper_inside_block><<U <todo method>>>
+          args = [BlockArg{ expr = Local{
+              localVariable = <U <blk>>
+            } }]
+          rhs = EmptyTree
         }
 
-        Send{
-          flags = {}
-          recv = ConstantLit{
-            symbol = (module ::Sorbet::Private::Static)
-            orig = nullptr
-          }
-          fun = <U keep_def>
-          block = nullptr
-          pos_args = 3
-          args = [
-            Local{
-              localVariable = <U <self>>
-            }
-            Literal{ value = :takes_keyword }
-            Literal{ value = :normal }
-          ]
-        }
+        <runtime method definition of takes_positional>
 
-        Send{
-          flags = {}
-          recv = ConstantLit{
-            symbol = (module ::Sorbet::Private::Static)
-            orig = nullptr
-          }
-          fun = <U keep_def>
-          block = nullptr
-          pos_args = 3
-          args = [
-            Local{
-              localVariable = <U <self>>
-            }
-            Literal{ value = :takes_two_keyword }
-            Literal{ value = :normal }
-          ]
-        }
+        <runtime method definition of takes_keyword>
 
-        Send{
-          flags = {}
-          recv = ConstantLit{
-            symbol = (module ::Sorbet::Private::Static)
-            orig = nullptr
-          }
-          fun = <U keep_def>
-          block = nullptr
-          pos_args = 3
-          args = [
-            Local{
-              localVariable = <U <self>>
-            }
-            Literal{ value = :takes_positional_then_keyword }
-            Literal{ value = :normal }
-          ]
-        }
+        <runtime method definition of takes_two_keyword>
 
-        Send{
-          flags = {}
-          recv = ConstantLit{
-            symbol = (module ::Sorbet::Private::Static)
-            orig = nullptr
-          }
-          fun = <U keep_def>
-          block = nullptr
-          pos_args = 3
-          args = [
-            Local{
-              localVariable = <U <self>>
-            }
-            Literal{ value = :takes_rest }
-            Literal{ value = :normal }
-          ]
-        }
+        <runtime method definition of takes_positional_then_keyword>
 
-        Send{
-          flags = {}
-          recv = ConstantLit{
-            symbol = (module ::Sorbet::Private::Static)
-            orig = nullptr
-          }
-          fun = <U keep_def>
-          block = nullptr
-          pos_args = 3
-          args = [
-            Local{
-              localVariable = <U <self>>
-            }
-            Literal{ value = :takes_keyword_rest }
-            Literal{ value = :normal }
-          ]
-        }
+        <runtime method definition of takes_rest>
 
-        Send{
-          flags = {}
-          recv = ConstantLit{
-            symbol = (module ::Sorbet::Private::Static)
-            orig = nullptr
-          }
-          fun = <U keep_def>
-          block = nullptr
-          pos_args = 3
-          args = [
-            Local{
-              localVariable = <U <self>>
-            }
-            Literal{ value = :takes_block }
-            Literal{ value = :normal }
-          ]
-        }
+        <runtime method definition of takes_keyword_rest>
+
+        <runtime method definition of takes_block>
+
+        <runtime method definition of zsuper_inside_block>
       ]
     }
 
@@ -356,7 +257,8 @@ ClassDef{
       name = UnresolvedConstantLit{
         cnst = <C <U Child>>
         scope = EmptyTree
-      }<<C <U <todo sym>>>>
+      }
+      symbol = <C <U <todo sym>>>
       ancestors = [UnresolvedConstantLit{
           cnst = <C <U Parent>>
           scope = EmptyTree
@@ -632,131 +534,63 @@ ClassDef{
           }
         }
 
-        Send{
+        MethodDef{
           flags = {}
-          recv = ConstantLit{
-            symbol = (module ::Sorbet::Private::Static)
-            orig = nullptr
-          }
-          fun = <U keep_def>
-          block = nullptr
-          pos_args = 3
-          args = [
-            Local{
-              localVariable = <U <self>>
+          name = <U zsuper_inside_block><<U <todo method>>>
+          args = [BlockArg{ expr = Local{
+              localVariable = <U <blk>>
+            } }]
+          rhs = Send{
+            flags = {}
+            recv = Literal{ value = 1 }
+            fun = <U times>
+            block = Block {
+              args = [
+                Local{
+                  localVariable = <U i>$1
+                }
+              ]
+              body = Send{
+                flags = {privateOk}
+                recv = ConstantLit{
+                  symbol = (class ::<Magic>)
+                  orig = nullptr
+                }
+                fun = <U <call-with-block>>
+                block = nullptr
+                pos_args = 3
+                args = [
+                  Local{
+                    localVariable = <U <self>>
+                  }
+                  Literal{ value = :<super> }
+                  Local{
+                    localVariable = <U <blk>>
+                  }
+                ]
+              }
             }
-            Literal{ value = :takes_positional }
-            Literal{ value = :normal }
-          ]
+            pos_args = 0
+            args = [
+            ]
+          }
         }
 
-        Send{
-          flags = {}
-          recv = ConstantLit{
-            symbol = (module ::Sorbet::Private::Static)
-            orig = nullptr
-          }
-          fun = <U keep_def>
-          block = nullptr
-          pos_args = 3
-          args = [
-            Local{
-              localVariable = <U <self>>
-            }
-            Literal{ value = :takes_keyword }
-            Literal{ value = :normal }
-          ]
-        }
+        <runtime method definition of takes_positional>
 
-        Send{
-          flags = {}
-          recv = ConstantLit{
-            symbol = (module ::Sorbet::Private::Static)
-            orig = nullptr
-          }
-          fun = <U keep_def>
-          block = nullptr
-          pos_args = 3
-          args = [
-            Local{
-              localVariable = <U <self>>
-            }
-            Literal{ value = :takes_two_keyword }
-            Literal{ value = :normal }
-          ]
-        }
+        <runtime method definition of takes_keyword>
 
-        Send{
-          flags = {}
-          recv = ConstantLit{
-            symbol = (module ::Sorbet::Private::Static)
-            orig = nullptr
-          }
-          fun = <U keep_def>
-          block = nullptr
-          pos_args = 3
-          args = [
-            Local{
-              localVariable = <U <self>>
-            }
-            Literal{ value = :takes_positional_then_keyword }
-            Literal{ value = :normal }
-          ]
-        }
+        <runtime method definition of takes_two_keyword>
 
-        Send{
-          flags = {}
-          recv = ConstantLit{
-            symbol = (module ::Sorbet::Private::Static)
-            orig = nullptr
-          }
-          fun = <U keep_def>
-          block = nullptr
-          pos_args = 3
-          args = [
-            Local{
-              localVariable = <U <self>>
-            }
-            Literal{ value = :takes_rest }
-            Literal{ value = :normal }
-          ]
-        }
+        <runtime method definition of takes_positional_then_keyword>
 
-        Send{
-          flags = {}
-          recv = ConstantLit{
-            symbol = (module ::Sorbet::Private::Static)
-            orig = nullptr
-          }
-          fun = <U keep_def>
-          block = nullptr
-          pos_args = 3
-          args = [
-            Local{
-              localVariable = <U <self>>
-            }
-            Literal{ value = :takes_keyword_rest }
-            Literal{ value = :normal }
-          ]
-        }
+        <runtime method definition of takes_rest>
 
-        Send{
-          flags = {}
-          recv = ConstantLit{
-            symbol = (module ::Sorbet::Private::Static)
-            orig = nullptr
-          }
-          fun = <U keep_def>
-          block = nullptr
-          pos_args = 3
-          args = [
-            Local{
-              localVariable = <U <self>>
-            }
-            Literal{ value = :takes_block }
-            Literal{ value = :normal }
-          ]
-        }
+        <runtime method definition of takes_keyword_rest>
+
+        <runtime method definition of takes_block>
+
+        <runtime method definition of zsuper_inside_block>
       ]
     }
   ]

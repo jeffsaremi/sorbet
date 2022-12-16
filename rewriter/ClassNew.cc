@@ -10,9 +10,18 @@ using namespace std;
 
 namespace sorbet::rewriter {
 
+// Is this expression a synthetic `T.bind` call we added from the `ClassNew` rewriter on sends?
+bool isRewrittenBind(ast::ExpressionPtr &expr) {
+    auto cast = ast::cast_tree<ast::Cast>(expr);
+    if (cast == nullptr) {
+        return false;
+    }
+
+    return cast->cast == core::Names::syntheticBind();
+}
+
 vector<ast::ExpressionPtr> ClassNew::run(core::MutableContext ctx, ast::Assign *asgn) {
     vector<ast::ExpressionPtr> empty;
-    auto loc = asgn->loc;
 
     if (ctx.state.runningUnderAutogen) {
         // This is not safe to run under autogen, because we'd be outputing
@@ -62,6 +71,10 @@ vector<ast::ExpressionPtr> ClassNew::run(core::MutableContext ctx, ast::Assign *
         // Steal the trees, because the run is going to remove the original send node from the tree anyway.
         if (auto insSeq = ast::cast_tree<ast::InsSeq>(block->body)) {
             for (auto &&stat : insSeq->stats) {
+                if (isRewrittenBind(stat)) {
+                    // Remove synthetic `T.bind` statements we added during the ClassNew rewriter on sends.
+                    continue;
+                }
                 body.emplace_back(move(stat));
             }
             body.emplace_back(move(insSeq->expr));
@@ -77,9 +90,62 @@ vector<ast::ExpressionPtr> ClassNew::run(core::MutableContext ctx, ast::Assign *
         ancestors.emplace_back(ast::MK::Constant(send->loc, core::Symbols::todo()));
     }
 
+    auto loc = asgn->loc;
+
     vector<ast::ExpressionPtr> stats;
     stats.emplace_back(ast::MK::Class(loc, loc, std::move(asgn->lhs), std::move(ancestors), std::move(body)));
     return stats;
+}
+
+bool ClassNew::run(core::MutableContext ctx, ast::Send *send) {
+    auto recv = ast::cast_tree<ast::UnresolvedConstantLit>(send->recv);
+    if (recv == nullptr) {
+        return false;
+    }
+
+    if (!ast::isa_tree<ast::EmptyTree>(recv->scope) || recv->cnst != core::Names::Constants::Class() ||
+        send->fun != core::Names::new_()) {
+        return false;
+    }
+
+    auto argc = send->numPosArgs();
+    if (argc > 1 || send->hasKwArgs()) {
+        return false;
+    }
+
+    if (argc == 1 && !ast::isa_tree<ast::UnresolvedConstantLit>(send->getPosArg(0))) {
+        return false;
+    }
+
+    auto *block = send->block();
+    if (block == nullptr) {
+        return false;
+    }
+
+    ast::ExpressionPtr type;
+
+    if (argc == 0) {
+        type = ast::MK::Constant(send->loc, core::Symbols::Class());
+    } else {
+        auto target = send->getPosArg(0).deepCopy();
+        type = ast::MK::ClassOf(send->loc, std::move(target));
+    }
+
+    auto bind = ast::MK::SyntheticBind(send->loc, ast::MK::Self(send->loc), std::move(type));
+
+    ast::InsSeq::STATS_store blockStats;
+    blockStats.emplace_back(std::move(bind));
+
+    if (auto insSeq = ast::cast_tree<ast::InsSeq>(block->body)) {
+        for (auto &stat : insSeq->stats) {
+            blockStats.emplace_back(std::move(stat));
+        }
+        block->body = ast::MK::InsSeq(block->loc, std::move(blockStats), std::move(insSeq->expr));
+    } else {
+        block->body = ast::MK::InsSeq(block->loc, std::move(blockStats), std::move(block->body));
+    }
+
+    return true;
 }
 
 }; // namespace sorbet::rewriter

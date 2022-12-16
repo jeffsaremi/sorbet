@@ -2,7 +2,7 @@
 #define RUBY_TYPER_LSP_UNDOSTATE_H
 
 #include "ast/ast.h"
-#include "core/NameHash.h"
+#include "core/FileHash.h"
 #include "core/core.h"
 
 namespace sorbet::realmain::lsp {
@@ -18,8 +18,9 @@ class UndoState final {
     UnorderedMap<int, ast::ParsedFile> evictedIndexed;
     // Stores the index trees stored in `gs` that were evicted because the slow path operation replaced `gs`.
     UnorderedMap<int, ast::ParsedFile> evictedIndexedFinalGS;
-    // Stores the list of files that had errors before the slow path began.
-    std::vector<core::FileRef> evictedFilesThatHaveErrors;
+
+    // Dummy ParsedFile that we return when the file requested by getIndexed is not available.
+    ast::ParsedFile dummyParsedFile{nullptr, core::FileRef()};
 
 public:
     // Epoch of the running slow path
@@ -38,6 +39,16 @@ public:
      */
     void restore(std::unique_ptr<core::GlobalState> &gs, std::vector<ast::ParsedFile> &indexed,
                  UnorderedMap<int, ast::ParsedFile> &indexedFinalGS);
+
+    /**
+     * Retrieves the evicted global state.
+     */
+    const std::unique_ptr<core::GlobalState> &getEvictedGs();
+
+    /**
+     * Returns the indexed file
+     */
+    const ast::ParsedFile &getIndexed(core::FileRef fref) const;
 };
 
 } // namespace sorbet::realmain::lsp

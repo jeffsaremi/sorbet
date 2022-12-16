@@ -1,9 +1,8 @@
 #include "doctest.h"
 // has to go first as it violates our requirements
 
-#include "main/lsp/lsp.h"
+#include "main/lsp/LSPLoop.h"
 
-namespace spd = spdlog;
 using namespace std;
 
 namespace sorbet::realmain::lsp::test {

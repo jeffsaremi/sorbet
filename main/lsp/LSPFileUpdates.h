@@ -3,6 +3,9 @@
 
 #include "ast/ast.h"
 #include "common/common.h"
+#include "core/FileHash.h"
+#include "main/lsp/LSPConfiguration.h"
+#include "main/lsp/LSPPathType.h"
 
 namespace sorbet::realmain::lsp {
 /**
@@ -21,7 +24,8 @@ public:
     std::vector<std::shared_ptr<core::File>> updatedFiles;
     std::vector<ast::ParsedFile> updatedFileIndexes;
 
-    bool canTakeFastPath = false;
+    PathType typecheckingPath = PathType::Slow;
+
     // Indicates that this update contains a new file. Is a hack for determining if combining two updates can take the
     // fast path.
     bool hasNewFiles = false;
@@ -39,7 +43,7 @@ public:
     /**
      * Merges the given (and older) LSPFileUpdates object into this LSPFileUpdates object.
      *
-     * Resets `fastPathDecision`.
+     * Resets `getTypecheckingPath`.
      */
     void mergeOlder(const LSPFileUpdates &older);
 
@@ -47,6 +51,34 @@ public:
      * Returns a copy of this LSPFileUpdates object. Does not handle deepCopying `updatedGS`.
      */
     LSPFileUpdates copy() const;
+
+    struct FastPathFilesToTypecheckResult {
+        // size_t is an index into the LSPFileUpdates::updatedFiles vector
+        UnorderedMap<core::FileRef, size_t> changedFiles;
+
+        // The names of all symbols changed by this set of updates
+        std::vector<core::WithoutUniqueNameHash> changedSymbolNameHashes;
+
+        // Extra files that need to be typechecked because the file mentions the name of one of the changed symbols.
+        std::vector<core::FileRef> extraFiles;
+    };
+
+    // It would be nice to have this accept `...<const core::File>...`
+    // As written, it's possible to mutate the files, but that's not intentional.
+    static FastPathFilesToTypecheckResult
+    fastPathFilesToTypecheck(const core::GlobalState &gs, const LSPConfiguration &config,
+                             const std::vector<std::shared_ptr<core::File>> &updatedFiles);
+
+    // Overload because sometimes we have to look up the old file's hash in GlobalState (when
+    // running on the typechecker thread), and sometimes we have to look it up in evictedFiles (when
+    // running on the indexer thread).
+    static FastPathFilesToTypecheckResult
+    fastPathFilesToTypecheck(const core::GlobalState &gs, const LSPConfiguration &config,
+                             const std::vector<std::shared_ptr<core::File>> &updatedFiles,
+                             const UnorderedMap<core::FileRef, std::shared_ptr<core::File>> &evictedFiles);
+
+    FastPathFilesToTypecheckResult fastPathFilesToTypecheck(const core::GlobalState &gs,
+                                                            const LSPConfiguration &config) const;
 };
 } // namespace sorbet::realmain::lsp
 

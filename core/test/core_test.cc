@@ -11,44 +11,104 @@
 #include "spdlog/sinks/stdout_color_sinks.h"
 #include "spdlog/spdlog.h"
 
-namespace spd = spdlog;
 using namespace std;
 
 namespace sorbet::core {
-auto logger = spd::stderr_color_mt("parse");
+auto logger = spdlog::stderr_color_mt("parse");
 auto errorCollector = make_shared<core::ErrorCollector>();
 auto errorQueue = make_shared<ErrorQueue>(*logger, *logger, errorCollector);
 
 struct Offset2PosTest {
     string src;
-    uint32_t off;
+    optional<uint32_t> off;
     uint32_t line;
     uint32_t col;
 };
 
-TEST_CASE("TestOffset2Pos") {
+string showOffset(const optional<uint32_t> &off) {
+    if (off.has_value()) {
+        return to_string(off.value());
+    } else {
+        return "nullopt";
+    }
+}
+
+TEST_CASE("TestOffset2Pos2Offset") {
     GlobalState gs(errorQueue);
     gs.initEmpty();
     UnfreezeFileTable fileTableAccess(gs);
 
-    vector<Offset2PosTest> cases = {{"hello", 0, 1, 1},
-                                    {"line 1\nline 2", 1, 1, 2},
-                                    {"line 1\nline 2", 7, 2, 1},
-                                    {"line 1\nline 2", 11, 2, 5},
-                                    {"a long line with no newlines\n", 20, 1, 21},
-                                    {"line 1\nline 2\nline3\n", 7, 2, 1},
-                                    {"line 1\nline 2\nline3", 6, 1, 7},
-                                    {"line 1\nline 2\nline3", 7, 2, 1}};
+    vector<Offset2PosTest> cases = {
+        {"hello", 0, 1, 1},
+        {"line 1\nline 2", 1, 1, 2},
+        {"line 1\nline 2", 7, 2, 1},
+        {"line 1\nline 2", 11, 2, 5},
+        {"a long line with no newlines\n", 20, 1, 21},
+        {"line 1\nline 2\nline3\n", 7, 2, 1},
+        {"line 1\nline 2\nline3", 6, 1, 7},
+        {"line 1\nline 2\nline3", 7, 2, 1},
+    };
+
     int i = 0;
     for (auto &tc : cases) {
         auto name = string("case: ") + to_string(i);
         INFO(name);
         FileRef f = gs.enterFile(move(name), tc.src);
 
-        auto detail = Loc::offset2Pos(f.data(gs), tc.off);
+        auto detail = Loc::offset2Pos(f.data(gs), tc.off.value());
 
         CHECK_EQ(tc.col, detail.column);
         CHECK_EQ(tc.line, detail.line);
+
+        // Test that it's reversible
+        auto offset = Loc::pos2Offset(f.data(gs), detail);
+        CHECK_EQ(tc.off, offset);
+
+        i++;
+    }
+}
+
+TEST_CASE("TestPos2OffsetNull") {
+    GlobalState gs(errorQueue);
+    gs.initEmpty();
+    UnfreezeFileTable fileTableAccess(gs);
+
+    vector<Offset2PosTest> cases = {
+        {"hello", nullopt, 0, 1},
+        {"hello", UINT32_MAX, 1, 0},
+        {"hello", 0, 1, 1},
+
+        {"hello", 4, 1, 5},
+        {"hello", 5, 1, 6},
+        {"hello", nullopt, 1, 7},
+
+        {"hello", 5, 2, 0}, // kind of strange?
+        {"hello", nullopt, 2, 1},
+
+        {"hello\n", 5, 2, 0},
+        {"hello\n", 6, 2, 1},
+        {"hello\n", nullopt, 2, 2},
+
+        {"line 1\nline 2", 5, 1, 6},
+        {"line 1\nline 2", 6, 1, 7},
+        {"line 1\nline 2", nullopt, 1, 8},
+
+        {"line 1\nline 2", 6, 2, 0},
+        {"line 1\nline 2", 7, 2, 1},
+
+        {"line 1\n\nline 2", 7, 2, 1},
+        {"line 1\n\nline 2", nullopt, 2, 2},
+    };
+
+    int i = 0;
+    for (auto &tc : cases) {
+        auto name = string("case: ") + to_string(i);
+        FileRef f = gs.enterFile(move(name), tc.src);
+
+        auto actualOffset = Loc::pos2Offset(f.data(gs), Loc::Detail{tc.line, tc.col});
+
+        INFO(fmt::format("i={}, CHECK_EQ({}, {})", i, showOffset(tc.off), showOffset(actualOffset)));
+        CHECK_EQ(tc.off, actualOffset);
         i++;
     }
 }
@@ -123,6 +183,26 @@ TEST_CASE("FileIsCompiled") { // NOLINT
     }
 }
 
+struct FileIsPackagedCase {
+    string_view src;
+    PackagedLevel packaged;
+};
+
+TEST_CASE("FileIsPackaged") { // NOLINT
+    vector<FileIsPackagedCase> cases = {
+        {"", PackagedLevel::None},
+        {"# packaged: true", PackagedLevel::True},
+        {"\n# packaged: true\n", PackagedLevel::True},
+        {"\n# packaged: false\n", PackagedLevel::False},
+        {"not a packaged: sigil\n# packaged: true\n", PackagedLevel::True},
+        {"packaged:\n# packaged: nonsense\n", PackagedLevel::None},
+        {"packaged: true\n", PackagedLevel::None},
+    };
+    for (auto &tc : cases) {
+        CHECK_EQ(tc.packaged, File::filePackagedSigil(tc.src));
+    }
+}
+
 TEST_CASE("Substitute") { // NOLINT
     GlobalState gs1(errorQueue);
     gs1.initEmpty();
@@ -168,15 +248,10 @@ class TypePtrTestHelper {
 public:
     static std::atomic<uint32_t> *counter(const TypePtr &ptr) {
         CHECK(ptr.containsPtr());
-        return ptr.counter;
+        return &ptr.get()->counter;
     }
 
-    static uint64_t value(const TypePtr &ptr) {
-        CHECK(!ptr.containsPtr());
-        return ptr.value;
-    }
-
-    static uint32_t inlinedValue(const TypePtr &ptr) {
+    static uint64_t inlinedValue(const TypePtr &ptr) {
         CHECK(!ptr.containsPtr());
         return ptr.inlinedValue();
     }
@@ -185,24 +260,24 @@ public:
         return ptr.store;
     }
 
-    static void *get(const TypePtr &ptr) {
+    static Refcounted *get(const TypePtr &ptr) {
         CHECK(ptr.containsPtr());
         return ptr.get();
     }
 
-    static TypePtr create(TypePtr::Tag tag, void *type) {
+    static TypePtr create(TypePtr::Tag tag, Refcounted *type) {
         return TypePtr(tag, type);
     }
 
-    static TypePtr createInlined(TypePtr::Tag tag, uint32_t inlinedValue, uint64_t value) {
-        return TypePtr(tag, inlinedValue, value);
+    static TypePtr createInlined(TypePtr::Tag tag, uint64_t inlinedValue) {
+        return TypePtr(tag, inlinedValue);
     }
 };
 
 TEST_SUITE("TypePtr") {
     TEST_CASE("Does not allocate a counter for null type") {
         TypePtr ptr;
-        CHECK_EQ(0, TypePtrTestHelper::value(ptr));
+        CHECK_EQ(0, TypePtrTestHelper::store(ptr));
     }
 
     TEST_CASE("Properly manages counter") {
@@ -232,7 +307,6 @@ TEST_SUITE("TypePtr") {
             CHECK_EQ(1, counter->load());
 
             // Moving should clear counter from ptrCopy and make it an empty TypePtr
-            CHECK_EQ(0, TypePtrTestHelper::value(ptrCopy));
             CHECK_EQ(0, TypePtrTestHelper::store(ptrCopy));
             CHECK_EQ(TypePtr(), ptrCopy);
 
@@ -245,15 +319,6 @@ TEST_SUITE("TypePtr") {
     }
 
     TEST_CASE("Tagging works as expected") {
-        // This tag is < 8. Will be deleted / managed by TypePtr.
-        {
-            auto rawPtr = new SelfType();
-            auto ptr = TypePtrTestHelper::create(TypePtr::Tag::SelfType, rawPtr);
-            CHECK_EQ(TypePtr::Tag::SelfType, ptr.tag());
-            CHECK_EQ(rawPtr, TypePtrTestHelper::get(ptr));
-        }
-
-        // This tag is > 8
         {
             auto rawPtr = new UnresolvedClassType(Symbols::untyped(), {});
             auto ptr = TypePtrTestHelper::create(TypePtr::Tag::UnresolvedClassType, rawPtr);
@@ -272,10 +337,9 @@ TEST_SUITE("TypePtr") {
 
         for (auto values : valuesArray) {
             SUBCASE(fmt::format("{}, {}", values.first, values.second).c_str()) {
-                auto type = TypePtrTestHelper::createInlined(TypePtr::Tag::SelfType, values.first, values.second);
+                auto type = TypePtrTestHelper::createInlined(TypePtr::Tag::SelfType, values.first);
                 CHECK_EQ(TypePtr::Tag::SelfType, type.tag());
                 CHECK_EQ(values.first, TypePtrTestHelper::inlinedValue(type));
-                CHECK_EQ(values.second, TypePtrTestHelper::value(type));
             }
         }
     }

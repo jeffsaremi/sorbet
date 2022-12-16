@@ -2,11 +2,12 @@
 #include "absl/strings/match.h"
 #include "absl/synchronization/notification.h"
 #include "common/sort.h"
-#include "core/NameHash.h"
+#include "core/FileHash.h"
 #include "core/lsp/QueryResponse.h"
+#include "main/lsp/LSPLoop.h"
 #include "main/lsp/LSPOutput.h"
+#include "main/lsp/LSPQuery.h"
 #include "main/lsp/json_types.h"
-#include "main/lsp/lsp.h"
 
 namespace sorbet::realmain::lsp {
 using namespace std;
@@ -88,6 +89,9 @@ ResponseMessageStatus statusForResponse(const ResponseMessage &response) {
                 } else if constexpr (is_same_v<T, variant<JSONNullObject, vector<unique_ptr<CodeAction>>>>) {
                     // textDocument/codeAction
                     return ResponseMessageStatus::Unknown;
+                } else if constexpr (is_same_v<T, optional<unique_ptr<CodeAction>>>) {
+                    //  codeAction/resolve
+                    return ResponseMessageStatus::Unknown;
                 } else if constexpr (is_same_v<T, variant<JSONNullObject, vector<unique_ptr<SymbolInformation>>>>) {
                     // workspace/symbol
                     return ResponseMessageStatus::Unknown;
@@ -153,10 +157,16 @@ ConstExprStr LSPTask::methodString() const {
             return "initialized";
         case LSPMethod::SorbetReadFile:
             return "sorbet.readFile";
+        case LSPMethod::SorbetIndexerInitialization:
+            return "sorbet.indexerInitialization";
         case LSPMethod::SorbetShowSymbol:
             return "sorbet.showSymbol";
         case LSPMethod::SorbetWatchmanFileChange:
             return "sorbet.watchmanFileChange";
+        case LSPMethod::SorbetWatchmanStateEnter:
+            return "sorbet.watchmanStateEnter";
+        case LSPMethod::SorbetWatchmanStateLeave:
+            return "sorbet.watchmanStateLeave";
         case LSPMethod::SorbetWorkspaceEdit:
         case LSPMethod::TextDocumentDidChange:
         case LSPMethod::TextDocumentDidClose:
@@ -165,7 +175,7 @@ ConstExprStr LSPTask::methodString() const {
         case LSPMethod::TextDocumentCodeAction:
             return "textDocument.codeAction";
         case LSPMethod::TextDocumentCompletion:
-            return "textDocument.completion";
+            return LSP_COMPLETION_METRICS_PREFIX;
         case LSPMethod::TextDocumentDefinition:
             return "textDocument.definition";
         case LSPMethod::TextDocumentDocumentHighlight:
@@ -190,6 +200,8 @@ ConstExprStr LSPTask::methodString() const {
             return "workspace.symbol";
         case LSPMethod::TextDocumentImplementation:
             return "textDocument.implementation";
+        case LSPMethod::CodeActionResolve:
+            return "codeAction.resolve";
     }
 }
 
@@ -244,67 +256,6 @@ bool LSPRequestTask::cancel(const MessageId &id) {
     return false;
 }
 
-LSPQueryResult LSPTask::queryByLoc(LSPTypecheckerDelegate &typechecker, string_view uri, const Position &pos,
-                                   const LSPMethod forMethod, bool errorIfFileIsUntyped) const {
-    Timer timeit(config.logger, "setupLSPQueryByLoc");
-    const core::GlobalState &gs = typechecker.state();
-    auto fref = config.uri2FileRef(gs, uri);
-    if (!fref.exists()) {
-        auto error = make_unique<ResponseError>(
-            (int)LSPErrorCodes::InvalidParams,
-            fmt::format("Did not find file at uri {} in {}", uri, convertLSPMethodToString(forMethod)));
-        return LSPQueryResult{{}, move(error)};
-    }
-
-    if (errorIfFileIsUntyped && fref.data(gs).strictLevel < core::StrictLevel::True) {
-        config.logger->info("Ignoring request on untyped file `{}`", uri);
-        // Act as if the query returned no results.
-        return LSPQueryResult{{}, nullptr};
-    }
-
-    auto loc = config.lspPos2Loc(fref, pos, gs);
-    return typechecker.query(core::lsp::Query::createLocQuery(loc), {fref});
-}
-
-LSPQueryResult LSPTask::queryBySymbolInFiles(LSPTypecheckerDelegate &typechecker, core::SymbolRef sym,
-                                             vector<core::FileRef> frefs) const {
-    Timer timeit(config.logger, "setupLSPQueryBySymbolInFiles");
-    ENFORCE(sym.exists());
-    return typechecker.query(core::lsp::Query::createSymbolQuery(sym), frefs);
-}
-
-LSPQueryResult LSPTask::queryBySymbol(LSPTypecheckerDelegate &typechecker, core::SymbolRef sym) const {
-    Timer timeit(config.logger, "setupLSPQueryBySymbol");
-    ENFORCE(sym.exists());
-    vector<core::FileRef> frefs;
-    const core::GlobalState &gs = typechecker.state();
-    const core::NameHash symNameHash(gs, sym.name(gs));
-    // Locate files that contain the same Name as the symbol. Is an overapproximation, but a good first filter.
-    int i = -1;
-    for (auto &file : typechecker.state().getFiles()) {
-        i++;
-        if (file == nullptr) {
-            continue;
-        }
-
-        ENFORCE(file->getFileHash() != nullptr);
-        const auto &hash = *file->getFileHash();
-        const auto &usedSends = hash.usages.sends;
-        const auto &usedSymbolNames = hash.usages.symbols;
-        auto ref = core::FileRef(i);
-
-        const bool fileIsValid = ref.exists() && (ref.data(gs).sourceType == core::File::Type::Normal ||
-                                                  ref.data(gs).sourceType == core::File::Type::Package);
-        if (fileIsValid &&
-            (std::find(usedSends.begin(), usedSends.end(), symNameHash) != usedSends.end() ||
-             std::find(usedSymbolNames.begin(), usedSymbolNames.end(), symNameHash) != usedSymbolNames.end())) {
-            frefs.emplace_back(ref);
-        }
-    }
-
-    return typechecker.query(core::lsp::Query::createSymbolQuery(sym), frefs);
-}
-
 bool LSPTask::needsMultithreading(const LSPIndexer &indexer) const {
     return false;
 }
@@ -322,58 +273,17 @@ bool LSPTask::canPreempt(const LSPIndexer &indexer) const {
     return !needsMultithreading(indexer);
 }
 
-// Filter for untyped locations, and dedup responses that are at the same location
-vector<unique_ptr<core::lsp::QueryResponse>>
-LSPTask::filterAndDedup(const core::GlobalState &gs,
-                        const vector<unique_ptr<core::lsp::QueryResponse>> &queryResponses) const {
-    vector<unique_ptr<core::lsp::QueryResponse>> responses;
-    // Filter for responses with a loc that exists and points to a typed file, unless it's a const, field or
-    // definition in which case we're ok with untyped files (because we know where those things are even in untyped
-    // files.)
-    for (auto &q : queryResponses) {
-        core::Loc loc = q->getLoc();
-        if (loc.exists() && loc.file().exists()) {
-            auto fileIsTyped = loc.file().data(gs).strictLevel >= core::StrictLevel::True;
-            // If file is untyped, only support responses involving constants and definitions.
-            if (fileIsTyped || q->isConstant() || q->isField() || q->isDefinition()) {
-                responses.push_back(make_unique<core::lsp::QueryResponse>(*q));
-            }
-        }
-    }
-
-    // sort by location and deduplicate
-    fast_sort(responses,
-              [](const unique_ptr<core::lsp::QueryResponse> &a, const unique_ptr<core::lsp::QueryResponse> &b) -> bool {
-                  auto aLoc = a->getLoc();
-                  auto bLoc = b->getLoc();
-                  int cmp = aLoc.file().id() - bLoc.file().id();
-                  if (cmp == 0) {
-                      cmp = aLoc.beginPos() - bLoc.beginPos();
-                  }
-                  if (cmp == 0) {
-                      cmp = aLoc.endPos() - bLoc.endPos();
-                  }
-                  // TODO: precedence based on response type, in case of same location?
-                  return cmp < 0;
-              });
-    responses.resize(
-        std::distance(responses.begin(), std::unique(responses.begin(), responses.end(),
-                                                     [](const unique_ptr<core::lsp::QueryResponse> &a,
-                                                        const unique_ptr<core::lsp::QueryResponse> &b) -> bool {
-                                                         auto aLoc = a->getLoc();
-                                                         auto bLoc = b->getLoc();
-                                                         return aLoc == bLoc;
-                                                     })));
-    return responses;
-}
-
 vector<unique_ptr<Location>>
 LSPTask::extractLocations(const core::GlobalState &gs,
                           const vector<unique_ptr<core::lsp::QueryResponse>> &queryResponses,
                           vector<unique_ptr<Location>> locations) const {
-    auto queryResponsesFiltered = filterAndDedup(gs, queryResponses);
+    auto queryResponsesFiltered = LSPQuery::filterAndDedup(gs, queryResponses);
     for (auto &q : queryResponsesFiltered) {
-        addLocIfExists(gs, locations, q->getLoc());
+        if (auto *send = q->isSend()) {
+            addLocIfExists(gs, locations, send->funLoc);
+        } else {
+            addLocIfExists(gs, locations, q->getLoc());
+        }
     }
     return locations;
 }
@@ -382,7 +292,18 @@ vector<unique_ptr<core::lsp::QueryResponse>>
 LSPTask::getReferencesToSymbol(LSPTypecheckerDelegate &typechecker, core::SymbolRef symbol,
                                vector<unique_ptr<core::lsp::QueryResponse>> &&priorRefs) const {
     if (symbol.exists()) {
-        auto run2 = queryBySymbol(typechecker, symbol);
+        auto run2 = LSPQuery::bySymbol(config, typechecker, symbol);
+        absl::c_move(run2.responses, back_inserter(priorRefs));
+    }
+    return move(priorRefs);
+}
+
+vector<unique_ptr<core::lsp::QueryResponse>>
+LSPTask::getReferencesToSymbolInPackage(LSPTypecheckerDelegate &typechecker, core::NameRef packageName,
+                                        core::SymbolRef symbol,
+                                        vector<unique_ptr<core::lsp::QueryResponse>> &&priorRefs) const {
+    if (symbol.exists()) {
+        auto run2 = LSPQuery::bySymbol(config, typechecker, symbol, packageName);
         absl::c_move(run2.responses, back_inserter(priorRefs));
     }
     return move(priorRefs);
@@ -392,7 +313,7 @@ vector<unique_ptr<core::lsp::QueryResponse>>
 LSPTask::getReferencesToSymbolInFile(LSPTypecheckerDelegate &typechecker, core::FileRef fref, core::SymbolRef symbol,
                                      vector<unique_ptr<core::lsp::QueryResponse>> &&priorRefs) const {
     if (symbol.exists() && fref.exists()) {
-        auto run2 = queryBySymbolInFiles(typechecker, symbol, {fref});
+        auto run2 = LSPQuery::bySymbolInFiles(config, typechecker, symbol, {fref});
         for (auto &resp : run2.responses) {
             // Ignore results in other files (which may have been picked up for typechecking purposes)
             if (resp->getLoc().file() == fref) {
@@ -594,21 +515,19 @@ void LSPTask::addLocIfExists(const core::GlobalState &gs, vector<unique_ptr<Loca
 }
 
 LSPQueuePreemptionTask::LSPQueuePreemptionTask(const LSPConfiguration &config, absl::Notification &finished,
-                                               absl::Mutex &taskQueueMutex, TaskQueueState &taskQueue,
-                                               LSPIndexer &indexer)
-    : LSPTask(config, LSPMethod::SorbetError), finished(finished), taskQueueMutex(taskQueueMutex), taskQueue(taskQueue),
-      indexer(indexer) {}
+                                               TaskQueue &taskQueue, LSPIndexer &indexer)
+    : LSPTask(config, LSPMethod::SorbetError), finished(finished), taskQueue(taskQueue), indexer(indexer) {}
 
 void LSPQueuePreemptionTask::run(LSPTypecheckerDelegate &tc) {
     for (;;) {
         unique_ptr<LSPTask> task;
         {
-            absl::MutexLock lck(&taskQueueMutex);
-            if (taskQueue.pendingTasks.empty() || !taskQueue.pendingTasks.front()->canPreempt(indexer)) {
+            absl::MutexLock lck(taskQueue.getMutex());
+            if (taskQueue.tasks().empty() || !taskQueue.tasks().front()->canPreempt(indexer)) {
                 break;
             }
-            task = move(taskQueue.pendingTasks.front());
-            taskQueue.pendingTasks.pop_front();
+            task = move(taskQueue.tasks().front());
+            taskQueue.tasks().pop_front();
 
             {
                 Timer timeit(config.logger, "LSPTask::index");

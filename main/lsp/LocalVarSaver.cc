@@ -6,13 +6,13 @@ using namespace std;
 
 namespace sorbet::realmain::lsp {
 namespace {
-core::MethodRef enclosingMethod(core::Context ctx, core::Loc loc) {
+core::MethodRef enclosingMethod(core::Context ctx) {
     core::MethodRef enclosingMethod;
 
     if (ctx.owner.isMethod()) {
         enclosingMethod = ctx.owner.asMethodRef();
     } else if (ctx.owner == core::Symbols::root()) {
-        enclosingMethod = ctx.state.lookupStaticInitForFile(loc);
+        enclosingMethod = ctx.state.lookupStaticInitForFile(ctx.file);
     } else {
         enclosingMethod = ctx.state.lookupStaticInitForClass(ctx.owner.asClassOrModuleRef());
     }
@@ -21,9 +21,9 @@ core::MethodRef enclosingMethod(core::Context ctx, core::Loc loc) {
 }
 } // namespace
 
-ast::ExpressionPtr LocalVarSaver::postTransformBlock(core::Context ctx, ast::ExpressionPtr tree) {
+void LocalVarSaver::postTransformBlock(core::Context ctx, ast::ExpressionPtr &tree) {
     auto &block = ast::cast_tree_nonnull<ast::Block>(tree);
-    auto method = enclosingMethod(ctx, core::Loc(ctx.file, block.loc));
+    auto method = enclosingMethod(ctx);
 
     for (auto &arg : block.args) {
         if (auto *localExp = ast::MK::arg2Local(arg)) {
@@ -31,18 +31,15 @@ ast::ExpressionPtr LocalVarSaver::postTransformBlock(core::Context ctx, ast::Exp
             if (lspQueryMatch) {
                 core::TypeAndOrigins tp;
                 core::lsp::QueryResponse::pushQueryResponse(
-                    ctx,
-                    core::lsp::IdentResponse(core::Loc(ctx.file, localExp->loc), localExp->localVariable, tp, method));
+                    ctx, core::lsp::IdentResponse(ctx.locAt(localExp->loc), localExp->localVariable, tp, method));
             }
         }
     }
-
-    return tree;
 }
 
-ast::ExpressionPtr LocalVarSaver::postTransformLocal(core::Context ctx, ast::ExpressionPtr tree) {
+void LocalVarSaver::postTransformLocal(core::Context ctx, ast::ExpressionPtr &tree) {
     auto &local = ast::cast_tree_nonnull<ast::Local>(tree);
-    auto method = enclosingMethod(ctx, core::Loc(ctx.file, local.loc));
+    auto method = enclosingMethod(ctx);
 
     bool lspQueryMatch = ctx.state.lspQuery.matchesVar(method, local.localVariable);
     if (lspQueryMatch) {
@@ -50,13 +47,11 @@ ast::ExpressionPtr LocalVarSaver::postTransformLocal(core::Context ctx, ast::Exp
         // Let the default constructor make tp.type an empty shared_ptr and tp.origins an empty vector
         core::TypeAndOrigins tp;
         core::lsp::QueryResponse::pushQueryResponse(
-            ctx, core::lsp::IdentResponse(core::Loc(ctx.file, local.loc), local.localVariable, tp, method));
+            ctx, core::lsp::IdentResponse(ctx.locAt(local.loc), local.localVariable, tp, method));
     }
-
-    return tree;
 }
 
-ast::ExpressionPtr LocalVarSaver::postTransformMethodDef(core::Context ctx, ast::ExpressionPtr tree) {
+void LocalVarSaver::postTransformMethodDef(core::Context ctx, ast::ExpressionPtr &tree) {
     auto &methodDef = ast::cast_tree_nonnull<ast::MethodDef>(tree);
 
     // Check args.
@@ -68,12 +63,10 @@ ast::ExpressionPtr LocalVarSaver::postTransformMethodDef(core::Context ctx, ast:
                 // (Ditto)
                 core::TypeAndOrigins tp;
                 core::lsp::QueryResponse::pushQueryResponse(
-                    ctx, core::lsp::IdentResponse(core::Loc(ctx.file, localExp->loc), localExp->localVariable, tp,
-                                                  methodDef.symbol));
+                    ctx,
+                    core::lsp::IdentResponse(ctx.locAt(localExp->loc), localExp->localVariable, tp, methodDef.symbol));
             }
         }
     }
-
-    return tree;
 }
 } // namespace sorbet::realmain::lsp

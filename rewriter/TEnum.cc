@@ -50,11 +50,54 @@ ast::Send *asEnumsDo(ast::ExpressionPtr &stat) {
 }
 
 vector<ast::ExpressionPtr> badConst(core::MutableContext ctx, core::LocOffsets headerLoc, core::LocOffsets line1Loc) {
-    if (auto e = ctx.beginError(headerLoc, core::errors::Rewriter::TEnumConstNotEnumValue)) {
+    if (auto e = ctx.beginError(headerLoc, core::errors::Rewriter::BadTEnumSyntax)) {
         e.setHeader("All constants defined on an `{}` must be unique instances of the enum", "T::Enum");
-        e.addErrorLine(core::Loc(ctx.file, line1Loc), "Enclosing definition here");
+        e.addErrorLine(ctx.locAt(line1Loc), "Enclosing definition here");
     }
     return {};
+}
+
+ast::Send *findMagicSelfNew(ast::ExpressionPtr &assignRhs) {
+    auto *rhs = ast::cast_tree<ast::Send>(assignRhs);
+    if (rhs != nullptr) {
+        if (rhs->fun != core::Names::selfNew() && rhs->fun != core::Names::let()) {
+            return nullptr;
+        }
+
+        if (rhs->fun == core::Names::selfNew() && !ast::MK::isMagicClass(rhs->recv)) {
+            return nullptr;
+        }
+
+        auto *magicSelfNew = rhs;
+        if (rhs->fun == core::Names::let()) {
+            auto recv = ast::cast_tree<ast::UnresolvedConstantLit>(rhs->recv);
+            if (recv == nullptr) {
+                return nullptr;
+            }
+
+            if (rhs->numPosArgs() != 2) {
+                return nullptr;
+            }
+
+            auto arg0 = ast::cast_tree<ast::Send>(rhs->getPosArg(0));
+            if (arg0 == nullptr) {
+                return nullptr;
+            }
+
+            if (!ast::MK::isSelfNew(arg0)) {
+                return nullptr;
+            }
+            magicSelfNew = arg0;
+        }
+        return magicSelfNew;
+    }
+
+    auto *cast = ast::cast_tree<ast::Cast>(assignRhs);
+    if (cast == nullptr) {
+        return nullptr;
+    }
+
+    return findMagicSelfNew(cast->arg);
 }
 
 vector<ast::ExpressionPtr> processStat(core::MutableContext ctx, ast::ClassDef *klass, ast::ExpressionPtr &stat,
@@ -69,37 +112,9 @@ vector<ast::ExpressionPtr> processStat(core::MutableContext ctx, ast::ClassDef *
         return {};
     }
 
-    auto *rhs = ast::cast_tree<ast::Send>(asgn->rhs);
-    if (rhs == nullptr) {
+    auto *magicSelfNew = findMagicSelfNew(asgn->rhs);
+    if (magicSelfNew == nullptr) {
         return badConst(ctx, stat.loc(), klass->loc);
-    }
-
-    if (rhs->fun != core::Names::selfNew() && rhs->fun != core::Names::let()) {
-        return badConst(ctx, stat.loc(), klass->loc);
-    }
-
-    if (rhs->fun == core::Names::selfNew() && !ast::MK::isMagicClass(rhs->recv)) {
-        return badConst(ctx, stat.loc(), klass->loc);
-    }
-
-    if (rhs->fun == core::Names::let()) {
-        auto recv = ast::cast_tree<ast::UnresolvedConstantLit>(rhs->recv);
-        if (recv == nullptr) {
-            return badConst(ctx, stat.loc(), klass->loc);
-        }
-
-        if (rhs->numPosArgs() != 2) {
-            return badConst(ctx, stat.loc(), klass->loc);
-        }
-
-        auto arg0 = ast::cast_tree<ast::Send>(rhs->getPosArg(0));
-        if (arg0 == nullptr) {
-            return badConst(ctx, stat.loc(), klass->loc);
-        }
-
-        if (!ast::MK::isSelfNew(arg0)) {
-            return badConst(ctx, stat.loc(), klass->loc);
-        }
     }
 
     // By this point, we have something that looks like
@@ -109,10 +124,10 @@ vector<ast::ExpressionPtr> processStat(core::MutableContext ctx, ast::ClassDef *
     // So we're good to process this thing as a new T::Enum value.
 
     if (fromWhere != FromWhere::Inside) {
-        if (auto e = ctx.beginError(stat.loc(), core::errors::Rewriter::TEnumOutsideEnumsDo)) {
+        if (auto e = ctx.beginError(stat.loc(), core::errors::Rewriter::BadTEnumSyntax)) {
             e.setHeader("Definition of enum value `{}` must be within the `{}` block for this `{}`",
                         lhs->cnst.show(ctx), "enums do", "T::Enum");
-            e.addErrorLine(core::Loc(ctx.file, klass->declLoc), "Enclosing definition here");
+            e.addErrorLine(ctx.locAt(klass->declLoc), "Enclosing definition here");
         }
     }
 
@@ -125,15 +140,16 @@ vector<ast::ExpressionPtr> processStat(core::MutableContext ctx, ast::ClassDef *
         ast::MK::Class(stat.loc(), stat.loc(), classCnst.deepCopy(), std::move(parent), std::move(classRhs));
 
     // Remove one from the number of positional arguments to account for the self param to <Magic>.<self-new>
-    rhs->removePosArg(0);
+    magicSelfNew->removePosArg(0);
 
     ast::Send::Flags flags = {};
     flags.isPrivateOk = true;
-    auto singletonAsgn = ast::MK::Assign(
-        stat.loc(), std::move(asgn->lhs),
-        ast::MK::Send2(stat.loc(), ast::MK::Constant(stat.loc(), core::Symbols::T()), core::Names::uncheckedLet(),
-                       stat.loc().copyWithZeroLength(),
-                       rhs->withNewBody(stat.loc(), classCnst.deepCopy(), core::Names::new_()), std::move(classCnst)));
+    auto singletonAsgn =
+        ast::MK::Assign(stat.loc(), std::move(asgn->lhs),
+                        ast::make_expression<ast::Cast>(
+                            stat.loc(), core::Types::todo(),
+                            magicSelfNew->withNewBody(stat.loc(), classCnst.deepCopy(), core::Names::new_()),
+                            core::Names::uncheckedLet(), std::move(classCnst)));
     vector<ast::ExpressionPtr> result;
     result.emplace_back(std::move(classDef));
     result.emplace_back(std::move(singletonAsgn));

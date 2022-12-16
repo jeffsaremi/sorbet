@@ -15,22 +15,9 @@ Gem::Specification.new do |s|
 
   s.add_dependency 'sorbet-static', '0.0.0'
 
-  s.required_ruby_version = ['>= 2.3.0']
+  s.required_ruby_version = ['>= 2.7.0']
 
   s.add_development_dependency 'minitest', '~> 5.11'
   s.add_development_dependency 'mocha', '~> 1.7'
   s.add_development_dependency 'rake'
-
-  s.post_install_message = %q{
-  Thanks for installing Sorbet! To use it in your project, first run:
-
-    bundle exec srb init
-
-  which will get your project ready to use with Sorbet.
-  After that whenever you want to typecheck your code, run:
-
-    bundle exec srb tc
-
-  For more docs see: https://sorbet.org/docs/adopting
-}
 end

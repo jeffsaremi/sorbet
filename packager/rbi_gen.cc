@@ -7,6 +7,7 @@
 #include "common/FileOps.h"
 #include "common/concurrency/ConcurrentQueue.h"
 #include "common/concurrency/WorkerPool.h"
+#include "common/sort.h"
 #include "core/GlobalState.h"
 #include "packager/packager.h"
 
@@ -34,7 +35,7 @@ private:
 public:
     template <typename... Args> void println(fmt::format_string<Args...> fmt, Args &&...args) {
         fmt::format_to(std::back_inserter(out), "{:{}}", "", this->indent * 2);
-        fmt::format_to(std::back_inserter(out), fmt, args...);
+        fmt::format_to(std::back_inserter(out), fmt, std::forward<Args>(args)...);
         fmt::format_to(std::back_inserter(out), "\n");
     }
 
@@ -51,14 +52,10 @@ public:
     }
 };
 
-class QuoteStringNameFormatter final {
-    const core::GlobalState &gs;
-
+class QuoteStringFormatter final {
 public:
-    QuoteStringNameFormatter(const core::GlobalState &gs) : gs(gs) {}
-
-    void operator()(std::string *out, pair<core::ClassOrModuleRef, core::SymbolRef> klass) const {
-        out->append(fmt::format("\"{}\"", klass.first.show(gs)));
+    void operator()(std::string *out, const string &str) const {
+        out->append(fmt::format("\"{}\"", str));
     }
 };
 
@@ -152,7 +149,7 @@ private:
             maybeEmit(symbol.asClassOrModuleRef().data(gs)->attachedClass(gs));
             return;
         }
-        if (!emittedSymbols.contains(symbol) && isInPackage(symbol, symbol)) {
+        if (!emittedSymbols.contains(symbol) && isInPackage(symbol)) {
             emittedSymbols.insert(symbol);
             toEmit.emplace_back(symbol);
         }
@@ -274,7 +271,7 @@ private:
         if (sym->flags.isOverride) {
             flags.emplace_back("override");
         }
-        for (auto ta : method.data(gs)->typeArguments) {
+        for (auto ta : method.data(gs)->typeArguments()) {
             typeArguments.emplace_back(absl::StrCat(":", ta.data(gs)->name.show(gs)));
         }
         for (auto &argSym : method.data(gs)->arguments) {
@@ -439,7 +436,9 @@ private:
                 maybeEmit(classType.symbol);
                 break;
             }
-            case core::TypePtr::Tag::LiteralType: {
+            case core::TypePtr::Tag::NamedLiteralType:
+            case core::TypePtr::Tag::IntegerLiteralType:
+            case core::TypePtr::Tag::FloatLiteralType: {
                 // No symbols here.
                 break;
             }
@@ -495,10 +494,9 @@ private:
                 break;
             }
             case core::TypePtr::Tag::LambdaParam: {
-                // Running .show on LambdaParam doesn't print out the types.
-                // const auto &lambdaParam = core::cast_type_nonnull<core::LambdaParam>(type);
-                // enqueueSymbolsInType(lambdaParam.lowerBound);
-                // enqueueSymbolsInType(lambdaParam.upperBound);
+                const auto &lambdaParam = core::cast_type_nonnull<core::LambdaParam>(type);
+                enqueueSymbolsInType(lambdaParam.lowerBound);
+                enqueueSymbolsInType(lambdaParam.upperBound);
                 break;
             }
         }
@@ -506,26 +504,40 @@ private:
 
     Output out;
 
-    // copied from variance.cc
-    string showVariance(core::TypeMemberRef tm) {
-        if (tm.data(gs)->isFixed()) {
-            auto &lambdaParam = core::cast_type_nonnull<core::LambdaParam>(tm.data(gs)->resultType);
-            return absl::StrCat("fixed: ", showType(lambdaParam.upperBound));
-        }
+    vector<string> typeMemberDetails(core::TypeMemberRef tm) {
+        vector<string> res;
 
         switch (tm.data(gs)->variance()) {
             case core::Variance::CoVariant:
-                return ":out";
+                res.emplace_back(":out");
+                break;
+
             case core::Variance::Invariant:
-                // Default.
-                return "";
+                break;
+
             case core::Variance::ContraVariant:
-                return ":in";
+                res.emplace_back(":in");
+                break;
         }
+
+        auto &lambdaParam = core::cast_type_nonnull<core::LambdaParam>(tm.data(gs)->resultType);
+        if (tm.data(gs)->flags.isFixed) {
+            res.emplace_back(fmt::format("fixed: {}", showType(lambdaParam.upperBound)));
+        } else {
+            if (lambdaParam.upperBound != core::Types::top()) {
+                res.emplace_back(fmt::format("upper: {}", showType(lambdaParam.upperBound)));
+            }
+
+            if (lambdaParam.lowerBound != core::Types::bottom()) {
+                res.emplace_back(fmt::format("lower: {}", showType(lambdaParam.lowerBound)));
+            }
+        }
+
+        return res;
     }
 
     bool isInTestPackage(core::SymbolRef sym) {
-        if (sym == core::Symbols::root() || sym == core::Symbols::PackageRegistry()) {
+        if (sym == core::Symbols::root()) {
             return false;
         }
         if (sym == pkgNamespace) {
@@ -542,27 +554,30 @@ private:
         return isInTestPackage(sym.owner(gs));
     }
 
-    bool isInPackage(core::SymbolRef sym, core::SymbolRef original) {
-        if (sym == core::Symbols::root() || sym == core::Symbols::PackageRegistry()) {
-            // Symbol isn't part of a package. Check if it was defined in an RBI.
-            auto locs = original.locs(gs);
-            for (auto loc : locs) {
-                if (loc.exists() && loc.file().data(gs).isRBI() && !loc.file().data(gs).isPayload()) {
-                    referencedRBIs.insert(loc.file());
+    bool isInPackage(core::SymbolRef original) {
+        for (auto sym = original; sym.exists(); sym = sym.owner(gs)) {
+            if (sym == core::Symbols::root()) {
+                // Symbol isn't part of a package. Check if it was defined in an RBI.
+                auto locs = original.locs(gs);
+                for (auto loc : locs) {
+                    if (loc.exists() && loc.file().data(gs).isRBI() && !loc.file().data(gs).isPayload()) {
+                        referencedRBIs.insert(loc.file());
+                    }
                 }
-            }
-            return false;
-        }
-        if (sym == pkgNamespace || sym == pkgTestNamespace) {
-            return true;
-        }
-        if (sym.isClassOrModule()) {
-            if (pkgNamespaces.contains(sym.asClassOrModuleRef())) {
-                referencedPackages[sym.asClassOrModuleRef()] = original;
                 return false;
             }
+            if (sym == pkgNamespace || sym == pkgTestNamespace) {
+                return true;
+            }
+            if (sym.isClassOrModule()) {
+                if (pkgNamespaces.contains(sym.asClassOrModuleRef())) {
+                    referencedPackages[sym.asClassOrModuleRef()] = original;
+                    return false;
+                }
+            }
         }
-        return isInPackage(sym.owner(gs), original);
+
+        return false;
     }
 
     string typeDeclaration(const core::TypePtr &type) {
@@ -699,7 +714,7 @@ private:
     }
 
     void emit(core::ClassOrModuleRef klass) {
-        if (!isInPackage(klass, klass) || !emittedSymbols.contains(klass)) {
+        if (!isInPackage(klass) || !emittedSymbols.contains(klass)) {
             // We don't emit class definitions for items defined in other packages.
             Exception::raise("Invalid klass");
         }
@@ -720,12 +735,13 @@ private:
 
         // cerr << "Emitting " << klass.show(gs) << "\n";
         // Class definition line
-        auto defType = klass.data(gs)->isClassOrModuleClass() ? "class" : "module";
+        auto defType = klass.data(gs)->flags.isClass ? "class" : "module";
         auto fullName = klass.show(gs);
         string superClassString;
         if (klass.data(gs)->superClass().exists()) {
             auto superClass = klass.data(gs)->superClass();
-            if (superClass != core::Symbols::Sorbet_Private_Static_ImplicitModuleSuperClass()) {
+            if (superClass != core::Symbols::Sorbet_Private_Static_ImplicitModuleSuperClass() &&
+                superClass != core::Symbols::Object()) {
                 maybeEmit(superClass);
                 superClassString = absl::StrCat(" < ", superClass.show(gs));
             }
@@ -735,24 +751,33 @@ private:
         {
             Indent indent(out);
 
-            if (klass.data(gs)->isClassOrModuleAbstract()) {
+            if (klass.data(gs)->flags.isAbstract) {
                 out.println("abstract!");
             }
 
-            if (klass.data(gs)->isClassOrModuleFinal()) {
+            if (klass.data(gs)->flags.isFinal) {
                 out.println("final!");
             }
 
-            if (klass.data(gs)->isClassOrModuleInterface()) {
+            if (klass.data(gs)->flags.isInterface) {
                 out.println("interface!");
             }
 
-            if (klass.data(gs)->isClassOrModuleSealed()) {
+            if (klass.data(gs)->flags.isSealed) {
                 out.println("sealed!");
             }
 
             // Mixins (include/extend)
             for (auto mixin : klass.data(gs)->mixins()) {
+                // The resolver turns unresolved constant literals into StubModules.
+                // Ideally, we'd never see these, but we might have out-of-date RBIs
+                // as input to the package generation process.  Since mixins that
+                // were stubbed out wouldn't have affected typechecking, they
+                // won't affect uses of the generated RBIs, either, and we should
+                // just skip them.
+                if (mixin == core::Symbols::StubModule()) {
+                    continue;
+                }
                 auto isSingleton = mixin.data(gs)->isSingletonClass(gs);
                 auto keyword = isSingleton ? "extend"sv : "include"sv;
                 out.println("{} {}", keyword, mixin.show(gs));
@@ -893,6 +918,15 @@ private:
             if (singleton.exists()) {
                 // Mixins (include/extend)
                 for (auto mixin : singleton.data(gs)->mixins()) {
+                    // The resolver turns unresolved constant literals into StubModules.
+                    // Ideally, we'd never see these, but we might have out-of-date RBIs
+                    // as input to the package generation process.  Since mixins that
+                    // were stubbed out wouldn't have affected typechecking, they
+                    // won't affect uses of the generated RBIs, either, and we should
+                    // just skip them.
+                    if (mixin == core::Symbols::StubModule()) {
+                        continue;
+                    }
                     out.println("extend {}", mixin.show(gs));
                     maybeEmit(mixin);
                 }
@@ -927,7 +961,7 @@ private:
                             break;
                         }
                         case core::SymbolRef::Kind::Method: {
-                            if (klass.data(gs)->isClassOrModuleSealed() && name == core::Names::sealedSubclasses()) {
+                            if (klass.data(gs)->flags.isSealed && name == core::Names::sealedSubclasses()) {
                                 // Ignore: Generated by TEnum rewriter pass.
                             } else {
                                 emit(member.asMethodRef(), pendingFields);
@@ -1095,10 +1129,11 @@ private:
         }
 
         // If this is a type template, there will be an alias type defined on the non-singleton class w/ the same name.
+        auto details = typeMemberDetails(tm);
         if (tm.data(gs)->owner.asClassOrModuleRef().data(gs)->isSingletonClass(gs)) {
-            out.println("{} = type_template({})", tm.data(gs)->name.show(gs), showVariance(tm));
+            out.println("{} = type_template({})", tm.data(gs)->name.show(gs), fmt::join(details, ", "));
         } else {
-            out.println("{} = type_member({})", tm.data(gs)->name.show(gs), showVariance(tm));
+            out.println("{} = type_member({})", tm.data(gs)->name.show(gs), fmt::join(details, ", "));
         }
     }
 
@@ -1132,18 +1167,42 @@ private:
         return lookupFQN(gs, fullName).asClassOrModuleRef();
     }
 
+    string buildPackageDependenciesString(const core::GlobalState &gs) {
+        vector<string> packageNames;
+        packageNames.reserve(referencedPackages.size());
+        absl::c_transform(referencedPackages, back_inserter(packageNames),
+                          [&gs](const auto &p) -> string { return p.first.show(gs); });
+        fast_sort(packageNames, [](const auto &lhs, const auto &rhs) -> bool { return lhs < rhs; });
+
+        vector<core::FileRef> rbiFiles;
+        rbiFiles.reserve(referencedRBIs.size());
+        rbiFiles.insert(rbiFiles.end(), referencedRBIs.begin(), referencedRBIs.end());
+        fast_sort(rbiFiles, [](const auto &lhs, const auto &rhs) -> bool { return lhs < rhs; });
+
+        return fmt::format("{{\"packageRefs\":[{}], \"rbiRefs\":[{}]}}\n",
+                           absl::StrJoin(packageNames.begin(), packageNames.end(), ",", QuoteStringFormatter()),
+                           absl::StrJoin(rbiFiles.begin(), rbiFiles.end(), ",", QuoteStringFileFormatter(gs)));
+    }
+
 public:
     RBIExporter(const core::GlobalState &gs, const core::packages::PackageInfo &pkg,
                 const UnorderedSet<core::ClassOrModuleRef> &pkgNamespaces)
         : gs(gs), pkg(pkg), pkgNamespace(lookupFQN(gs, pkg.fullName()).asClassOrModuleRef()),
           pkgTestNamespace(getPkgTestNamespace(gs, pkg)), pkgNamespaces(pkgNamespaces) {
         const auto name = gs.lookupNameConstant("Flatfiles");
-        if (name.exists()) {
-            const auto flatFiles = gs.lookupClassSymbol(core::Symbols::Opus(), name);
-            if (flatFiles.exists()) {
-                flatfileRecord = gs.lookupClassSymbol(flatFiles, gs.lookupNameConstant("Record"));
-                flatfileXMLNode = gs.lookupClassSymbol(flatFiles, gs.lookupNameConstant("MarkupLanguageNodeStruct"));
-            }
+        if (!name.exists()) {
+            return;
+        }
+
+        auto opus = gs.lookupClassSymbol(core::Symbols::root(), core::Names::Constants::Opus());
+        if (!opus.exists()) {
+            return;
+        }
+
+        const auto flatFiles = gs.lookupClassSymbol(opus, name);
+        if (flatFiles.exists()) {
+            flatfileRecord = gs.lookupClassSymbol(flatFiles, gs.lookupNameConstant("Record"));
+            flatfileXMLNode = gs.lookupClassSymbol(flatFiles, gs.lookupNameConstant("MarkupLanguageNodeStruct"));
         }
     }
 
@@ -1151,12 +1210,10 @@ public:
         RBIGenerator::RBIOutput output;
         output.baseFilePath = pkg.mangledName().show(gs);
 
-        auto rawExports = pkg.exports();
-        auto rawTestExports = pkg.testExports();
-
         vector<core::SymbolRef> exports;
         vector<core::SymbolRef> testExports;
 
+        auto rawExports = pkg.exports();
         for (auto &e : rawExports) {
             auto exportSymbol = lookupFQN(gs, e);
             if (exportSymbol.exists()) {
@@ -1169,13 +1226,6 @@ public:
             }
         }
 
-        for (auto e : rawTestExports) {
-            auto exportSymbol = lookupFQN(gs, e);
-            if (exportSymbol.exists()) {
-                testExports.emplace_back(exportSymbol);
-            }
-        }
-
         if (!exports.empty()) {
             for (auto &exportSymbol : exports) {
                 maybeEmit(exportSymbol);
@@ -1184,10 +1234,7 @@ public:
             emitLoop();
 
             output.rbi = "# typed: true\n\n" + out.toString();
-            output.rbiPackageDependencies = fmt::format(
-                "{{\"packageRefs\":[{}], \"rbiRefs\":[{}]}}",
-                absl::StrJoin(referencedPackages.begin(), referencedPackages.end(), ",", QuoteStringNameFormatter(gs)),
-                absl::StrJoin(referencedRBIs.begin(), referencedRBIs.end(), ",", QuoteStringFileFormatter(gs)));
+            output.rbiPackageDependencies = buildPackageDependenciesString(gs);
         }
 
         // N.B.: We don't need to generate this in the same pass. Test code only relies on exported symbols from regular
@@ -1202,11 +1249,7 @@ public:
             auto rbiText = out.toString();
             if (!rbiText.empty()) {
                 output.testRBI = "# typed: true\n\n" + rbiText;
-                output.testRBIPackageDependencies = fmt::format(
-                    "{{\"packageRefs\":[{}], \"rbiRefs\":[{}]}}",
-                    absl::StrJoin(referencedPackages.begin(), referencedPackages.end(), ",",
-                                  QuoteStringNameFormatter(gs)),
-                    absl::StrJoin(referencedRBIs.begin(), referencedRBIs.end(), ",", QuoteStringFileFormatter(gs)));
+                output.testRBIPackageDependencies = buildPackageDependenciesString(gs);
             }
         }
 
@@ -1215,14 +1258,11 @@ public:
 };
 } // namespace
 
-UnorderedSet<core::ClassOrModuleRef>
-RBIGenerator::buildPackageNamespace(core::GlobalState &gs, vector<ast::ParsedFile> &packageFiles, WorkerPool &workers) {
-    // Populate package database.
-    packageFiles = Packager::findPackages(gs, workers, move(packageFiles));
-
+UnorderedSet<core::ClassOrModuleRef> RBIGenerator::buildPackageNamespace(core::GlobalState &gs, WorkerPool &workers) {
     const auto &packageDB = gs.packageDB();
 
     auto &packages = packageDB.packages();
+
     if (packages.empty()) {
         Exception::raise("No packages found?");
     }
@@ -1231,7 +1271,7 @@ RBIGenerator::buildPackageNamespace(core::GlobalState &gs, vector<ast::ParsedFil
 
     UnorderedSet<core::ClassOrModuleRef> packageNamespaces;
     for (auto package : packages) {
-        auto &pkg = gs.packageDB().getPackageInfo(package);
+        auto &pkg = packageDB.getPackageInfo(package);
         vector<core::NameRef> fullName = pkg.fullName();
         auto packageNamespace = lookupFQN(gs, fullName);
         // Might not exist if package has no files.
@@ -1257,10 +1297,9 @@ RBIGenerator::RBIOutput RBIGenerator::runOnce(const core::GlobalState &gs, core:
     return exporter.emit();
 }
 
-void RBIGenerator::run(core::GlobalState &gs, vector<ast::ParsedFile> packageFiles, string outputDir,
-                       WorkerPool &workers) {
+void RBIGenerator::run(core::GlobalState &gs, const UnorderedSet<core::ClassOrModuleRef> &packageNamespaces,
+                       string outputDir, WorkerPool &workers) {
     absl::BlockingCounter threadBarrier(std::max(workers.size(), 1));
-    UnorderedSet<core::ClassOrModuleRef> packageNamespaces = buildPackageNamespace(gs, packageFiles, workers);
 
     const auto &packageDB = gs.packageDB();
     auto &packages = packageDB.packages();
@@ -1293,4 +1332,21 @@ void RBIGenerator::run(core::GlobalState &gs, vector<ast::ParsedFile> packageFil
         });
     threadBarrier.Wait();
 }
+
+void RBIGenerator::runSinglePackage(core::GlobalState &gs,
+                                    const UnorderedSet<core::ClassOrModuleRef> &packageNamespaces,
+                                    core::NameRef package, string outputDir, WorkerPool &workers) {
+    auto output = runOnce(gs, package, packageNamespaces);
+    if (!output.rbi.empty()) {
+        FileOps::write(absl::StrCat(outputDir, "/", output.baseFilePath, ".package.rbi"), output.rbi);
+        FileOps::write(absl::StrCat(outputDir, "/", output.baseFilePath, ".deps.json"), output.rbiPackageDependencies);
+    }
+
+    if (!output.testRBI.empty()) {
+        FileOps::write(absl::StrCat(outputDir, "/", output.baseFilePath, ".test.package.rbi"), output.testRBI);
+        FileOps::write(absl::StrCat(outputDir, "/", output.baseFilePath, ".test.deps.json"),
+                       output.testRBIPackageDependencies);
+    }
+}
+
 } // namespace sorbet::packager

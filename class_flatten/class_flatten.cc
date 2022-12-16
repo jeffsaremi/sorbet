@@ -61,14 +61,12 @@ public:
         ENFORCE(classStack.empty());
     }
 
-    ast::ExpressionPtr preTransformClassDef(core::Context ctx, ast::ExpressionPtr tree) {
+    void preTransformClassDef(core::Context ctx, ast::ExpressionPtr &tree) {
         classStack.emplace_back(classes.size());
         classes.emplace_back();
-
-        return tree;
     }
 
-    ast::ExpressionPtr postTransformClassDef(core::Context ctx, ast::ExpressionPtr tree) {
+    void postTransformClassDef(core::Context ctx, ast::ExpressionPtr &tree) {
         ENFORCE(!classStack.empty());
         ENFORCE(classes.size() > classStack.back());
         ENFORCE(classes[classStack.back()] == nullptr);
@@ -77,7 +75,6 @@ public:
         auto inits = extractClassInit(ctx, classDef);
 
         core::MethodRef sym;
-        auto loc = core::Loc(ctx.file, classDef->declLoc);
         ast::ExpressionPtr replacement;
         if (classDef->symbol == core::Symbols::root()) {
             // Every file may have its own top-level code, so uniqify the names.
@@ -85,16 +82,21 @@ public:
             // NOTE(nelhage): In general, we potentially need to do this for
             // every class, since Ruby allows reopening classes. However, since
             // pay-server bans that behavior, this should be OK here.
-            sym = ctx.state.lookupStaticInitForFile(loc);
+            sym = ctx.state.lookupStaticInitForFile(ctx.file);
 
             // Skip emitting a place-holder for the root object.
             replacement = ast::MK::EmptyTree();
         } else {
             sym = ctx.state.lookupStaticInitForClass(classDef->symbol);
 
-            // Replace the class definition with a call to <Magic>.<define-top-class-or-module> to make its definition
-            // available to the containing static-init
-            replacement = ast::MK::DefineTopClassOrModule(classDef->declLoc, classDef->symbol);
+            // We only need a representation of the runtime definition of the class in the
+            // containing static-init if the file is compiled; such a definition is just
+            // noise otherwise.
+            if (ctx.file.data(ctx).compiledLevel == core::CompiledLevel::True) {
+                replacement = ast::MK::DefineTopClassOrModule(classDef->declLoc, classDef->symbol);
+            } else {
+                replacement = ast::MK::EmptyTree();
+            }
         }
         ENFORCE(!sym.data(ctx)->arguments.empty(), "<static-init> method should already have a block arg symbol: {}",
                 sym.show(ctx));
@@ -109,8 +111,9 @@ public:
         ast::MethodDef::ARGS_store args;
         args.emplace_back(ast::make_expression<ast::Local>(blkLoc, blkLocalVar));
 
-        auto init = ast::make_expression<ast::MethodDef>(loc.offsets(), loc.offsets(), sym, core::Names::staticInit(),
-                                                         std::move(args), std::move(inits), ast::MethodDef::Flags());
+        auto init =
+            ast::make_expression<ast::MethodDef>(classDef->declLoc, classDef->declLoc, sym, core::Names::staticInit(),
+                                                 std::move(args), std::move(inits), ast::MethodDef::Flags());
         ast::cast_tree_nonnull<ast::MethodDef>(init).flags.isRewriterSynthesized = false;
         ast::cast_tree_nonnull<ast::MethodDef>(init).flags.isSelfMethod = true;
 
@@ -119,7 +122,7 @@ public:
         classes[classStack.back()] = std::move(tree);
         classStack.pop_back();
 
-        return replacement;
+        tree = std::move(replacement);
     };
 
     ast::ExpressionPtr addClasses(core::Context ctx, ast::ExpressionPtr tree) {
@@ -159,7 +162,7 @@ private:
     // them by their starts, so that `class A; class B; end; end` --> `class A;
     // end; class B; end`.
     //
-    // In order to make TreeMap work out, we can't remove them from the AST
+    // In order to make TreeWalk work out, we can't remove them from the AST
     // until the `postTransform*` hook. Appending them to a list at that point
     // would result in an "bottom-up" ordering, so instead we store a stack of
     // "where does the next definition belong" into `classStack`
@@ -170,7 +173,7 @@ private:
 
 ast::ParsedFile runOne(core::Context ctx, ast::ParsedFile tree) {
     ClassFlattenWalk flatten;
-    tree.tree = ast::TreeMap::apply(ctx, flatten, std::move(tree.tree));
+    ast::TreeWalk::apply(ctx, flatten, tree.tree);
     tree.tree = flatten.addClasses(ctx, std::move(tree.tree));
 
     return tree;

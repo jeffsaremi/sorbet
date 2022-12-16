@@ -11,14 +11,14 @@ bool TypeConstraint::isEmpty() const {
     return upperBounds.empty() && lowerBounds.empty();
 }
 
-void TypeConstraint::defineDomain(const GlobalState &gs, const InlinedVector<TypeArgumentRef, 4> &typeParams) {
+void TypeConstraint::defineDomain(const GlobalState &gs, absl::Span<const TypeArgumentRef> typeParams) {
     // ENFORCE(isEmpty()); // unfortunately this is false. See
     // test/testdata/infer/generic_methods/countraints_crosstalk.rb
     for (const auto &ta : typeParams) {
         auto typ = cast_type<TypeVar>(ta.data(gs)->resultType);
         ENFORCE(typ != nullptr);
 
-        if (ta.data(gs)->isCovariant()) {
+        if (ta.data(gs)->flags.isCovariant) {
             findLowerBound(typ->sym) = Types::bottom();
         } else {
             findUpperBound(typ->sym) = Types::top();
@@ -40,7 +40,7 @@ bool TypeConstraint::solve(const GlobalState &gs) {
         if (bound == Types::top()) {
             continue;
         }
-        auto approximation = bound._approximate(gs, *this);
+        auto approximation = bound._approximate(gs, *this, core::Polarity::Positive);
         if (approximation) {
             findSolution(tv) = approximation;
         } else {
@@ -56,7 +56,7 @@ bool TypeConstraint::solve(const GlobalState &gs) {
         if (sol) {
             continue;
         }
-        auto approximation = bound._approximate(gs, *this);
+        auto approximation = bound._approximate(gs, *this, core::Polarity::Positive);
         if (approximation) {
             sol = approximation;
         } else {
@@ -213,7 +213,7 @@ TypePtr TypeConstraint::findUpperBound(TypeArgumentRef forWhat) const {
             return entry.second;
         }
     }
-    Exception::raise("should never happen");
+    Exception::raise("Failed to find entry in TypeConstraint::upperBounds for type argument");
 }
 
 TypePtr TypeConstraint::findLowerBound(TypeArgumentRef forWhat) const {
@@ -222,7 +222,7 @@ TypePtr TypeConstraint::findLowerBound(TypeArgumentRef forWhat) const {
             return entry.second;
         }
     }
-    Exception::raise("should never happen");
+    Exception::raise("Failed to find entry in TypeConstraint::lowerBounds for type argument");
 }
 
 TypePtr TypeConstraint::findSolution(TypeArgumentRef forWhat) const {
@@ -231,7 +231,7 @@ TypePtr TypeConstraint::findSolution(TypeArgumentRef forWhat) const {
             return entry.second;
         }
     }
-    Exception::raise("should never happen");
+    Exception::raise("Failed to find entry in TypeConstraint::solution for type argument");
 }
 
 InlinedVector<SymbolRef, 4> TypeConstraint::getDomain() const {

@@ -10,6 +10,7 @@
 
 namespace sorbet {
 class WorkerPool;
+class KeyValueStore;
 } // namespace sorbet
 
 namespace sorbet::core::lsp {
@@ -19,6 +20,8 @@ class QueryResponse;
 
 namespace sorbet::realmain::lsp {
 class ResponseError;
+class InitializedTask;
+class TaskQueue;
 
 struct LSPQueryResult {
     std::vector<std::unique_ptr<core::lsp::QueryResponse>> responses;
@@ -40,6 +43,7 @@ class LSPTypechecker final {
     std::vector<ast::ParsedFile> indexed;
     /** Trees that have been indexed (with finalGS) and can be reused between different runs */
     UnorderedMap<int, ast::ParsedFile> indexedFinalGS;
+
     /** Set only when typechecking is happening on the slow path. Contains all of the state needed to restore
      * LSPTypechecker to its pre-slow-path state. Can be null, which indicates that no slow path is currently running */
     std::unique_ptr<UndoState> cancellationUndoState;
@@ -51,6 +55,10 @@ class LSPTypechecker final {
     bool initialized = false;
 
     std::shared_ptr<ErrorReporter> errorReporter;
+
+    /** Used in tests to force the slow path to block just after cancellation state has been set. */
+    bool slowPathBlocked ABSL_GUARDED_BY(slowPathBlockedMutex) = false;
+    absl::Mutex slowPathBlockedMutex;
 
     /** Conservatively reruns entire pipeline without caching any trees. Returns 'true' if committed, 'false' if
      * canceled. */
@@ -84,7 +92,8 @@ public:
      *
      * Writes all diagnostic messages to LSPOutput.
      */
-    void initialize(LSPFileUpdates updates, WorkerPool &workers);
+    void initialize(TaskQueue &queue, std::unique_ptr<core::GlobalState> gs, std::unique_ptr<KeyValueStore> kvstore,
+                    WorkerPool &workers);
 
     /**
      * Typechecks the given input. Returns 'true' if the updates were committed, or 'false' if typechecking was
@@ -126,23 +135,31 @@ public:
      * Returns the typechecker's internal global state, which effectively destroys the typechecker for further use.
      */
     std::unique_ptr<core::GlobalState> destroy();
+
+    /**
+     * (For tests only) Set a flag that forces the slow path to block indefinitely after saving undo state. Setting
+     * this flag to `false` will immediately unblock any currently blocked slow paths.
+     */
+    void setSlowPathBlocked(bool blocked);
 };
 
 /**
  * Provides lambdas with a set of operations that they are allowed to do with the LSPTypechecker.
  */
-class LSPTypecheckerDelegate {
+class LSPTypecheckerDelegate final {
     LSPTypechecker &typechecker;
 
-public:
+    TaskQueue &queue;
+
     /** The WorkerPool on which work will be performed. If the task is multithreaded, the pool will contain multiple
      * worker threads. */
     WorkerPool &workers;
 
+public:
     /**
      * Creates a new delegate that runs LSPTypechecker operations on the WorkerPool threads.
      */
-    LSPTypecheckerDelegate(WorkerPool &workers, LSPTypechecker &typechecker);
+    LSPTypecheckerDelegate(TaskQueue &queue, WorkerPool &workers, LSPTypechecker &typechecker);
 
     // Delete copy constructor / assignment.
     LSPTypecheckerDelegate(LSPTypecheckerDelegate &) = delete;
@@ -150,32 +167,18 @@ public:
     LSPTypecheckerDelegate &operator=(LSPTypecheckerDelegate &&) = delete;
     LSPTypecheckerDelegate &operator=(const LSPTypecheckerDelegate &) = delete;
 
-    /**
-     * Typechecks the given input on the fast path. The edit *must* be a fast path edit!
-     */
+    virtual ~LSPTypecheckerDelegate() = default;
+
+    void initialize(InitializedTask &task, std::unique_ptr<core::GlobalState> gs,
+                    std::unique_ptr<KeyValueStore> kvstore);
+
+    void resumeTaskQueue(InitializedTask &task);
+
     void typecheckOnFastPath(LSPFileUpdates updates, std::vector<std::unique_ptr<Timer>> diagnosticLatencyTimers);
-
-    /**
-     * Re-typechecks the provided files to re-produce error messages.
-     */
     std::vector<std::unique_ptr<core::Error>> retypecheck(std::vector<core::FileRef> frefs) const;
-
-    /** Runs the provided query against the given files, and returns matches. */
     LSPQueryResult query(const core::lsp::Query &q, const std::vector<core::FileRef> &filesForQuery) const;
-
-    /**
-     * Returns the parsed file for the given file, up to the index passes (does not include resolver passes).
-     */
     const ast::ParsedFile &getIndexed(core::FileRef fref) const;
-
-    /**
-     * Returns the parsed files for the given files, including resolver.
-     */
     std::vector<ast::ParsedFile> getResolved(const std::vector<core::FileRef> &frefs) const;
-
-    /**
-     * Returns the currently active GlobalState.
-     */
     const core::GlobalState &state() const;
 };
 } // namespace sorbet::realmain::lsp

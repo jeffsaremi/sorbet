@@ -1,6 +1,7 @@
 #include "main/lsp/requests/type_definition.h"
 #include "common/typecase.h"
 #include "core/lsp/QueryResponse.h"
+#include "main/lsp/LSPQuery.h"
 #include "main/lsp/json_types.h"
 
 using namespace std;
@@ -40,6 +41,43 @@ vector<core::Loc> locsForType(const core::GlobalState &gs, const core::TypePtr &
             for (auto loc : locsForType(gs, t.right)) {
                 result.emplace_back(loc);
             }
+        },
+        [&](const core::SelfTypeParam &s) {
+            for (auto loc : s.definition.locs(gs)) {
+                result.emplace_back(loc);
+            }
+        },
+        [&](const core::LambdaParam &l) {
+            for (auto loc : l.definition.data(gs)->locs()) {
+                result.emplace_back(loc);
+            }
+        },
+        [&](const core::NamedLiteralType &_) {
+            // nothing
+        },
+        [&](const core::ShapeType &_) {
+            // nothing
+        },
+        [&](const core::TupleType &_) {
+            // nothing
+        },
+        [&](const core::MetaType &_) {
+            // nothing
+        },
+        [&](const core::AliasType &a) {
+            ENFORCE(false, "Please add a test case for this test, and delete this enforce.");
+            for (auto loc : a.symbol.locs(gs)) {
+                result.emplace_back(loc);
+            }
+        },
+        [&](const core::SelfType &_) {
+            ENFORCE(false, "Please add a test case for this test, and delete this enforce.");
+        },
+        [&](const core::TypeVar &s) {
+            ENFORCE(false, "Please add a test case for this test, and delete this enforce.");
+        },
+        [&](const core::TypePtr &t) {
+            Exception::raise("Unhandled case in textDocument/typeDefinition: {}", core::TypePtr::tagToString(t.tag()));
         });
     return result;
 }
@@ -52,8 +90,8 @@ TypeDefinitionTask::TypeDefinitionTask(const LSPConfiguration &config, MessageId
 unique_ptr<ResponseMessage> TypeDefinitionTask::runRequest(LSPTypecheckerDelegate &typechecker) {
     auto response = make_unique<ResponseMessage>("2.0", id, LSPMethod::TextDocumentTypeDefinition);
     const core::GlobalState &gs = typechecker.state();
-    auto result = queryByLoc(typechecker, params->textDocument->uri, *params->position,
-                             LSPMethod::TextDocumentTypeDefinition, false);
+    auto result = LSPQuery::byLoc(config, typechecker, params->textDocument->uri, *params->position,
+                                  LSPMethod::TextDocumentTypeDefinition, false);
     if (result.error) {
         // An error happened while setting up the query.
         response->error = move(result.error);

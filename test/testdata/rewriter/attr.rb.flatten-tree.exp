@@ -3,7 +3,7 @@ begin
   class <emptyTree><<C <root>>> < (::<todo sym>)
     def self.<static-init><<static-init>$CENSORED>(<blk>)
       begin
-        ::<Magic>.<define-top-class-or-module>(::TestAttr)
+        <emptyTree>
         ::Sorbet::Private::Static.keep_for_ide(::TestAttr)
         <emptyTree>
       end
@@ -12,18 +12,12 @@ begin
   class ::TestAttr<<C TestAttr>> < (::<todo sym>)
     def initialize(<blk>)
       begin
-        @v1 = begin
-          ::Sorbet::Private::Static.keep_for_typechecking(::Integer)
-          T.let(0, Integer)
-        end
-        @v2 = begin
-          ::Sorbet::Private::Static.keep_for_typechecking(::String)
-          T.let("", String)
-        end
-        @v6 = begin
-          ::Sorbet::Private::Static.keep_for_typechecking(::String)
-          T.let("", String)
-        end
+        @v1 = <cast:let>(0, Integer, ::Integer)
+        @v2 = <cast:let>("", String, ::String)
+        @v6 = <cast:let>("", String, ::String)
+        @strv7 = <cast:let>(0.000000, Float, ::Float)
+        @strv8 = <cast:let>(0.000000, Float, ::Float)
+        @strv9 = <cast:let>(0.000000, Float, ::Float)
       end
     end
 
@@ -55,35 +49,67 @@ begin
       @v5 = v5
     end
 
+    def strv7(<blk>)
+      @strv7
+    end
+
+    def strv8=(strv8, <blk>)
+      @strv8 = strv8
+    end
+
+    def strv9(<blk>)
+      @strv9
+    end
+
+    def strv9=(strv9, <blk>)
+      @strv9 = strv9
+    end
+
     def self.<static-init>(<blk>)
       begin
-        ::Sorbet::Private::Static::ResolvedSig.sig(<self>, false, :initialize) do ||
+        ::Sorbet::Private::Static.sig(<self>) do ||
           <self>.void()
         end
-        ::Sorbet::Private::Static::ResolvedSig.sig(<self>, false, :v1) do ||
+        ::Sorbet::Private::Static.sig(<self>) do ||
           <self>.returns(::Integer)
         end
-        ::Sorbet::Private::Static::ResolvedSig.sig(<self>, false, :v1=) do ||
+        ::Sorbet::Private::Static.sig(<self>) do ||
           <self>.params(:v1, ::Integer).returns(::Integer)
         end
-        ::Sorbet::Private::Static::ResolvedSig.sig(<self>, false, :v2) do ||
+        ::Sorbet::Private::Static.sig(<self>) do ||
           <self>.returns(::String)
         end
-        ::Sorbet::Private::Static::ResolvedSig.sig(<self>, false, :v2=) do ||
+        ::Sorbet::Private::Static.sig(<self>) do ||
           <self>.params(:v2, ::String).returns(::String)
         end
-        ::Sorbet::Private::Static::ResolvedSig.sig(<self>, false, :v3) do ||
+        ::Sorbet::Private::Static.sig(<self>) do ||
           <self>.returns(::String)
         end
+        ::Sorbet::Private::Static.sig(<self>) do ||
+          <self>.returns(::Float)
+        end
+        ::Sorbet::Private::Static.sig(<self>) do ||
+          <self>.params(:strv8, ::Float).returns(::Float)
+        end
+        ::Sorbet::Private::Static.sig(<self>) do ||
+          <self>.returns(::Float)
+        end
+        ::Sorbet::Private::Static.sig(<self>) do ||
+          <self>.params(:strv9, ::Float).returns(::Float)
+        end
         <self>.extend(::T::Sig)
-        ::Sorbet::Private::Static.keep_def(<self>, :initialize, :normal)
-        ::Sorbet::Private::Static.keep_def(<self>, :v1, :normal)
-        ::Sorbet::Private::Static.keep_def(<self>, :v1=, :normal)
-        ::Sorbet::Private::Static.keep_def(<self>, :v2, :normal)
-        ::Sorbet::Private::Static.keep_def(<self>, :v2=, :normal)
-        ::Sorbet::Private::Static.keep_def(<self>, :v3, :normal)
-        ::Sorbet::Private::Static.keep_def(<self>, :v4=, :normal)
-        ::Sorbet::Private::Static.keep_def(<self>, :v5=, :normal)
+        <runtime method definition of initialize>
+        <runtime method definition of v1>
+        <runtime method definition of v1=>
+        <runtime method definition of v2>
+        <runtime method definition of v2=>
+        <runtime method definition of v3>
+        <runtime method definition of v4=>
+        <runtime method definition of v5=>
+        <runtime method definition of strv7>
+        <runtime method definition of strv8=>
+        <runtime method definition of strv9>
+        <runtime method definition of strv9=>
         <emptyTree>
       end
     end

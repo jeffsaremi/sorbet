@@ -47,7 +47,6 @@
 #include <vector>
 
 namespace sorbet::test {
-namespace spd = spdlog;
 using namespace std;
 
 string singleTest;
@@ -80,7 +79,7 @@ TEST_CASE("WhitequarkParserTest") {
         }
     }
 
-    auto logger = spd::stderr_color_mt("fixtures: " + inputPath);
+    auto logger = spdlog::stderr_color_mt("fixtures: " + inputPath);
     auto errorCollector = make_shared<core::ErrorCollector>();
     auto errorQueue = make_shared<core::ErrorQueue>(*logger, *logger, errorCollector);
     core::GlobalState gs(errorQueue);
@@ -127,8 +126,8 @@ TEST_CASE("WhitequarkParserTest") {
             // whitequark/parser declares these 3 meta variables to
             // simplify testing cases around local variables
             vector<string> initialLocals = {"foo", "bar", "baz"};
-            auto trace = false;
-            nodes = parser::Parser::run(gs, file, trace, initialLocals);
+            auto settings = parser::Parser::Settings{};
+            nodes = parser::Parser::run(gs, file, settings, initialLocals);
         }
         {
             errorQueue->flushAllErrors(gs);
